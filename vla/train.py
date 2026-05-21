@@ -322,7 +322,7 @@ def main():
     # ---------------------------------------------------------------
     # Construct Hierarchical VLA actor + critic
     # ---------------------------------------------------------------
-    waypoint_ckpt = os.path.join(_DRONE_PROJECT, "model_2998_waypoint.pt")
+    waypoint_ckpt = os.path.join(_DRONE_PROJECT, "checkpoints", "stage2_waypoint.pt")
     print(f"[INFO] Constructing Hierarchical VLA actor (PaliGemma frozen + frozen waypoint policy)...")
     actor = HierarchicalVLAActor(
         waypoint_checkpoint_path=waypoint_ckpt,

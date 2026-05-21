@@ -2,7 +2,7 @@
 
 ## 1. System Overview
 
-The VLA system is **Stage 3** of a three-stage curriculum for language-grounded drone navigation. It replaces frozen CLIP/SigLIP embeddings with **PaliGemma 3B** (a vision-language model), enabling the Crazyflie quadcopter to navigate toward objects based on natural language commands using raw RGB input.
+The VLA system is **Stage 4** of the four-stage curriculum (hover -> waypoint_nav -> lang_nav -> vla) for language-grounded drone navigation. It replaces frozen CLIP/SigLIP embeddings with **PaliGemma 3B** (a vision-language model), enabling the Crazyflie quadcopter to navigate toward objects based on natural language commands using raw RGB input.
 
 ### Architecture Pipeline
 
@@ -256,7 +256,7 @@ Accumulates spatial context across timesteps for stable target prediction — pr
 The low-level flight controller from Stage 2 is loaded and frozen as buffer tensors (not `nn.Module` submodules).
 
 ### Loaded Weights
-From checkpoint `logs/model_2998_waypoint.pt`:
+From checkpoint `checkpoints/stage2_waypoint.pt`:
 - `wp_w0, wp_b0`: Layer 1 (15 → 256)
 - `wp_w1, wp_b1`: Layer 2 (256 → 256)
 - `wp_w2, wp_b2`: Output (256 → 4)
@@ -391,7 +391,7 @@ Step 2: aux_loss = MSE(predicted_target, gt_target) + CE(predicted_obj, gt_obj)
 
 ## 10. Weight Transfer from Waypoint Stage
 
-**Source**: `transfer_waypoint_to_vla.py`
+**Source**: `scripts/transfer_waypoint_to_vla.py`
 
 ### Problem
 - **Waypoint policy** input: 15-dim `[flight_state(9) + target(3) + pos_error(3)]`
@@ -413,8 +413,8 @@ New weight matrix (256, 2057):
 
 ### Usage
 ```bash
-python vla/transfer_waypoint_to_vla.py \
-    --waypoint_checkpoint logs/rsl_rl/waypoint_nav/.../model_2998.pt \
+python scripts/transfer_waypoint_to_vla.py \
+    --waypoint_checkpoint checkpoints/stage2_waypoint.pt \
     --output_path logs/vla_init.pt
 ```
 

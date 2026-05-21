@@ -6,8 +6,8 @@ PaliGemma's 2048-dim features). Hidden and output layers transfer directly.
 
 Usage:
     cd ~/drone_project
-    python vla/transfer_waypoint_to_vla.py \
-        --waypoint_checkpoint logs/rsl_rl/waypoint_nav/.../model_2998.pt \
+    python scripts/transfer_waypoint_to_vla.py \
+        --waypoint_checkpoint checkpoints/stage2_waypoint.pt \
         --output_path logs/rsl_rl/vla_drone_direct/vla_init.pt
 """
 

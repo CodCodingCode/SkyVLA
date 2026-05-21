@@ -12,7 +12,7 @@ Optional args:
     --headless        Run without GUI
 
 The trained checkpoint is saved under drone_project/logs/rsl_rl/hover_pretrain/.
-Use it to initialise the lang_nav policy in Stage 2.
+Use it to initialise the waypoint_nav policy in Stage 2.
 """
 
 import argparse

@@ -19,7 +19,7 @@ bash ~/drone_project/vla_universal/run_navigate.sh \
 ```
 
 That's it. No training, no checkpoint management; reuses the frozen waypoint
-policy from `model_2998_waypoint.pt` for low-level flight and
+policy from `checkpoints/stage2_waypoint.pt` for low-level flight and
 `google/paligemma-3b-pt-224` for object detection.
 
 ## How it works

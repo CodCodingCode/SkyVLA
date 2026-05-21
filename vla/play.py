@@ -485,7 +485,7 @@ def main():
 
     # Construct hierarchical actor and load weights
     print("[INFO] Loading Hierarchical VLA actor (PaliGemma + frozen waypoint policy)...")
-    waypoint_ckpt = os.path.join(_DRONE_PROJECT, "model_2998_waypoint.pt")
+    waypoint_ckpt = os.path.join(_DRONE_PROJECT, "checkpoints", "stage2_waypoint.pt")
     actor = HierarchicalVLAActor(
         waypoint_checkpoint_path=waypoint_ckpt,
         paligemma_model_name="google/paligemma-3b-pt-224",

@@ -13,8 +13,8 @@ preserving pretrained hover/nav behavior.
 Usage:
     conda activate isaac
     cd /home/ubuntu/drone_project
-    python transfer_waypoint_to_pi0.py \
-        --waypoint_checkpoint model_2998_waypoint.pt \
+    python scripts/transfer_waypoint_to_pi0.py \
+        --waypoint_checkpoint checkpoints/stage2_waypoint.pt \
         --output_path logs/rsl_rl/pi0_drone_direct/pi0_init.pt
 """
 

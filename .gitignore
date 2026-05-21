@@ -1,6 +1,20 @@
-*.mp4
+# Byte-compiled / optimized files
 *.pyc
 __pycache__/
+*.egg-info/
+.pytest_cache/
+
+# Environments and OS noise
+.DS_Store
+
+# Training artifacts
+*.mp4
 /tmp/
 logs/
 videos/
+wandb/
+
+# Local checkpoints (committed pretrained weights live in checkpoints/ via LFS;
+# anything else is treated as a local-only artifact)
+*.pt
+!checkpoints/*.pt

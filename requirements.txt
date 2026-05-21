@@ -1,0 +1,11 @@
+# Project dependencies on top of an existing Isaac Sim 5.1 + Isaac Lab 2.3.2
+# install. Use `bash setup.sh` for a from-scratch machine setup; this file is
+# intended for adding the Python deps to an environment that already has
+# Isaac Sim available.
+
+transformers>=4.50.0
+wandb>=0.25.0
+rsl-rl-lib>=5.0.0
+opencv-python-headless>=4.10.0
+tensorboard>=2.18.0
+moviepy>=2.0.0

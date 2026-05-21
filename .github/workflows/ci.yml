@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax:
+    name: Python syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Compile every Python file we ship outside of Isaac-only modules.
+      # Isaac Sim imports are skipped because the runner has no GPU and no
+      # Isaac install; the syntax check still catches `SyntaxError` and
+      # `IndentationError` across the whole tree.
+      - name: Compile Python sources
+        run: |
+          python -m compileall -q \
+            scripts \
+            hover \
+            waypoint_nav \
+            lang_nav \
+            lang_nav_siglip \
+            vla \
+            vla_warehouse \
+            vla_cesium \
+            vla_universal \
+            pi \
+            huge_bench \
+            main.py
+
+  markdown-links:
+    name: Markdown link check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: yes
+          use-verbose-mode: yes
+          config-file: .github/markdown-link-check.json

@@ -1,6 +1,6 @@
 """Waypoint navigation environment — fly to a distant goal and stop.
 
-Stage 1.5 of curriculum: the drone learns to navigate to randomised goal
+Stage 2 of curriculum: the drone learns to navigate to randomised goal
 positions, with a terminal success bonus on arrival.
 This bridges hover (hold position) and lang_nav (fly to language-specified
 objects) by teaching intentional point-to-point navigation.

@@ -3,7 +3,7 @@
 The original lives inside HierarchicalVLAActor (vla/vla_policy.py:_waypoint_policy_forward),
 but that class pulls in PaliGemma + LoRA + LSTM + cross-attention. For scan +
 navigate we only need the 3-layer MLP + obs normalizer. This file loads
-`model_2998_waypoint.pt` directly and mirrors the forward pass verbatim.
+`checkpoints/stage2_waypoint.pt` directly and mirrors the forward pass verbatim.
 
 Input:  flight_state (9,) + target_body (3,) + pos_error_w (3,)  →  obs_15
 Output: action (4,)  = [thrust, roll_m, pitch_m, yaw_m]  in [-1, 1]-ish
@@ -25,7 +25,7 @@ ArrayLike = Union[np.ndarray, torch.Tensor]
 class WaypointController:
     def __init__(
         self,
-        ckpt_path: str = "/home/ubuntu/drone_project/model_2998_waypoint.pt",
+        ckpt_path: str = "/home/ubuntu/drone_project/checkpoints/stage2_waypoint.pt",
         device: str | torch.device = "cuda",
     ):
         if not os.path.exists(ckpt_path):

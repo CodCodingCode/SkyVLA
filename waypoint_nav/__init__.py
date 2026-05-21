@@ -1,4 +1,4 @@
-"""Waypoint navigation environment — Stage 1.5 of drone curriculum."""
+"""Waypoint navigation environment — Stage 2 of drone curriculum."""
 
 import gymnasium as gym
 

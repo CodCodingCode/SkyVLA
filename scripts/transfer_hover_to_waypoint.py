@@ -7,8 +7,8 @@ reset so training restarts fresh while keeping learned weights.
 Usage:
     conda activate isaac
     cd /home/ubuntu/drone_project
-    python transfer_hover_to_waypoint.py \
-        --hover_checkpoint logs/rsl_rl/hover_pretrain/<timestamp>/model_299.pt \
+    python scripts/transfer_hover_to_waypoint.py \
+        --hover_checkpoint checkpoints/stage1_hover.pt \
         --output_path logs/rsl_rl/waypoint_nav/pretrained_init.pt
 """
 

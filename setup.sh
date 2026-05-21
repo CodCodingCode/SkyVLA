@@ -5,6 +5,7 @@
 # Tested on: GH200 (ARM64 H100), A10 (x86)
 #
 # Usage:
+#   git lfs install
 #   git clone https://github.com/CodCodingCode/drone_project.git ~/drone_project
 #   cd ~/drone_project
 #   bash setup.sh
@@ -130,11 +131,17 @@ echo "  cd ~/IsaacLab"
 echo "  ./isaaclab.sh -p ~/drone_project/hover/train.py --num_envs 1024 --max_iterations 1500 --headless"
 echo ""
 echo "To train waypoint nav (Stage 2):"
-echo "  ./isaaclab.sh -p ~/drone_project/waypoint_nav/train.py --num_envs 1024 --max_iterations 1500 --headless \\"
-echo "      --resume_path ~/drone_project/logs/rsl_rl/hover_pretrain/<timestamp>/model_1499.pt"
+echo "  python ~/drone_project/scripts/transfer_hover_to_waypoint.py \\"
+echo "      --hover_checkpoint ~/drone_project/checkpoints/stage1_hover.pt \\"
+echo "      --output_path logs/rsl_rl/waypoint_nav/pretrained_init.pt"
+echo "  ./isaaclab.sh -p ~/drone_project/waypoint_nav/train.py --num_envs 1024 --max_iterations 2000 --headless \\"
+echo "      --resume_path logs/rsl_rl/waypoint_nav/pretrained_init.pt"
 echo ""
 echo "To train lang nav (Stage 3):"
-echo "  python ~/drone_project/transfer_waypoint_to_vla.py --waypoint_checkpoint <waypoint.pt> --output_path ~/drone_project/logs/rsl_rl/lang_drone_direct/vla_init.pt"
-echo "  ./isaaclab.sh -p ~/drone_project/lang_nav/train.py --num_envs 256 --max_iterations 3000 --headless --enable_cameras \\"
-echo "      --resume_path ~/drone_project/logs/rsl_rl/lang_drone_direct/vla_init.pt"
+echo "  bash ~/drone_project/scripts/train_lang_nav.sh"
+echo ""
+echo "To train full VLA (Stage 4):"
+echo "  ./isaaclab.sh -p ~/drone_project/vla/train.py --num_envs 256 --max_iterations 5000 --headless --enable_cameras"
+echo ""
+echo "See docs/CURRICULUM.md for the full curriculum walkthrough."
 echo ""

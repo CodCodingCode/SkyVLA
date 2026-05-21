@@ -1,4 +1,4 @@
-"""Train the waypoint navigation policy — Stage 1.5 of curriculum.
+"""Train the waypoint navigation policy — Stage 2 of curriculum.
 
 Launch:
     cd /home/ubuntu/IsaacLab
@@ -13,7 +13,7 @@ Optional args:
     --headless        Run without GUI
 
 The trained checkpoint is saved under drone_project/logs/rsl_rl/waypoint_nav/.
-Use it to initialise the lang_nav policy in Stage 2.
+Use it to initialise the lang_nav policy in Stage 3.
 """
 
 import argparse

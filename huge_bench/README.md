@@ -23,6 +23,15 @@ LeRobot-format dataset.
 5. `eval_bc.py` — reports action MSE on a split, broken down by `env_id` and
    `task_index`.
 
+## HuggingFace (required for PaliGemma)
+
+PaliGemma is gated. Before training:
+
+1. Accept the license at https://huggingface.co/google/paligemma-3b-pt-224  
+2. `huggingface-cli login`
+
+Without this, `train_bc.py` fails with `401 Unauthorized`.
+
 ## Install deps (one-time, into the `isaac` conda env)
 ```
 source /home/ubuntu/miniconda3/bin/activate isaac

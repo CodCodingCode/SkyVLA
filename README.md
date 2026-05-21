@@ -20,6 +20,15 @@ The policy is built up across four stages, each one extending the previous one w
 
 Optional and experimental modules (SigLIP variant, Pi0, warehouse and Cesium fine-tunes, behaviour-cloning baseline) are documented in [docs/ADVANCED.md](docs/ADVANCED.md).
 
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/CURRICULUM.md](docs/CURRICULUM.md) | Four-stage training pipeline and weight transfer |
+| [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) | What to train next and benchmark roadmap |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | HUGE-Bench, CityNav, AirNav eval and initial results |
+| [benchmarks/](benchmarks/) | Runnable benchmark harness (`run_all.sh`) |
+
 ## Prerequisites
 
 - NVIDIA GPU with at least 24 GB VRAM (A10, H100, GH200 all tested)
@@ -75,7 +84,8 @@ drone_project/
 ├── README.md, LICENSE, requirements.txt
 ├── activate_env.sh, setup.sh
 ├── checkpoints/        Pretrained Stage 1 and Stage 2 weights (LFS)
-├── docs/               CURRICULUM.md, ADVANCED.md
+├── docs/               CURRICULUM.md, NEXT_STEPS.md, BENCHMARKS.md, ADVANCED.md
+├── benchmarks/         External VLN benchmark runners
 ├── scripts/            Transfer scripts, Stage 3 launcher, FPV camera test
 ├── hover/              Stage 1 environment + agent
 ├── waypoint_nav/       Stage 2 environment + agent

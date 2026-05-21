@@ -6,8 +6,9 @@ source /home/ubuntu/miniconda3/bin/activate isaac
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONUNBUFFERED=1
 
-cd /home/ubuntu
+cd /home/ubuntu/drone_project
 
+PYTHONPATH=/home/ubuntu/drone_project:$PYTHONPATH \
 python -m huge_bench.train_bc \
     --batch_size "${BATCH_SIZE:-16}" \
     --grad_accum "${GRAD_ACCUM:-4}" \

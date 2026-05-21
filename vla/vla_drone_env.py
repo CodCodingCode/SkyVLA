@@ -198,9 +198,10 @@ class VLADroneEnv(DirectRLEnv):
         self._text_mask = torch.zeros(self.num_envs, self.cfg.max_text_length, dtype=torch.long, device=self.device)
 
         # Cached camera images — 4 views (updated every N steps)
-        self._num_cameras = 4
-        self._cached_rgb = torch.zeros(self.num_envs, 4, 224, 224, 3, dtype=torch.float32, device=self.device)
-        self._cached_depth = torch.zeros(self.num_envs, 4, 224, 224, dtype=torch.float32, device=self.device)
+        _physics_only = getattr(self.cfg, "physics_only", False)
+        self._num_cameras = 0 if _physics_only else 4
+        self._cached_rgb = torch.zeros(self.num_envs, max(1, self._num_cameras), 224, 224, 3, dtype=torch.float32, device=self.device)
+        self._cached_depth = torch.zeros(self.num_envs, max(1, self._num_cameras), 224, 224, dtype=torch.float32, device=self.device)
         self._steps_since_capture = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # Dwell counter: consecutive steps inside hover zone with low speed
@@ -243,11 +244,16 @@ class VLADroneEnv(DirectRLEnv):
         self._log_step = 0
 
         # Load PaliGemma processor (tokenizer + image token handling)
-        from transformers import AutoProcessor
-        print("[VLA Env] Loading PaliGemma processor...")
-        self._processor = AutoProcessor.from_pretrained(self.cfg.tokenizer_name)
-        self._image_token_id = self._processor.tokenizer.convert_tokens_to_ids("<image>")
-        print(f"[VLA Env] Processor loaded. Image token id: {self._image_token_id}")
+        if _physics_only:
+            self._processor = None
+            self._image_token_id = 0
+            print("[VLA Env] physics_only=True — skipping PaliGemma processor and cameras")
+        else:
+            from transformers import AutoProcessor
+            print("[VLA Env] Loading PaliGemma processor...")
+            self._processor = AutoProcessor.from_pretrained(self.cfg.tokenizer_name)
+            self._image_token_id = self._processor.tokenizer.convert_tokens_to_ids("<image>")
+            print(f"[VLA Env] Processor loaded. Image token id: {self._image_token_id}")
 
         # Initial reset
         self._reset_idx(None)
@@ -330,6 +336,8 @@ class VLADroneEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _update_camera_pose(self):
+        if not self._cameras:
+            return
         drone_pos = self._robot.data.root_pos_w
         drone_quat = self._robot.data.root_quat_w
         cam_pos = drone_pos + quat_apply(drone_quat, self._cam_offset.expand(self.num_envs, -1))
@@ -342,6 +350,8 @@ class VLADroneEnv(DirectRLEnv):
             cam._view.set_world_poses(cam_pos, cam_quat)
 
     def _maybe_capture_camera(self):
+        if not self._cameras:
+            return
         self._steps_since_capture += 1
         if (self._steps_since_capture >= self.cfg.camera_every_n).any():
             for i, cam in enumerate(self._cameras):

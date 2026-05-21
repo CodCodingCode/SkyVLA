@@ -118,4 +118,72 @@ bash ~/drone_project/scripts/train_lang_nav.sh
     --num_envs 256 --max_iterations 5000 --headless --enable_cameras
 ```
 
+## Benchmark-aligned extension (Stages 5–8)
+
+Stages 1–4 train the architecture; Stages 5–8 train the **vision-language head only** on benchmark data so we can report numbers on HUGE-Bench (and later AirNav) without disturbing the frozen Stage-2 controller. The high-level rules:
+
+- The Stage-2 waypoint MLP is **never** updated past Stage 2. It is loaded as frozen buffers inside [`HierarchicalVLAActor`](../vla/vla_policy.py).
+- Only the PaliGemma LoRA adapters, cross-attention head, depth encoder, LSTM and `target_mlp` are trainable. The action MLP already knows how to fly.
+- Benchmark SFT/RL is done on the benchmark **train** split; eval is on `test_seen` / `test_unseen` only. See [BENCHMARK_FAIRNESS.md](BENCHMARK_FAIRNESS.md) for what's claimable.
+
+```mermaid
+flowchart LR
+    S4[Stage4 vla RL empty arena] --> S5[Stage5 core VLA RL]
+    S5 --> S6[Stage6 HUGE highlevel SFT offline]
+    S6 --> S7[Stage7 HUGE Isaac RL when sim drops]
+    S7 --> S8[Stage8 unified eval]
+```
+
+### Stage 5 — Core VLA RL
+
+This is the same trainer as Stage 4 — listed separately because it is the **prerequisite checkpoint** that Stages 6 and 7 resume from. Run from the empty-arena env until reward plateaus, then save the checkpoint that subsequent stages will fine-tune.
+
+```bash
+./isaaclab.sh -p ~/drone_project/vla/train.py \
+    --num_envs 256 --max_iterations 5000 --headless --enable_cameras
+# -> logs/rsl_rl/vla_drone_direct/<run>/model_*.pt
+```
+
+### Stage 6 — HUGE high-level offline SFT
+
+[`huge_bench/train_vla_highlevel.py`](../huge_bench/train_vla_highlevel.py) loads the Stage-5 checkpoint and supervises the high-level head only. Labels are **body-frame future waypoints** computed from each episode's trajectory by [`huge_bench/dataset_highlevel.py`](../huge_bench/dataset_highlevel.py) (look ahead K frames, project the displacement into the body frame at the current yaw). Loss is target MSE plus a small cosine direction term.
+
+This is **not** the same as the legacy [`huge_bench/train_bc.py`](../huge_bench/train_bc.py): that script trains a separate delta-action head ([`HugeBCPolicy`](../huge_bench/policy.py)) and bypasses the frozen waypoint policy. Keep it as a baseline action-MSE number for the leaderboard, but the model that flies in Isaac is the hierarchical one trained here.
+
+```bash
+python -m huge_bench.train_vla_highlevel \
+    --max_steps 5000 \
+    --resume_path logs/rsl_rl/vla_drone_direct/<run>/model_<N>.pt
+# -> logs/huge_bench_highlevel/<run>/model_*.pt
+```
+
+### Stage 7 — HUGE Isaac RL (scaffold)
+
+The HUGE-Bench Isaac Sim toolchain (3DGS-Mesh USDs + scene loaders) is not yet public. [`vla_huge/`](../vla_huge) follows the same shim pattern as [`vla_warehouse/`](../vla_warehouse): a `sys.modules`-patched `train.py` that swaps the env without duplicating the training loop. Until the digital-twin USDs ship, every entry in [`vla_huge/scenes.py`](../vla_huge/scenes.py) resolves to `warehouse_full.usd`, so Stage 7 functions today as a smoke test of the Stage-6-checkpoint resume path.
+
+```bash
+./isaaclab.sh -p ~/drone_project/vla_huge/train.py \
+    --num_envs 64 --max_iterations 3000 \
+    --headless --enable_cameras --scene_id 1_office \
+    --resume_path logs/huge_bench_highlevel/<run>/model_<N>.pt
+```
+
+When HUGE drops the sim, edit `HugeScene.usd_path` in `scenes.py` to point at the real digital-twin assets. See [`vla_huge/README.md`](../vla_huge/README.md) for details.
+
+### Stage 8 — Unified benchmark eval
+
+[`benchmarks/run_all.sh`](../benchmarks/run_all.sh) now scores three things on HUGE-Bench:
+
+| Backend | Metric | Source |
+|---|---|---|
+| `eval_huge.py --backend bc_checkpoint` | normalized + raw delta-action MSE | `HugeBCPolicy` (legacy baseline) |
+| `eval_huge_vla.py --backend vla_highlevel` | target MSE + median displacement + cosine direction on body-frame future waypoint | `HierarchicalVLAActor` from Stage 6 (or Stage 5 if no Stage 6 ckpt yet) |
+| `eval_huge.py --backend waypoint_heuristic` | zero-action MSE | lower bound |
+
+Both VLA backends evaluate on `test_seen` and `test_unseen` separately; results land under `logs/benchmarks/`.
+
+### One-shot runner
+
+[`scripts/train_curriculum_benchmark.sh`](../scripts/train_curriculum_benchmark.sh) chains Stages 5 → 6 → 7 → 8, gating each stage on the previous stage's checkpoint and writing per-stage logs under `logs/curriculum/stageN/`.
+
 For domain fine-tunes (warehouse scenes, Cesium tiles), behaviour-cloning baselines, and the Pi0 alternative, see [ADVANCED.md](ADVANCED.md).

@@ -42,6 +42,29 @@ else
   echo "      Then re-run with BC_CKPT=logs/huge_bench/<run>/model_20000.pt"
 fi
 
+# Hierarchical VLA target-prediction eval (Stage 6 / Stage 5 RL checkpoints).
+# Looks first at $VLA_CKPT, then at the latest stage-6 SFT run, then at the
+# latest Stage-4/5 RL run. Skip silently if none exists yet.
+VLA_CKPT="${VLA_CKPT:-}"
+if [[ -z "$VLA_CKPT" ]]; then
+  VLA_CKPT=$(ls -t "$DRONE"/logs/huge_bench_highlevel/*/model_*.pt 2>/dev/null | head -1 || true)
+fi
+if [[ -z "$VLA_CKPT" ]]; then
+  VLA_CKPT=$(ls -t "$DRONE"/logs/rsl_rl/vla_drone_direct/*/model_*.pt 2>/dev/null | head -1 || true)
+fi
+if [[ -n "$VLA_CKPT" && -f "$VLA_CKPT" ]]; then
+  echo "[1/4] HUGE-Bench — hierarchical VLA target-pred ($VLA_CKPT)"
+  for SPLIT in test_seen test_unseen; do
+    python -m benchmarks.eval_huge_vla \
+      --backend vla_highlevel --checkpoint "$VLA_CKPT" \
+      --split "$SPLIT" --device cuda --batch_size 4 --num_workers 2 \
+      --out_json "$OUT/huge_vla_target_${SPLIT}.json"
+  done
+else
+  echo "[1/4] No hierarchical VLA checkpoint — run Stage 5 (vla/train.py)"
+  echo "      and/or Stage 6 (huge_bench/train_vla_highlevel.py) first."
+fi
+
 # --- 2) CityNav (oracle waypoint geometry) -----------------------------
 echo ""
 echo "[2/4] CityNav"

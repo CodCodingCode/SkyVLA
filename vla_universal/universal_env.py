@@ -47,6 +47,9 @@ class UniversalDroneEnvCfg(_BaseCfg):
     # Deterministic spawn for reproducible scans
     spawn_xy_radius: float = 0.0
 
+    # Headless stage2 smoke tests: warehouse USD + physics, no RTX cameras
+    physics_only: bool = False
+
 
 class UniversalDroneEnv(_BaseEnv):
     cfg: UniversalDroneEnvCfg

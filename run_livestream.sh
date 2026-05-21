@@ -8,7 +8,10 @@ set -euo pipefail
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate isaac
 
-export LD_PRELOAD="${LD_PRELOAD:-}:/lib/aarch64-linux-gnu/libgomp.so.1"
+# aarch64 only — skip on x86_64 Lambda instances
+if [ -f /lib/aarch64-linux-gnu/libgomp.so.1 ]; then
+  export LD_PRELOAD="${LD_PRELOAD:-}:/lib/aarch64-linux-gnu/libgomp.so.1"
+fi
 export LIVESTREAM=2
 export ENABLE_CAMERAS=${ENABLE_CAMERAS:-1}
 

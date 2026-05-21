@@ -59,6 +59,9 @@ class VLAWarehouseDroneEnvCfg(_BaseVLADroneEnvCfg):
     spawn_altitude_jitter: float = 0.8
     spawn_xy_radius: float = 3.0       # random horizontal offset from env origin
 
+    # Skip TiledCameras (RTX) for headless physics-only tests (e.g. stage2 warehouse smoke)
+    physics_only: bool = False
+
     # --------------------------- POI selection ---------------------------
     num_active_pois: int = 3           # matches the 3 marker objects
 
@@ -134,12 +137,15 @@ class VLAWarehouseDroneEnv(_BaseVLADroneEnv):
         from isaaclab.sim.views import XformPrimView
 
         self._robot = Articulation(self.cfg.robot)
-        self._cameras = [
-            TiledCamera(self.cfg.cam_front),
-            TiledCamera(self.cfg.cam_right),
-            TiledCamera(self.cfg.cam_back),
-            TiledCamera(self.cfg.cam_left),
-        ]
+        if self.cfg.physics_only:
+            self._cameras = []
+        else:
+            self._cameras = [
+                TiledCamera(self.cfg.cam_front),
+                TiledCamera(self.cfg.cam_right),
+                TiledCamera(self.cfg.cam_back),
+                TiledCamera(self.cfg.cam_left),
+            ]
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing

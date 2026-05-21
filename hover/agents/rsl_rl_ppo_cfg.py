@@ -8,7 +8,7 @@ class HoverPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 1500
     save_interval = 50
     experiment_name = "hover_pretrain"
-    logger = "wandb"
+    logger = "tensorboard"  # set to "wandb" after `wandb login` if you want cloud logging
     wandb_project = "drone-hover"
 
     # 256-wide layers match lang_nav so weights transfer directly

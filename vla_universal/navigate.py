@@ -88,15 +88,7 @@ def pick_target(pois: list[POI], drone_xy: np.ndarray, policy: str,
         raise ValueError(f"unknown --pick policy: {policy}")
 
 
-def quat_rotate_inverse_np(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Rotate a vector by the inverse of a (w,x,y,z) quaternion."""
-    w, x, y, z = q_wxyz
-    # inverse of a unit quat = conjugate
-    q_inv = np.array([w, -x, -y, -z], dtype=np.float32)
-    # apply: use the same formula as _quat_apply_np in projection.py
-    qxyz = q_inv[1:]
-    t = 2.0 * np.cross(qxyz, v)
-    return v + q_inv[0] * t + np.cross(qxyz, t)
+from vla_universal.math_utils import quat_rotate_inverse_np  # noqa: E402
 
 
 def main() -> int:

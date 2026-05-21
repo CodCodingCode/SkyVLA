@@ -4,10 +4,13 @@ This folder wires our models to public aerial VLN benchmarks. Each benchmark has
 
 | Benchmark | Metric | Our adapter | Data / sim needed |
 |-----------|--------|-------------|-------------------|
-| **HUGE-Bench** | Action MSE (offline) | `huge_bench/` + `eval_huge.py` | HuggingFace only |
+| **HUGE-Bench** (action MSE baseline) | normalized + raw delta-action MSE | `huge_bench/policy.py` + [`eval_huge.py`](eval_huge.py) | HuggingFace only |
+| **HUGE-Bench** (hierarchical VLA target) | target MSE + median displacement + cosine direction | [`eval_huge_vla.py`](eval_huge_vla.py) (Stage 6 / Stage 7 ckpts) | HuggingFace only |
 | **CityNav** | NE, SR, OSR (sim) | `eval_citynav_oracle.py` | Point clouds + image cache |
 | **AirNav** | NE, SR, OSR, SPL (sim) | Manual (see AirNav repo) | Multi-GB rgbd + NavGym |
 | **OpenFly** | SR (sim) | Not available | Toolchain not open yet |
+
+`eval_huge.py` and `eval_huge_vla.py` are NOT redundant — they score **different models**. The first scores the legacy [`HugeBCPolicy`](../huge_bench/policy.py) on raw delta actions (the "we trained a separate BC head" baseline). The second scores the hierarchical [`HierarchicalVLAActor`](../vla/vla_policy.py) on its actual output: the body-frame target waypoint, with the Stage-2 controller still frozen. See [BENCHMARK_FAIRNESS.md](../docs/BENCHMARK_FAIRNESS.md) for what's claimable from each.
 
 ## Quick start (HUGE-Bench)
 
@@ -32,7 +35,15 @@ python -m benchmarks.run huge \
   --split test_seen --out_json /tmp/huge_test_seen.json
 ```
 
-**Note:** Our curriculum VLA checkpoint (`vla/train.py`) is **not** directly comparable to HUGE action deltas. The closest match is `HugeBCPolicy` (PaliGemma + MLP → `(dx,dy,dz,dyaw)`). To eval a trained VLA `.pt` you would need a separate export script; none is checked in yet.
+**Two evaluation paths.** The legacy `HugeBCPolicy` predicts raw `(dx, dy, dz, dyaw)` deltas, which match the dataset's action labels and produce an action-MSE leaderboard number. The Stage-6 hierarchical VLA predicts a body-frame **target** instead and re-uses the frozen Stage-2 waypoint controller for low-level flight; for it we score the predicted target against a body-frame future-waypoint label computed from the trajectory. Both numbers are useful: the BC MSE is directly comparable to other delta-action baselines on the HUGE leaderboard, while the target MSE shows whether the high-level head learned to localise the goal.
+
+```bash
+# Stage-6 hierarchical VLA target eval (after huge_bench/train_vla_highlevel.py)
+python -m benchmarks.eval_huge_vla \
+    --backend vla_highlevel \
+    --checkpoint logs/huge_bench_highlevel/<run>/model_5000.pt \
+    --split test_seen --out_json logs/benchmarks/huge_vla_target_test_seen.json
+```
 
 ## CityNav
 

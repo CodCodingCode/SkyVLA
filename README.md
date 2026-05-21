@@ -77,6 +77,21 @@ bash ~/drone_project/scripts/train_lang_nav.sh
 
 Pretrained checkpoints for the first two stages live in [checkpoints/](checkpoints) (Git LFS) so you can skip straight to Stage 3 or Stage 4 if you only want to iterate on the language and VLA pieces.
 
+## Video playback
+
+| What you want | Command |
+|---------------|---------|
+| Quick 2D demo MP4 | `waypoint_nav/play_fast.py` → `videos/waypoint_fast.mp4` |
+| Real 3D RTX chase-camera MP4 | `waypoint_nav/play_sim.py` → `videos/waypoint_sim_arena.mp4` |
+| Gym RecordVideo (rgb_array) | `waypoint_nav/play.py` → `videos/waypoint_nav_playback-*.mp4` |
+
+```bash
+# 3D arena footage (RTX chase camera)
+./isaaclab.sh -p ~/drone_project/waypoint_nav/play_sim.py \
+    --checkpoint ~/drone_project/checkpoints/stage2_waypoint.pt \
+    --num_steps 150 --headless --enable_cameras
+```
+
 ## Repository layout
 
 ```
@@ -84,7 +99,7 @@ drone_project/
 ├── README.md, LICENSE, requirements.txt
 ├── activate_env.sh, setup.sh
 ├── checkpoints/        Pretrained Stage 1 and Stage 2 weights (LFS)
-├── docs/               CURRICULUM.md, NEXT_STEPS.md, BENCHMARKS.md, ADVANCED.md
+├── docs/               CURRICULUM.md, BENCHMARKS.md, …
 ├── benchmarks/         External VLN benchmark runners
 ├── scripts/            Transfer scripts, Stage 3 launcher, FPV camera test
 ├── hover/              Stage 1 environment + agent

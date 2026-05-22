@@ -7,10 +7,11 @@
 Outdoor aerial vision-language navigation built on the [OpenFly](https://github.com/SHAILAB-IPEC/OpenFly-Platform) benchmark. The repository ships:
 
 - a thin evaluation harness around OpenFly's seen / unseen splits and SR / OSR / NE / SPL metrics;
-- a wrapper around the official OpenFly-Agent (OpenVLA 7B) FSDP fine-tune; and
-- a custom PaliGemma + LoRA + LSTM behaviour-cloning policy with its own offline trainer.
+- a wrapper around the official OpenFly-Agent (OpenVLA 7B) FSDP fine-tune;
+- a custom PaliGemma + LoRA + MLP behaviour-cloning policy with its own offline trainer; and
+- an RL pipeline on top of the AirSim bridge — DAgger, GRPO (PaliGemma), and PPO (OpenFly-Agent 7B with LoRA + value head).
 
-All Isaac Sim / Isaac Lab code (the previous indoor curriculum) has been removed; see [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) for the architectural lineage of the policy that now lives under [`openfly/models/`](openfly/models/).
+See [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) for design notes on the PaliGemma + LoRA backbone, and [`docs/A100_SETUP.md`](docs/A100_SETUP.md) for end-to-end setup on an x86_64 A100 host.
 
 ## Quick start
 
@@ -60,8 +61,8 @@ See [`openfly/README.md`](openfly/README.md) for the full eval / train reference
 | Doc | Contents |
 |-----|----------|
 | [`openfly/README.md`](openfly/README.md) | OpenFly eval, both training tracks, environment variables |
-| [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) | PaliGemma + LoRA + cross-attention + LSTM design notes |
-| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Benchmark coverage and the optional CityNav oracle baseline |
+| [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) | PaliGemma + LoRA feature extractor design notes |
+| [`docs/A100_SETUP.md`](docs/A100_SETUP.md) | End-to-end setup of the OpenFly RL stack on an x86_64 A100 host |
 | [`docs/BENCHMARK_FAIRNESS.md`](docs/BENCHMARK_FAIRNESS.md) | What is and is not claimable from each leaderboard number |
 | [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md) | Roadmap for extending the trainer and eval coverage |
 
@@ -70,26 +71,28 @@ See [`openfly/README.md`](openfly/README.md) for the full eval / train reference
 ```
 drone_project/
 ├── README.md, LICENSE, requirements.txt
-├── openfly/                 OpenFly eval, dataset, training, policies
-│   ├── eval_benchmark.py    Main eval harness (heuristic / OpenFly-Agent / PaliGemma)
+├── openfly/                 OpenFly eval, dataset, training, RL pipeline, policies
+│   ├── eval_benchmark.py    Main eval harness (heuristic / OpenFly-Agent / PaliGemma / DAgger / GRPO / PPO)
 │   ├── train_paligemma.py   Offline BC trainer for the custom model
+│   ├── train_dagger.py      DAgger relabel loop on top of the BC checkpoint
+│   ├── train_grpo_paligemma.py   GRPO RL fine-tune for the PaliGemma policy
+│   ├── train_ppo_openfly_agent.py   PPO + LoRA + value head for OpenFly-Agent 7B
 │   ├── run_train_agent.sh   Wrapper for upstream OpenVLA FSDP training
+│   ├── envs/airsim_vln_env.py    gymnasium env wrapping the AirSim bridge
+│   ├── rewards.py / rollout.py   Episode rewards + trajectory collection
 │   ├── dataset.py           PyTorch dataset over OpenFly trajectories
-│   ├── models/paligemma_vln.py
+│   ├── models/paligemma_vln.py / models/openfly_agent_rl.py
 │   ├── actions.py / episodes.py / platform.py / policies.py
-├── vla/                     Portable PaliGemma feature extractor + LoRA + design docs
-├── benchmarks/              OpenFly-first benchmark runner (CityNav oracle optional)
-├── checkpoints/             Legacy Isaac-trained weights (reference only — not used by OpenFly)
-├── docs/                    BENCHMARKS, BENCHMARK_FAIRNESS, NEXT_STEPS
-└── logs/                    Training and benchmark outputs
+├── vla/                     Portable PaliGemma feature extractor + LoRA + design notes
+├── docs/                    A100_SETUP, BENCHMARK_FAIRNESS, NEXT_STEPS
+└── logs/                    Training and benchmark outputs (gitignored)
 ```
 
 ## Prerequisites
 
 - NVIDIA GPU (24 GB+ VRAM recommended; OpenFly-Agent 7B FSDP needs more).
-- Linux x86_64 or aarch64.
+- Linux **x86_64** (the upstream AirSim Unreal Engine binaries are not built for aarch64 — see [`docs/A100_SETUP.md`](docs/A100_SETUP.md)).
 - Python 3.10 inside a conda environment named `openfly` (`openfly/setup.sh` creates it).
-- Optional: `git-lfs` if you want the legacy checkpoints in [`checkpoints/`](checkpoints).
 
 ## Citation
 

@@ -1,6 +1,7 @@
 """PaliGemma BC policy for OpenFly's 10-class discrete action space.
 
-Adapted from ``vla.vla_policy.HierarchicalVLAActor``. Key differences:
+Builds on ``vla.vla_policy.PaliGemmaFeatureExtractor``. Key differences from
+the earlier multi-camera Isaac variant:
 
 * Single RGB input (no 4-camera rig, no depth maps, no waypoint policy).
 * History of past frames is folded into the SigLIP token stream by

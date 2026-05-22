@@ -47,5 +47,5 @@ That is accurate, calibrates expectations, and makes the contribution legible wi
 ## Cross-references
 
 - Implementation: [`openfly/train_paligemma.py`](../openfly/train_paligemma.py), [`openfly/eval_benchmark.py`](../openfly/eval_benchmark.py), [`openfly/policies.py`](../openfly/policies.py).
-- Benchmark overview: [`BENCHMARKS.md`](BENCHMARKS.md).
+- Eval reference: [`../openfly/README.md`](../openfly/README.md).
 - Architecture lineage: [`vla/VLA_SYSTEM.md`](../vla/VLA_SYSTEM.md).

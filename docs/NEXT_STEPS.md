@@ -6,10 +6,10 @@ The repository targets the OpenFly outdoor aerial VLN benchmark. This document t
 
 | Component | Status |
 |-----------|--------|
-| OpenFly evaluation harness | Implemented, runs the `heuristic`, `openfly-agent`, and custom `paligemma` policies |
+| OpenFly evaluation harness | Implemented, runs the `heuristic`, `openfly-agent`, `paligemma`, `dagger`, `grpo`, and `ppo` policies |
 | OpenFly-Agent (OpenVLA 7B) wrapper | [`openfly/run_train_agent.sh`](../openfly/run_train_agent.sh) calls upstream FSDP training |
 | Custom PaliGemma BC policy | [`openfly/train_paligemma.py`](../openfly/train_paligemma.py) — offline cross-entropy on `train.json` |
-| Legacy Isaac checkpoints | [`checkpoints/`](../checkpoints/) — kept as a reference, not used by the OpenFly stack |
+| RL pipeline | DAgger / GRPO / PPO trainers under [`openfly/`](../openfly/) with shared Gymnasium env, rewards, and rollout collector |
 
 ## Recommended order of work
 
@@ -35,7 +35,6 @@ The OpenFly harness already supports the seen / unseen / eval_test splits and pe
 
 - Per-scene break-downs in the summary JSON (currently aggregated across envs).
 - Episode video logging via OpenCV when `--save_video` is passed.
-- Wiring [`benchmarks/eval_citynav_oracle.py`](../benchmarks/eval_citynav_oracle.py) to consume the same trained policy when CityNav data is available.
 
 ## References
 

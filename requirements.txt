@@ -1,11 +1,20 @@
-# Project dependencies on top of an existing Isaac Sim 5.1 + Isaac Lab 2.3.2
-# install. Use `bash setup.sh` for a from-scratch machine setup; this file is
-# intended for adding the Python deps to an environment that already has
-# Isaac Sim available.
+# Python dependencies for drone_project (OpenFly outdoor VLN track).
+# `bash openfly/setup.sh` installs these into the `openfly` conda env and also
+# pulls extras (airsim, msgpack-rpc-python, flash-attn) that are awkward via
+# requirements.txt. This file is the canonical "what does the repo import?"
+# reference.
 
-transformers>=4.50.0
-wandb>=0.25.0
-rsl-rl-lib>=5.0.0
-opencv-python-headless>=4.10.0
-tensorboard>=2.18.0
-moviepy>=2.0.0
+torch>=2.2
+torchvision>=0.17
+transformers>=4.45,<5
+huggingface_hub>=0.24
+accelerate>=0.30
+timm>=1.0
+einops>=0.7
+numpy>=1.26
+pillow>=10
+opencv-python>=4.9
+pyyaml>=6
+tqdm>=4.66
+tensorboard>=2.15
+wandb>=0.17

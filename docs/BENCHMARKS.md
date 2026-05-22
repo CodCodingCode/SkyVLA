@@ -1,108 +1,58 @@
-# External benchmarks
+# Benchmarks
 
-This project can be evaluated on public aerial vision-and-language navigation (VLN) benchmarks via the [`benchmarks/`](../benchmarks/) harness. Results are written to `logs/benchmarks/` (not checked into git).
+This project uses [OpenFly](https://github.com/SHAILAB-IPEC/OpenFly-Platform) as its primary benchmark and exposes a small number of supplementary baselines through `benchmarks/run.py`.
 
-## Supported benchmarks
+| Benchmark | Metrics | Status | Adapter |
+|-----------|---------|--------|---------|
+| [OpenFly](https://github.com/SHAILAB-IPEC/OpenFly-Platform) | SR, OSR, NE, SPL | Primary | [`openfly/eval_benchmark.py`](../openfly/eval_benchmark.py) |
+| [CityNav](https://github.com/water-cookie/citynav) (oracle baseline) | NE, SR, OSR | Optional | [`benchmarks/eval_citynav_oracle.py`](../benchmarks/eval_citynav_oracle.py) |
 
-| Benchmark | Metrics | Status | Our adapter |
-|-----------|---------|--------|-------------|
-| [HUGE-Bench](https://huggingface.co/datasets/yu781986168/HUGE_Dataset_task0) | Action MSE (offline) | Runnable | `huge_bench/` + `benchmarks/eval_huge.py` |
-| [CityNav](https://arxiv.org/abs/2406.14240) | NE, SR, OSR | Partial | `benchmarks/eval_citynav_oracle.py` |
-| [AirNav](https://huggingface.co/datasets/dpairnav/AirNav) | NE, SR, OSR, SPL | Data-heavy | Manual (AirNav repo) |
-| [OpenFly](https://shailab-ipec.github.io/openfly/) | SR | Not open yet | — |
+## OpenFly
 
-## Quick run
+OpenFly evaluates outdoor aerial vision-language navigation across AirSim, Unreal Engine, and 3D Gaussian Splatting scenes. Episodes from the official `seen.json` and `unseen.json` annotation files are run with the upstream simulation bridges.
 
 ```bash
-source ~/miniconda3/bin/activate isaac
-cd ~/drone_project
-pip install pyarrow   # once, for HUGE parquet
+bash ~/drone_project/openfly/setup.sh
+bash ~/drone_project/openfly/download_airsim_scene.sh env_airsim_16
+source ~/drone_project/openfly/activate.sh
 
-# All runnable benchmarks (skips missing data)
-bash benchmarks/run_all.sh
+python -m benchmarks.run openfly \
+  --split unseen --policy heuristic \
+  --env_filter env_airsim_16 --max_episodes 5
 ```
 
-Or per benchmark:
+Three policies are available out of the box:
 
-```bash
-python -m benchmarks.run huge --backend waypoint_heuristic --split test_seen
-python -m benchmarks.run citynav --citynav_root $HOME/benchmarks_external/citynav
-```
+- `heuristic` — oracle that turns toward the episode goal and lands within 20 m. Used as a sanity check on the simulator and metrics.
+- `openfly-agent` — the official `IPEC-COMMUNITY/openfly-agent-7b` from Hugging Face.
+- `paligemma` — the custom PaliGemma + LoRA + LSTM checkpoint produced by [`openfly/train_paligemma.py`](../openfly/train_paligemma.py). Pass `--paligemma_ckpt <path>`.
 
-Clone external repos (does not download multi-GB assets):
+See [`openfly/README.md`](../openfly/README.md) for the full eval and training reference.
+
+## CityNav (oracle baseline)
+
+The CityNav adapter is **not** a fair vision-language comparison: it hands the policy the ground-truth goal XYZ and only measures whether the discretiser in [`benchmarks/adapters/discrete.py`](../benchmarks/adapters/discrete.py) can reach it. Useful as a regression test for the body-frame action mapping.
 
 ```bash
 bash benchmarks/setup_external.sh
+export CITYNAV_ROOT=$HOME/benchmarks_external/citynav
+python -m benchmarks.run citynav --citynav_root "$CITYNAV_ROOT" --max_episodes 50
 ```
 
-## Initial results (May 2026)
-
-Run on **NVIDIA A100-SXM4-40GB**, driver **580.105.08**.
-
-### HUGE-Bench task0 (zero-action baseline)
-
-| Split | Samples | Norm. MSE | Raw MSE |
-|-------|---------|-----------|---------|
-| test_seen | 19,157 | 1.212 | 0.160 |
-| test_unseen | 14,856 | 1.234 | 0.160 |
-
-This is a **sanity lower bound** (predict zero deltas). The trained model path uses `HugeBCPolicy` (PaliGemma + MLP); see below.
-
-### CityNav (oracle waypoint mapper, 500 eps/split)
-
-| Split | NE (m) | SR | OSR |
-|-------|--------|-----|-----|
-| val_seen | 17.5 | 100% | 100% |
-| val_unseen | 17.5 | 100% | 100% |
-
-**Caveat:** Goals are given as oracle XYZ — this tests navigation geometry only, not language grounding. Paper baselines (CMA, Seq2Seq) use RGB + depth + instructions and typically achieve much lower SR on the full task.
-
-### Blocked / pending
-
-- **HUGE BC (PaliGemma):** requires `huggingface-cli login` and accepting the [PaliGemma license](https://huggingface.co/google/paligemma-3b-pt-224).
-- **AirNav:** needs full `rgbd-new` / NavGym photo cache (multi-GB).
-- **OpenFly:** toolchain not fully released.
-- **Curriculum VLA:** no Stage 4 checkpoint in repo yet — Isaac Sim eval not benchmarked.
-
-## Model ↔ benchmark mapping
-
-| drone_project output | HUGE-Bench | CityNav / AirNav |
-|----------------------|------------|------------------|
-| Stage 2 waypoint MLP | N/A (continuous sim) | `target_body_to_*` discretization |
-| Stage 4 VLA target (3D body) | N/A | discrete macro-actions (future) |
-| `HugeBCPolicy` (dx,dy,dz,dyaw) | **native** | future delta integrator |
-
-Stage 4 VLA (`vla/train.py`) is **not** directly comparable to HUGE action deltas without an export adapter.
-
-## Trained HUGE-Bench eval
+## Running everything
 
 ```bash
-# 1) Accept license + login
-huggingface-cli login
-
-# 2) Train (no Isaac Sim)
-bash huge_bench/run_train_bc.sh
-
-# 3) Eval
-python -m benchmarks.run huge \
-  --backend bc_checkpoint \
-  --checkpoint logs/huge_bench/<run>/model_20000.pt \
-  --split test_seen --out_json logs/benchmarks/huge_bc_test_seen.json
+RUN_OPENFLY_AGENT=1 \
+PALIGEMMA_CKPT=logs/openfly/paligemma/<run>/last.pt \
+bash benchmarks/run_all.sh
 ```
 
-## Driver note (Lambda / A100)
+Results land under `logs/benchmarks/`.
 
-If `nvidia-smi` fails with **Driver/library version mismatch**, install utils matching the loaded kernel module:
+## What we report
 
-```bash
-sudo apt-get install -y nvidia-utils-580-server
-sudo apt-get purge libnvidia-compute-580 libnvidia-compute-570  # stale rc configs only
-```
+- Always specify the split (`seen`, `unseen`, or a single env via `--env_filter`).
+- Always specify the policy and (for `paligemma`) the checkpoint path.
+- The OpenFly summary JSON includes per-episode SR / OSR / NE / SPL plus the simulator's exit reason — keep the file alongside any leaderboard claim.
 
-## References
-
-- CityNav: [water-cookie/citynav](https://github.com/water-cookie/citynav)
-- AirNav: [nopride03/AirNav](https://github.com/nopride03/AirNav)
-- HUGE-Bench dataset: [yu781986168/HUGE_Dataset_task0](https://huggingface.co/datasets/yu781986168/HUGE_Dataset_task0)
-
-See also [benchmarks/README.md](../benchmarks/README.md) for file-level detail.
+See [`BENCHMARK_FAIRNESS.md`](BENCHMARK_FAIRNESS.md) for what is and is not claimable from each evaluation mode.

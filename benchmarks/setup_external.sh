@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Clone external benchmark repos (does NOT download multi-GB datasets).
+# Clone external benchmark repos used by the optional CityNav oracle baseline.
+# OpenFly is the primary benchmark and is set up via openfly/setup.sh.
 set -euo pipefail
 
 BENCH_DIR="${BENCH_DIR:-$HOME/benchmarks_external}"
@@ -16,30 +17,18 @@ clone_if_missing() {
 }
 
 clone_if_missing citynav https://github.com/water-cookie/citynav.git
-clone_if_missing AirNav   https://github.com/nopride03/AirNav.git
 
 cat <<EOF
 
 Cloned under: $BENCH_DIR
 
-Next steps — HUGE-Bench (easiest, no sim):
-  source ~/miniconda3/bin/activate isaac
-  cd ~/drone_project
-  pip install datasets pyarrow   # if missing
-  python -m huge_bench.train_bc --max_steps 5000   # train adapter
-  python -m benchmarks.run huge --backend bc_checkpoint --checkpoint logs/huge_bench/<run>/model_5000.pt
+Next steps — OpenFly (primary benchmark, set up separately):
+  bash ~/drone_project/openfly/setup.sh
+  bash ~/drone_project/openfly/download_airsim_scene.sh env_airsim_16
 
-Next steps — CityNav (real urban point clouds + image cache):
+Next steps — CityNav oracle (optional, real urban point clouds):
   export CITYNAV_ROOT=$BENCH_DIR/citynav
   cd \$CITYNAV_ROOT && sh scripts/download_data.sh
-  # + SensatUrban PLY rasterization per citynav/README.md
+  # plus SensatUrban PLY rasterization per citynav/README.md
   python -m benchmarks.run citynav --citynav_root \$CITYNAV_ROOT --max_episodes 20
-
-Next steps — AirNav:
-  export AIRNAV_ROOT=$BENCH_DIR/AirNav
-  # Download from https://huggingface.co/datasets/dpairnav/AirNav into \$AIRNAV_ROOT/data/
-  cd \$AIRNAV_ROOT && pip install -r requirements.txt
-  # See AirNav README for vLLM / Qwen baselines
-
-OpenFly: not yet released — https://shailab-ipec.github.io/openfly/
 EOF

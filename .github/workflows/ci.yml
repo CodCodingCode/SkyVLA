@@ -17,27 +17,18 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      # Compile every Python file we ship outside of Isaac-only modules.
-      # Isaac Sim imports are skipped because the runner has no GPU and no
-      # Isaac install; the syntax check still catches `SyntaxError` and
+      # Compile every Python file we ship. PaliGemma and AirSim imports are
+      # avoided because the runner has no GPU and no upstream OpenFly-Platform
+      # checkout; the syntax check still catches `SyntaxError` and
       # `IndentationError` across the whole tree.
       - name: Compile Python sources
         run: |
           python -m compileall -q \
-            scripts \
-            hover \
-            waypoint_nav \
-            lang_nav \
-            lang_nav_siglip \
-            vla \
-            vla_warehouse \
-            vla_cesium \
-            vla_universal \
-            pi \
-            huge_bench \
-            main.py
+            openfly \
+            vla/vla_policy.py \
+            benchmarks
 
   markdown-links:
     name: Markdown link check

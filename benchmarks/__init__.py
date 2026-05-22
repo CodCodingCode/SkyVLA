@@ -1,8 +1,6 @@
-"""External benchmark runners for drone_project models.
+"""External benchmark runners for drone_project.
 
 Supported:
-  - huge   — HUGE-Bench task0 offline action MSE (HuggingFace)
-  - citynav — CityNav aerial VLN (requires clone + dataset; sim eval)
-  - airnav  — AirNav aerial VLN (requires clone + dataset; sim eval)
-  - openfly — not yet open-sourced (stub)
+  - openfly  — OpenFly outdoor aerial VLN (default; primary benchmark).
+  - citynav  — CityNav oracle waypoint baseline (optional; needs CityNav clone).
 """

@@ -1,123 +1,102 @@
 # drone_project
 
-[![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/)
-[![Isaac Sim](https://img.shields.io/badge/Isaac%20Sim-5.1-76b900.svg)](https://developer.nvidia.com/isaac-sim)
-[![Isaac Lab](https://img.shields.io/badge/Isaac%20Lab-2.3.2-76b900.svg)](https://github.com/isaac-sim/IsaacLab)
+[![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/)
+[![OpenFly](https://img.shields.io/badge/OpenFly-VLN-1f6feb.svg)](https://github.com/SHAILAB-IPEC/OpenFly-Platform)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Language-grounded drone navigation in NVIDIA Isaac Sim. A Crazyflie quadcopter is trained with PPO across a four-stage curriculum so it can fly to objects described in natural language ("fly to the red cube", "go to the forklift") using only an onboard camera and the command text.
+Outdoor aerial vision-language navigation built on the [OpenFly](https://github.com/SHAILAB-IPEC/OpenFly-Platform) benchmark. The repository ships:
 
-## Architecture
+- a thin evaluation harness around OpenFly's seen / unseen splits and SR / OSR / NE / SPL metrics;
+- a wrapper around the official OpenFly-Agent (OpenVLA 7B) FSDP fine-tune; and
+- a custom PaliGemma + LoRA + LSTM behaviour-cloning policy with its own offline trainer.
 
-The policy is built up across four stages, each one extending the previous one with strictly more task structure while preserving the low-level flight skills already learned. See [docs/CURRICULUM.md](docs/CURRICULUM.md) for the full story, including the weight-transfer mechanics that bridge each stage.
+All Isaac Sim / Isaac Lab code (the previous indoor curriculum) has been removed; see [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) for the architectural lineage of the policy that now lives under [`openfly/models/`](openfly/models/).
 
-| Stage | Module | What it teaches |
-|-------|--------|-----------------|
-| 1 | [hover/](hover) | Altitude hold, stability, thrust control |
-| 2 | [waypoint_nav/](waypoint_nav) | Point-to-point navigation with an in-env reward curriculum |
-| 3 | [lang_nav/](lang_nav) | Pick the correct object from a CLIP-encoded language command |
-| 4 | [vla/](vla) | Full VLA: PaliGemma decides where to go, the frozen Stage 2 policy flies |
+## Quick start
 
-Optional and experimental modules (SigLIP variant, Pi0, warehouse and Cesium fine-tunes, behaviour-cloning baseline) are documented in [docs/ADVANCED.md](docs/ADVANCED.md).
+```bash
+git clone https://github.com/CodCodingCode/drone_project.git ~/drone_project
+cd ~/drone_project
+
+# 1. One-time setup: conda env, OpenFly-Platform clone, annotation JSON.
+bash openfly/setup.sh
+
+# 2. Download at least one AirSim scene (several GB).
+bash openfly/download_airsim_scene.sh env_airsim_16
+
+# 3. Sanity-check the eval harness with the oracle policy.
+source openfly/activate.sh
+bash openfly/run_eval.sh \
+  --split unseen --policy heuristic \
+  --env_filter env_airsim_16 --max_episodes 5
+```
+
+Eval results land in `logs/benchmarks/openfly_*.json`.
+
+## Train
+
+Two interchangeable training tracks ship with the repo. Both target the OpenFly eval harness above.
+
+```bash
+# Track A — official OpenFly-Agent (OpenVLA 7B) via upstream FSDP. See openfly/README.md
+#           for the TFDS build steps that must run first.
+export OPENFLY_TFDS_DIR=~/openfly_tfds
+bash openfly/run_train_agent.sh --run_root_dir runs/openfly_agent_7b
+
+# Track B — custom PaliGemma BC on train.json (single GPU, offline).
+export OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images
+bash openfly/run_train_paligemma.sh --epochs 10 --batch_size 8
+
+# Evaluate the custom checkpoint:
+bash openfly/run_eval.sh --split unseen --policy paligemma \
+  --paligemma_ckpt logs/openfly/paligemma/<run>/last.pt \
+  --env_filter env_airsim_16
+```
+
+See [`openfly/README.md`](openfly/README.md) for the full eval / train reference.
 
 ## Documentation
 
 | Doc | Contents |
 |-----|----------|
-| [docs/CURRICULUM.md](docs/CURRICULUM.md) | Four-stage training pipeline and weight transfer |
-| [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) | What to train next and benchmark roadmap |
-| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | HUGE-Bench, CityNav, AirNav eval and initial results |
-| [benchmarks/](benchmarks/) | Runnable benchmark harness (`run_all.sh`) |
-
-## Prerequisites
-
-- NVIDIA GPU with at least 24 GB VRAM (A10, H100, GH200 all tested)
-- Ubuntu 22.04, x86_64 or aarch64
-- Isaac Sim 5.1 and Isaac Lab 2.3.2
-- Pegasus Simulator for multirotor flight dynamics
-- Python 3.11 inside a conda environment named `isaac`
-- `git-lfs` for the pretrained checkpoints in [checkpoints/](checkpoints)
-
-## Quick start
-
-```bash
-git lfs install
-git clone https://github.com/CodCodingCode/drone_project.git ~/drone_project
-cd ~/drone_project
-bash setup.sh
-source activate_env.sh
-```
-
-`setup.sh` installs Miniconda (if needed), clones Isaac Lab, creates the `isaac` conda env, and installs Isaac Sim plus all Python dependencies. `activate_env.sh` is meant to be sourced before running any training script and sets `OMNI_KIT_ACCEPT_EULA`, `ISAACSIM_PATH`, and `TERM`.
-
-If you only need the Python deps in a pre-existing environment, `requirements.txt` lists everything that is not part of the Isaac Sim install.
-
-## Training
-
-```bash
-# Stage 1: hover
-./isaaclab.sh -p ~/drone_project/hover/train.py \
-    --num_envs 1024 --max_iterations 1500 --headless
-
-# Stage 2: waypoint navigation, resumed from hover
-python ~/drone_project/scripts/transfer_hover_to_waypoint.py \
-    --hover_checkpoint ~/drone_project/checkpoints/stage1_hover.pt \
-    --output_path logs/rsl_rl/waypoint_nav/pretrained_init.pt
-./isaaclab.sh -p ~/drone_project/waypoint_nav/train.py \
-    --num_envs 1024 --max_iterations 2000 --headless \
-    --resume_path logs/rsl_rl/waypoint_nav/pretrained_init.pt
-
-# Stage 3: language navigation (CLIP)
-bash ~/drone_project/scripts/train_lang_nav.sh
-
-# Stage 4: full VLA (PaliGemma)
-./isaaclab.sh -p ~/drone_project/vla/train.py \
-    --num_envs 256 --max_iterations 5000 --headless --enable_cameras
-```
-
-Pretrained checkpoints for the first two stages live in [checkpoints/](checkpoints) (Git LFS) so you can skip straight to Stage 3 or Stage 4 if you only want to iterate on the language and VLA pieces.
-
-## Video playback
-
-| What you want | Command |
-|---------------|---------|
-| Quick 2D demo MP4 | `waypoint_nav/play_fast.py` → `videos/waypoint_fast.mp4` |
-| Real 3D RTX chase-camera MP4 | `waypoint_nav/play_sim.py` → `videos/waypoint_sim_arena.mp4` |
-| Gym RecordVideo (rgb_array) | `waypoint_nav/play.py` → `videos/waypoint_nav_playback-*.mp4` |
-
-```bash
-# 3D arena footage (RTX chase camera)
-./isaaclab.sh -p ~/drone_project/waypoint_nav/play_sim.py \
-    --checkpoint ~/drone_project/checkpoints/stage2_waypoint.pt \
-    --num_steps 150 --headless --enable_cameras
-```
+| [`openfly/README.md`](openfly/README.md) | OpenFly eval, both training tracks, environment variables |
+| [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) | PaliGemma + LoRA + cross-attention + LSTM design notes |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Benchmark coverage and the optional CityNav oracle baseline |
+| [`docs/BENCHMARK_FAIRNESS.md`](docs/BENCHMARK_FAIRNESS.md) | What is and is not claimable from each leaderboard number |
+| [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md) | Roadmap for extending the trainer and eval coverage |
 
 ## Repository layout
 
 ```
 drone_project/
 ├── README.md, LICENSE, requirements.txt
-├── activate_env.sh, setup.sh
-├── checkpoints/        Pretrained Stage 1 and Stage 2 weights (LFS)
-├── docs/               CURRICULUM.md, BENCHMARKS.md, …
-├── benchmarks/         External VLN benchmark runners
-├── scripts/            Transfer scripts, Stage 3 launcher, FPV camera test
-├── hover/              Stage 1 environment + agent
-├── waypoint_nav/       Stage 2 environment + agent
-├── lang_nav/           Stage 3 environment + agent (CLIP)
-├── vla/                Stage 4 environment + agent (PaliGemma)
-└── lang_nav_siglip/, pi/, vla_warehouse/, vla_cesium/, vla_universal/, huge_bench/
-                        Advanced and experimental modules (see docs/ADVANCED.md)
+├── openfly/                 OpenFly eval, dataset, training, policies
+│   ├── eval_benchmark.py    Main eval harness (heuristic / OpenFly-Agent / PaliGemma)
+│   ├── train_paligemma.py   Offline BC trainer for the custom model
+│   ├── run_train_agent.sh   Wrapper for upstream OpenVLA FSDP training
+│   ├── dataset.py           PyTorch dataset over OpenFly trajectories
+│   ├── models/paligemma_vln.py
+│   ├── actions.py / episodes.py / platform.py / policies.py
+├── vla/                     Portable PaliGemma feature extractor + LoRA + design docs
+├── benchmarks/              OpenFly-first benchmark runner (CityNav oracle optional)
+├── checkpoints/             Legacy Isaac-trained weights (reference only — not used by OpenFly)
+├── docs/                    BENCHMARKS, BENCHMARK_FAIRNESS, NEXT_STEPS
+└── logs/                    Training and benchmark outputs
 ```
 
-## Citation
+## Prerequisites
 
-If you use this code in academic work, please cite:
+- NVIDIA GPU (24 GB+ VRAM recommended; OpenFly-Agent 7B FSDP needs more).
+- Linux x86_64 or aarch64.
+- Python 3.10 inside a conda environment named `openfly` (`openfly/setup.sh` creates it).
+- Optional: `git-lfs` if you want the legacy checkpoints in [`checkpoints/`](checkpoints).
+
+## Citation
 
 ```bibtex
 @software{codcodingcode_drone_project,
   author = {CodCodingCode},
-  title  = {drone_project: language-grounded drone navigation in Isaac Sim},
+  title  = {drone_project: outdoor aerial VLN with OpenFly},
   year   = {2026},
   url    = {https://github.com/CodCodingCode/drone_project}
 }

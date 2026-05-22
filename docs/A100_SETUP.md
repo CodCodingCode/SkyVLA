@@ -49,7 +49,7 @@ Cheap providers: Lambda, RunPod, Vast.ai, CoreWeave. Ask for `xvfb`, `mesa-utils
 
 ```bash
 # Clone this repo
-git clone https://github.com/CodCodingCode/drone_project.git ~/drone_project
+git clone https://github.com/CodCodingCode/SkyVLA.git ~/drone_project
 cd ~/drone_project
 
 # One-shot setup: conda env, OpenFly-Platform clone, annotations, system deps

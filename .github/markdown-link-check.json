@@ -4,7 +4,7 @@
       "pattern": "^https?://localhost"
     },
     {
-      "pattern": "^https://github.com/CodCodingCode/drone_project"
+      "pattern": "^https://github.com/CodCodingCode/SkyVLA"
     }
   ],
   "timeout": "20s",

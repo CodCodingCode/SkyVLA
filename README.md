@@ -1,4 +1,4 @@
-# drone_project
+# SkyVLA
 
 [![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/)
 [![OpenFly](https://img.shields.io/badge/OpenFly-VLN-1f6feb.svg)](https://github.com/SHAILAB-IPEC/OpenFly-Platform)
@@ -15,7 +15,7 @@ All Isaac Sim / Isaac Lab code (the previous indoor curriculum) has been removed
 ## Quick start
 
 ```bash
-git clone https://github.com/CodCodingCode/drone_project.git ~/drone_project
+git clone https://github.com/CodCodingCode/SkyVLA.git ~/drone_project
 cd ~/drone_project
 
 # 1. One-time setup: conda env, OpenFly-Platform clone, annotation JSON.
@@ -94,11 +94,11 @@ drone_project/
 ## Citation
 
 ```bibtex
-@software{codcodingcode_drone_project,
+@software{codcodingcode_skyvla,
   author = {CodCodingCode},
-  title  = {drone_project: outdoor aerial VLN with OpenFly},
+  title  = {SkyVLA: outdoor aerial vision-language navigation with OpenFly},
   year   = {2026},
-  url    = {https://github.com/CodCodingCode/drone_project}
+  url    = {https://github.com/CodCodingCode/SkyVLA}
 }
 ```
 

@@ -214,17 +214,88 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         return int(action)
 
 
+class OpenFlyAgentRLPolicy(OpenFlyPolicy):
+    """OpenFly-Agent 7B with PPO LoRA + value head from Phase 5.
+
+    Wraps :class:`openfly.models.openfly_agent_rl.OpenFlyAgentRL` and
+    loads the trainable ``lora_state`` produced by
+    ``train_ppo_openfly_agent.py``. The backbone stays at the upstream
+    HF weights so the file on disk is small.
+    """
+
+    def __init__(
+        self,
+        checkpoint: str,
+        *,
+        model_id: str = "IPEC-COMMUNITY/openfly-agent-7b",
+        device: str = "cuda:0",
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        history_steps: int = 2,
+        do_sample: bool = False,
+    ):
+        import torch
+
+        from openfly.models.openfly_agent_rl import OpenFlyAgentRL
+
+        self.model = OpenFlyAgentRL(
+            model_id=model_id,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            device=device,
+            history_steps=history_steps,
+        )
+        if checkpoint:
+            ckpt = torch.load(checkpoint, map_location=device)
+            state = ckpt.get("lora_state", ckpt)
+            missing, unexpected = self.model.load_state_dict(state, strict=False)
+            print(
+                f"[ppo-agent-policy] loaded {checkpoint}: "
+                f"{len(missing)} missing, {len(unexpected)} unexpected"
+            )
+        self.do_sample = bool(do_sample)
+        self.instruction = ""
+
+    def reset(self, instruction: str, goal: Sequence[float]) -> None:
+        del goal
+        self.instruction = instruction
+
+    def act(
+        self,
+        rgb: np.ndarray,
+        pose: Sequence[float],
+        step: int,
+        history: list[int],
+    ) -> int:
+        del pose, step
+        return int(
+            self.model.act(rgb, self.instruction, history, do_sample=self.do_sample)
+        )
+
+
 def build_policy(name: str, **kwargs: Any) -> OpenFlyPolicy:
     name = name.lower()
     if name in ("heuristic", "oracle", "goal"):
         return GoalHeuristicPolicy(**kwargs)
     if name in ("openfly", "openfly-agent", "agent"):
         return OpenFlyAgentPolicy(**kwargs)
-    if name in ("paligemma", "vla"):
+    if name in ("paligemma", "vla", "grpo", "dagger"):
+        # GRPO and DAgger ckpts share the PaliGemmaVLNPolicy state dict, so
+        # they are loaded by the same adapter — the alias just signals which
+        # training stage produced the weights.
         if "checkpoint" not in kwargs:
             raise ValueError(
-                "paligemma policy requires --paligemma_ckpt (checkpoint=...) "
-                "produced by openfly.train_paligemma"
+                f"{name} policy requires --paligemma_ckpt (checkpoint=...) "
+                "produced by openfly.train_paligemma / train_dagger / train_grpo_paligemma"
             )
         return PaliGemmaOpenFlyPolicy(**kwargs)
-    raise ValueError(f"Unknown policy {name!r}. Use: heuristic, openfly-agent, paligemma")
+    if name in ("ppo", "ppo-agent", "openfly-agent-rl"):
+        if "checkpoint" not in kwargs:
+            raise ValueError(
+                "ppo policy requires --ppo_ckpt (checkpoint=...) "
+                "produced by openfly.train_ppo_openfly_agent"
+            )
+        return OpenFlyAgentRLPolicy(**kwargs)
+    raise ValueError(
+        f"Unknown policy {name!r}. Use: heuristic, openfly-agent, paligemma, dagger, grpo, ppo"
+    )

@@ -36,7 +36,12 @@ from openfly.policies import build_policy
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OpenFly VLN benchmark eval")
     p.add_argument("--split", type=str, default="unseen", help="seen|unseen|eval_test|train")
-    p.add_argument("--policy", type=str, default="heuristic", help="heuristic|openfly-agent|paligemma")
+    p.add_argument(
+        "--policy",
+        type=str,
+        default="heuristic",
+        help="heuristic|openfly-agent|paligemma|dagger|grpo|ppo",
+    )
     p.add_argument("--max_episodes", type=int, default=0, help="0 = all in split")
     p.add_argument("--env_filter", type=str, default="", help="Substring filter on env name")
     p.add_argument("--max_steps", type=int, default=100)
@@ -47,7 +52,13 @@ def parse_args() -> argparse.Namespace:
         "--paligemma_ckpt",
         type=str,
         default="",
-        help="Checkpoint produced by openfly.train_paligemma (required when --policy paligemma).",
+        help="PaliGemma checkpoint (train_paligemma / train_dagger / train_grpo_paligemma).",
+    )
+    p.add_argument(
+        "--ppo_ckpt",
+        type=str,
+        default="",
+        help="OpenFly-Agent LoRA+value-head checkpoint (train_ppo_openfly_agent).",
     )
     return p.parse_args()
 
@@ -91,10 +102,15 @@ def run(args: argparse.Namespace) -> dict:
     pol = args.policy.lower()
     if pol in ("openfly", "openfly-agent", "agent"):
         policy_kwargs["model_id"] = args.model_id
-    elif pol in ("paligemma", "vla"):
+    elif pol in ("paligemma", "vla", "dagger", "grpo"):
         if not args.paligemma_ckpt:
-            raise SystemExit("--policy paligemma requires --paligemma_ckpt PATH")
+            raise SystemExit(f"--policy {pol} requires --paligemma_ckpt PATH")
         policy_kwargs["checkpoint"] = args.paligemma_ckpt
+    elif pol in ("ppo", "ppo-agent", "openfly-agent-rl"):
+        if not args.ppo_ckpt:
+            raise SystemExit(f"--policy {pol} requires --ppo_ckpt PATH")
+        policy_kwargs["checkpoint"] = args.ppo_ckpt
+        policy_kwargs["model_id"] = args.model_id
     policy = build_policy(args.policy, **policy_kwargs)
 
     results: list[dict] = []

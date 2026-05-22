@@ -30,6 +30,22 @@ jobs:
             vla/vla_policy.py \
             benchmarks
 
+      # Smoke-import the lightweight RL modules. AirSim, transformers, and
+      # PaliGemma are not installed on the runner, so we only touch modules
+      # that do not import the heavy stack at module load.
+      - name: Import-check RL core
+        run: |
+          pip install --quiet numpy 'gymnasium>=1.0'
+          PYTHONPATH=. python - <<'PY'
+          import openfly.actions
+          import openfly.episodes
+          import openfly.rewards
+          import openfly.rollout
+          # envs module triggers gymnasium.register on import
+          from openfly.envs import AirSimVLNEnv, AirSimVLNEnvConfig  # noqa: F401
+          print("imports ok")
+          PY
+
   markdown-links:
     name: Markdown link check
     runs-on: ubuntu-latest

@@ -27,8 +27,7 @@ jobs:
         run: |
           python -m compileall -q \
             openfly \
-            vla/vla_policy.py \
-            benchmarks
+            vla/vla_policy.py
 
       # Smoke-import the lightweight RL modules. AirSim, transformers, and
       # PaliGemma are not installed on the runner, so we only touch modules

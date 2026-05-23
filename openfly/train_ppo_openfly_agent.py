@@ -324,6 +324,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gae_lambda", type=float, default=0.95)
     p.add_argument("--clip_grad", type=float, default=1.0)
     p.add_argument("--dense_progress", action="store_true", help="Enable step shaping reward")
+    p.add_argument(
+        "--reward_preset",
+        default=None,
+        help="Optional curriculum preset (easy|medium|hard). Overrides the env "
+        "RewardConfig and forces --dense_progress on for 'easy'.",
+    )
 
     p.add_argument("--lora_lr", type=float, default=1e-5)
     p.add_argument("--value_lr", type=float, default=3e-4)
@@ -380,14 +386,16 @@ def main() -> int:
         model.trainable_param_groups(lora_lr=args.lora_lr, value_lr=args.value_lr)
     )
 
-    train_env = AirSimVLNEnv(
-        AirSimVLNEnvConfig(
-            split=args.rollout_split,
-            env_filter=args.env_filter,
-            max_steps=args.max_episode_steps,
-            seed=args.seed,
-        )
+    train_env_cfg = AirSimVLNEnvConfig(
+        split=args.rollout_split,
+        env_filter=args.env_filter,
+        max_steps=args.max_episode_steps,
+        seed=args.seed,
+        reward_preset=args.reward_preset,
     )
+    train_env = AirSimVLNEnv(train_env_cfg)
+    # Honour the preset's dense-progress flag if it was set.
+    args.dense_progress = args.dense_progress or train_env_cfg.dense_progress
     eval_env: AirSimVLNEnv | None = None
     if args.eval_every > 0:
         eval_env = AirSimVLNEnv(
@@ -396,6 +404,7 @@ def main() -> int:
                 env_filter=args.env_filter,
                 max_steps=args.max_episode_steps,
                 seed=args.seed + 1,
+                reward_preset=args.reward_preset,
             )
         )
 
@@ -409,7 +418,7 @@ def main() -> int:
             model,
             n_episodes=args.episodes_per_iter,
             temperature=args.temperature,
-            reward_config=DEFAULT_REWARD,
+            reward_config=train_env_cfg.reward_config,
             dense_progress=args.dense_progress,
         )
         update_stats = _ppo_update(

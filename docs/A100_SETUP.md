@@ -1,3 +1,10 @@
+---
+layout: default
+title: A100 setup
+description: End-to-end host bring-up on an x86_64 A100 box.
+permalink: /a100-setup/
+---
+
 # Running the OpenFly RL system on an A100 host
 
 This guide walks through bringing the repo up on a fresh **A100 40 GB SXM4** instance — the smallest configuration that runs the full pipeline (SFT → DAgger → GRPO → PPO) without modification, plus the AirSim simulator itself.
@@ -137,21 +144,38 @@ If you see crashes or zero SR, see [Troubleshooting](#troubleshooting).
 
 ### 3.1 Track B — PaliGemma BC
 
-You need the trajectory images from `OpenFly_DataGen` for SFT.
+You need the trajectory images from the main `IPEC-COMMUNITY/OpenFly`
+dataset for SFT. The images live under `Image/<env_name>/...` inside that
+repo (NOT under `OpenFly_DataGen`, which only ships the AirSim scene
+binaries used at eval time).
+
+For a single-env smoke run (~10 GB):
 
 ```bash
-# Fetch trajectory frames for env_airsim_16 only (saves ~50 GB)
+# Fetch trajectory frames for env_airsim_16 only
 python - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download(
-    repo_id="IPEC-COMMUNITY/OpenFly_DataGen",
+    repo_id="IPEC-COMMUNITY/OpenFly",
     repo_type="dataset",
-    allow_patterns=["airsim/env_airsim_16/**/*.png", "airsim/env_airsim_16/**/*.jpg"],
+    allow_patterns=["Image/env_airsim_16/**"],
     local_dir="/home/ubuntu/assets/OpenFly/images",
 )
 PY
-export OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images/airsim
+export OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images/Image
+```
 
+For the full 11-train-scene download (~100–150 GB, recommended for any
+serious SFT — see `docs/RESEARCH.md`), use the helper script which reads
+the train env list directly from `Annotation/train.json` so unseen scenes
+are never pulled in by accident:
+
+```bash
+bash ~/drone_project/openfly/download_train_images.sh
+# (--dry-run prints the patterns without downloading)
+```
+
+```bash
 # Smoke run (5k samples, 1 epoch)
 bash ~/drone_project/openfly/run_train_paligemma.sh \
   --max_samples 5000 --epochs 1 --batch_size 8 --env_filter env_airsim_16

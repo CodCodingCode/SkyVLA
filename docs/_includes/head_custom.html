@@ -1,0 +1,23 @@
+<!-- Mermaid for diagrams in markdown pages. Cayman pulls in this
+     include automatically if it exists in _includes. -->
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: false, theme: "default" });
+  window.addEventListener("DOMContentLoaded", () => {
+    document.querySelectorAll("pre > code.language-mermaid").forEach((block) => {
+      const pre = block.parentElement;
+      const wrapper = document.createElement("div");
+      wrapper.className = "mermaid";
+      wrapper.textContent = block.textContent;
+      pre.replaceWith(wrapper);
+    });
+    mermaid.run();
+  });
+</script>
+<style>
+  table { border-collapse: collapse; }
+  table th, table td { padding: 0.35rem 0.65rem; }
+  .env-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin: 1rem 0; }
+  .env-card { border: 1px solid #d0d7de; border-radius: 6px; padding: 1rem; }
+  .env-card h3 { margin-top: 0; }
+</style>

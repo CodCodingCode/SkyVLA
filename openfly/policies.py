@@ -107,8 +107,14 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
 
     Loads a checkpoint produced by ``openfly.train_paligemma`` and predicts
     discrete OpenFly action ids (0..9) from the current RGB frame plus a
-    rolling history.
+    rolling history. Mirrors the training-time forward signature
+    (``last_action`` + ``next_pose``); at inference we use ``next_pose ==
+    pose`` because we don't know the next state ahead of time — the model's
+    ``goal_pred`` auxiliary output is ignored.
     """
+
+    # START token id used during training when step == 0.
+    _START_ACTION_ID: int = 10
 
     def __init__(
         self,
@@ -118,6 +124,8 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         device: str = "cuda" if __import__("torch").cuda.is_available() else "cpu",
         paligemma_model: str = "google/paligemma-3b-pt-224",
         image_size: int = 224,
+        lora_rank: int = 16,
+        lora_alpha: float = 32.0,
     ):
         import torch
         from transformers import AutoProcessor
@@ -132,6 +140,8 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         self.model = PaliGemmaVLNPolicy(
             history_frames=history_frames,
             paligemma_model_name=paligemma_model,
+            lora_rank=int(lora_rank),
+            lora_alpha=float(lora_alpha),
         ).to(self.device)
         ckpt = torch.load(checkpoint, map_location=self.device)
         state = ckpt.get("model", ckpt)
@@ -145,6 +155,7 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         self.processor = AutoProcessor.from_pretrained(paligemma_model)
         self.instruction = ""
         self._history: list[np.ndarray] = []
+        self._last_action: int = self._START_ACTION_ID
 
     def _resize_rgb(self, rgb: np.ndarray) -> np.ndarray:
         if rgb.shape[0] != self.image_size or rgb.shape[1] != self.image_size:
@@ -160,6 +171,7 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         del goal  # not used at inference time
         self.instruction = instruction
         self._history = []
+        self._last_action = self._START_ACTION_ID
 
     def act(
         self,
@@ -181,10 +193,20 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
 
         rgb_t = torch.from_numpy(cur).unsqueeze(0).to(self.device)
         history_t = torch.from_numpy(past).unsqueeze(0).to(self.device)
+        pose_vec = [
+            float(pose[0]),
+            float(pose[1]),
+            float(pose[2]),
+            float(pose[3]),
+        ]
         pose_t = torch.tensor(
-            [[float(pose[0]), float(pose[1]), float(pose[2]), float(pose[3])]],
-            device=self.device,
-            dtype=torch.float32,
+            [pose_vec], device=self.device, dtype=torch.float32
+        )
+        # At inference we don't know the next pose; pass current pose. The
+        # downstream goal_pred output is unused for action selection.
+        next_pose_t = pose_t.clone()
+        last_action_t = torch.tensor(
+            [int(self._last_action)], device=self.device, dtype=torch.long
         )
 
         proc = self.processor(
@@ -193,7 +215,7 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
             return_tensors="pt",
             padding="longest",
             truncation=True,
-            max_length=256,
+            max_length=512,
         )
         input_ids = proc["input_ids"].to(self.device)
         attention_mask = proc["attention_mask"].to(self.device)
@@ -204,6 +226,8 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
             rgb_current=rgb_t,
             rgb_history=history_t,
             pose=pose_t,
+            last_action=last_action_t,
+            next_pose=next_pose_t,
         )
 
         # Slide history window after acting.
@@ -211,6 +235,7 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
             self._history.append(cur)
             if len(self._history) > self.history_frames:
                 self._history = self._history[-self.history_frames :]
+        self._last_action = int(action)
         return int(action)
 
 

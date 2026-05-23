@@ -52,7 +52,7 @@ _DRONE_ROOT = Path(__file__).resolve().parent.parent
 if str(_DRONE_ROOT) not in sys.path:
     sys.path.insert(0, str(_DRONE_ROOT))
 
-from openfly.dataset import OpenFlyDataset, collate
+from openfly.dataset import NUM_OPENFLY_ACTIONS, OpenFlyDataset, collate
 from openfly.envs import AirSimVLNEnv, AirSimVLNEnvConfig
 from openfly.episodes import load_episodes
 from openfly.models.paligemma_vln import (
@@ -96,10 +96,24 @@ def _forward_logits(
     *,
     with_grad: bool,
 ) -> torch.Tensor:
-    """Single-step logits for one observation."""
+    """Single-step logits for one observation.
+
+    ``last_action`` is sourced from the env's observation (``obs["last_action"]``
+    — see :class:`openfly.envs.AirSimVLNEnv`). The env initialises this to
+    ``-1`` at reset; we remap that to the START token (``NUM_OPENFLY_ACTIONS``)
+    so the model's embedding layer is consistent between offline SFT and
+    on-policy rollouts. ``next_pose`` is unknown at rollout time, so we
+    pass the current pose (the model's ``goal_pred`` auxiliary output is
+    not consumed during GRPO updates anyway).
+    """
     rgb_t = torch.from_numpy(obs["rgb"]).unsqueeze(0).to(device)
     hist_t = torch.from_numpy(obs["rgb_history"]).unsqueeze(0).to(device)
     pose_t = torch.from_numpy(obs["pose"]).unsqueeze(0).to(device)
+    raw_la = int(obs.get("last_action", -1))
+    if raw_la < 0 or raw_la >= NUM_OPENFLY_ACTIONS:
+        raw_la = NUM_OPENFLY_ACTIONS  # START token
+    last_action_t = torch.tensor([raw_la], dtype=torch.long, device=device)
+    next_pose_t = pose_t.clone()
     input_ids, attention_mask = _tokenise(processor, instruction, obs["rgb"], device)
     if with_grad:
         out = model(
@@ -108,6 +122,8 @@ def _forward_logits(
             rgb_current=rgb_t,
             rgb_history=hist_t,
             pose=pose_t,
+            last_action=last_action_t,
+            next_pose=next_pose_t,
             with_grad=True,
         )
     else:
@@ -118,6 +134,8 @@ def _forward_logits(
                 rgb_current=rgb_t,
                 rgb_history=hist_t,
                 pose=pose_t,
+                last_action=last_action_t,
+                next_pose=next_pose_t,
                 with_grad=False,
             )
     return out["action_logits"]
@@ -198,11 +216,17 @@ def _demo_anchor_loss(
     batch: dict[str, Any],
     device: torch.device,
 ) -> torch.Tensor:
-    """Standard CE on a batch from :class:`OpenFlyDataset`."""
+    """Standard CE on a batch from :class:`OpenFlyDataset`.
+
+    Forwards the same ``last_action`` / ``next_pose`` fields the SFT
+    trainer feeds so the action head stays consistent across stages.
+    """
     rgb = batch["rgb"].to(device, non_blocking=True)
     history = batch["history"].to(device, non_blocking=True)
     pose = batch["pose"].to(device, non_blocking=True)
     actions = batch["action_id"].to(device, non_blocking=True)
+    last_action = batch["last_action"].to(device, non_blocking=True)
+    next_pose = batch["next_pose"].to(device, non_blocking=True)
 
     proc = processor(
         text=[f"<image>\n{ins}" for ins in batch["instruction"]],
@@ -210,7 +234,7 @@ def _demo_anchor_loss(
         return_tensors="pt",
         padding="longest",
         truncation=True,
-        max_length=256,
+        max_length=512,
     )
     input_ids = proc["input_ids"].to(device)
     attention_mask = proc["attention_mask"].to(device)
@@ -220,6 +244,8 @@ def _demo_anchor_loss(
         rgb_current=rgb,
         rgb_history=history,
         pose=pose,
+        last_action=last_action,
+        next_pose=next_pose,
         with_grad=True,
     )
     return F.cross_entropy(out["action_logits"], actions)
@@ -264,6 +290,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval_every", type=int, default=10)
     p.add_argument("--eval_episodes", type=int, default=8)
     p.add_argument("--eval_split", default="unseen")
+    p.add_argument(
+        "--reward_preset",
+        default=None,
+        help="One of easy|medium|hard (see openfly.rewards.REWARD_PRESETS). "
+        "When set, overrides the env's default RewardConfig and toggles "
+        "dense progress shaping accordingly.",
+    )
+    p.add_argument(
+        "--traj_category",
+        default="",
+        help="Optional trajectory-difficulty filter; episodes are kept only "
+        "when their image_path contains this substring (e.g. 'short', "
+        "'medium_average', 'long').",
+    )
     return p.parse_args()
 
 
@@ -285,7 +325,14 @@ def main() -> int:
     ).to(device)
     ckpt = torch.load(args.init_ckpt, map_location=device)
     state = ckpt.get("model", ckpt)
-    model.load_state_dict(state, strict=False)
+    model_state = model.state_dict()
+    compatible = {
+        k: v
+        for k, v in state.items()
+        if k in model_state and model_state[k].shape == v.shape
+    }
+    model.load_state_dict(compatible, strict=False)
+    print(f"[grpo] loaded {len(compatible)}/{len(state)} tensors from init ckpt")
     print(f"[grpo] loaded init ckpt {args.init_ckpt}")
 
     # Frozen reference for the KL anchor. We deep-copy on CPU first to dodge
@@ -305,6 +352,7 @@ def main() -> int:
         max_steps=args.max_episode_steps,
         history_frames=args.history_frames,
         seed=args.seed,
+        reward_preset=args.reward_preset,
     )
     train_env = AirSimVLNEnv(train_env_cfg)
 
@@ -316,6 +364,7 @@ def main() -> int:
             max_steps=args.max_episode_steps,
             history_frames=args.history_frames,
             seed=args.seed + 1,
+            reward_preset=args.reward_preset,
         )
         eval_env = AirSimVLNEnv(eval_env_cfg)
 
@@ -343,6 +392,17 @@ def main() -> int:
         args.rollout_split,
         env_filter=args.env_filter,
     )
+    if args.traj_category:
+        n_before = len(train_episodes_meta)
+        train_episodes_meta = [
+            ep
+            for ep in train_episodes_meta
+            if args.traj_category in ep.get("image_path", "")
+        ]
+        print(
+            f"[grpo] traj_category={args.traj_category!r} kept "
+            f"{len(train_episodes_meta)}/{n_before} rollout episodes"
+        )
     if not train_episodes_meta:
         raise RuntimeError("No training episodes for GRPO rollouts.")
 
@@ -352,6 +412,16 @@ def main() -> int:
     log: list[dict[str, Any]] = []
     best_metric = -math.inf
     rollout_log_path = out_dir / "rollouts.jsonl"
+
+    # Write a small manifest so curriculum-stage runs are easy to inspect.
+    manifest = {
+        "args": vars(args),
+        "reward_preset": args.reward_preset or "default",
+        "reward_config": train_env_cfg.reward_config.__dict__,
+        "n_rollout_episodes": len(train_episodes_meta),
+    }
+    with open(out_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, default=str)
 
     for step in range(args.steps):
         t0 = time.time()
@@ -381,14 +451,25 @@ def main() -> int:
                 _compute_group_advantages([t.total_reward for t in group])
             )
 
-        # 3. Single GRPO update aggregating across all (group, traj, step) entries.
+        # 3. GRPO update with **incremental backward** to keep the
+        #    activation graph bounded: a 3B PaliGemma + 20+ rollout
+        #    timesteps would exceed 40 GB if we summed losses and called
+        #    backward once. We pre-count contributions, scale each step's
+        #    loss by 1/n_terms, and backward in-place so gradients
+        #    accumulate without holding every step's graph in memory.
+        n_terms = sum(
+            min(len(traj.actions), len(traj.obs_rgb))
+            for group in group_rollouts
+            for traj in group
+        )
+
         optimizer.zero_grad(set_to_none=True)
-        total_loss = torch.zeros((), device=device)
-        n_terms = 0
+        total_loss_val = 0.0
         kl_running = 0.0
         rew_mean = 0.0
         rew_count = 0
         success_running = 0
+        scale = 1.0 / max(n_terms, 1)
 
         for g_idx, group in enumerate(group_rollouts):
             adv_tensor = advantages_per_group[g_idx].to(device)
@@ -427,8 +508,7 @@ def main() -> int:
                     clipped = torch.clamp(
                         ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio
                     ) * advantage
-                    pg = -torch.min(unclipped, clipped)
-                    total_loss = total_loss + pg
+                    step_loss = -torch.min(unclipped, clipped)
 
                     if args.kl_coef > 0:
                         with torch.no_grad():
@@ -441,12 +521,11 @@ def main() -> int:
                                 with_grad=False,
                             )
                         kl = _kl_term(logits_pi, logits_ref)
-                        total_loss = total_loss + args.kl_coef * kl
+                        step_loss = step_loss + args.kl_coef * kl
                         kl_running += float(kl.detach().item())
-                    n_terms += 1
 
-        if n_terms > 0:
-            total_loss = total_loss / n_terms
+                    (step_loss * scale).backward()
+                    total_loss_val += float(step_loss.detach().item()) * scale
 
         demo_ce_val = 0.0
         if demo_loader is not None and args.demo_coef > 0:
@@ -470,11 +549,11 @@ def main() -> int:
                 )
                 batch = next(demo_loader)
             demo_ce = _demo_anchor_loss(model, processor, batch, device)
-            total_loss = total_loss + args.demo_coef * demo_ce
+            (args.demo_coef * demo_ce).backward()
             demo_ce_val = float(demo_ce.detach().item())
+            total_loss_val += args.demo_coef * demo_ce_val
 
         if n_terms > 0 or demo_loader is not None:
-            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], args.clip_grad
             )
@@ -483,7 +562,7 @@ def main() -> int:
         step_log = {
             "step": step,
             "n_terms": n_terms,
-            "loss": float(total_loss.detach().item()) if n_terms > 0 else 0.0,
+            "loss": total_loss_val if n_terms > 0 else 0.0,
             "mean_reward": rew_mean / max(rew_count, 1),
             "success_rate": success_running / max(rew_count, 1),
             "kl": kl_running / max(n_terms, 1) if args.kl_coef > 0 else 0.0,

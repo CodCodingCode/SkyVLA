@@ -1,3 +1,10 @@
+---
+layout: default
+title: Benchmark fairness
+description: What is and is not claimable from each OpenFly leaderboard number.
+permalink: /benchmark-fairness/
+---
+
 # Benchmark Fairness
 
 Short reference for "is what we're doing fair, and what can we honestly claim about the numbers?" — read this before posting OpenFly results anywhere public.

@@ -1,6 +1,18 @@
+---
+layout: default
+title: Next steps
+description: Engineering checklist for SkyVLA on top of OpenFly.
+permalink: /next-steps/
+---
+
 # Next steps
 
 The repository targets the OpenFly outdoor aerial VLN benchmark. This document tracks where the codebase is today and the natural next steps for improving the trained models and the eval coverage.
+
+> The **living research plan** — including the per-env unseen breakdown,
+> the reward curriculum, and the experiment matrix — lives in
+> [`docs/RESEARCH.md`](RESEARCH.md). This file is the shorter
+> engineering checklist that feeds into it.
 
 ## Where you are now
 
@@ -15,7 +27,7 @@ The repository targets the OpenFly outdoor aerial VLN benchmark. This document t
 
 1. **Verify the simulator end-to-end.** After `openfly/setup.sh` and downloading at least one AirSim scene, run the heuristic policy on five episodes and confirm a non-zero SR / OSR. This catches missing system packages, AirSim port collisions, and pose-ratio bugs before any model is trained.
 2. **Bring up the OpenFly-Agent baseline.** Pull the upstream checkpoint and run `--policy openfly-agent` on the same five episodes. The 7B model is a good reference point and exercises the FSDP / flash-attn install.
-3. **Train the custom PaliGemma BC policy.** Fetch the `train.json` annotations and the trajectory frames (set `OPENFLY_IMAGE_ROOT` to the extracted directory). A first pass with `--max_samples 10000 --epochs 1` validates the data pipeline; a full run at `--epochs 10 --batch_size 8` produces a usable checkpoint.
+3. **Train the custom PaliGemma BC policy.** Fetch the `train.json` annotations and the trajectory frames from `IPEC-COMMUNITY/OpenFly` (the `Image/` tree — NOT `OpenFly_DataGen`, which only ships AirSim scene binaries for eval). Use `bash openfly/download_train_images.sh` to pull all 11 train scenes (~100 GB) and set `OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images/Image`. A first pass with `--max_samples 10000 --epochs 1` validates the data pipeline; a full run at `--epochs 10 --batch_size 8` produces a usable checkpoint.
 4. **Score the trained PaliGemma checkpoint.** Run `--policy paligemma --paligemma_ckpt <path>` on `seen` and `unseen` splits and compare against the OpenFly-Agent and heuristic numbers.
 5. **Iterate on the BC pipeline.** Likely improvements once the loop runs:
    - Use a larger history window (`--history_frames 4`).

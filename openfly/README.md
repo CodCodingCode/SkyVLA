@@ -82,8 +82,12 @@ Single-GPU offline behaviour cloning over the OpenFly trajectories. The model is
 
 ```bash
 # 1. Make sure train.json + the trajectory frames are on disk
-#    OPENFLY_IMAGE_ROOT must point at extracted RGB folders.
-export OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images
+#    OPENFLY_IMAGE_ROOT must point at the extracted "Image/" tree under
+#    IPEC-COMMUNITY/OpenFly (NOT OpenFly_DataGen — that only ships the
+#    AirSim scene binaries used at eval time).
+#    Use the helper to grab all 11 train scenes (~100 GB):
+bash ~/drone_project/openfly/download_train_images.sh
+export OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images/Image
 
 # 2. Train (logs/openfly/paligemma/<run>)
 bash ~/drone_project/openfly/run_train_paligemma.sh \
@@ -138,6 +142,22 @@ bash ~/drone_project/openfly/run_train_grpo.sh \
   --steps 200 --group_size 4 --instructions_per_step 2
 ```
 
+For the easy → medium → hard reward curriculum used in
+[`docs/RESEARCH.md`](../docs/RESEARCH.md), use the curriculum driver
+which chains three GRPO stages and stitches the checkpoints together:
+
+```bash
+bash ~/drone_project/openfly/run_train_curriculum.sh \
+  --init_ckpt logs/openfly/dagger/<run>/last.pt \
+  --env_filter env_airsim_16 \
+  --steps_easy 80 --steps_medium 60 --steps_hard 60
+```
+
+Outputs live under `logs/openfly/curriculum/<run>/stage_{easy,medium,hard}/`
+with a top-level `curriculum_manifest.json`. Each stage writes a normal
+GRPO `last.pt` so existing eval and aggregation tooling works without
+changes.
+
 GRPO samples `K` trajectories per instruction, scores each with [`compute_episode_reward`](rewards.py), and applies a clipped policy-gradient update with a KL anchor against the frozen init checkpoint. Best checkpoints are gated on a small `unseen` eval (`--eval_every 10 --eval_episodes 8`).
 
 ### Step 3 — Track A online RL (PPO + LoRA)
@@ -173,7 +193,7 @@ The `dagger` / `grpo` / `paligemma` aliases all load the same `PaliGemmaVLNPolic
 |----------|---------|---------|
 | `OPENFLY_ROOT` | `~/OpenFly-Platform` | Upstream platform clone |
 | `OPENFLY_ANNOTATION_DIR` | `~/assets/OpenFly/Annotation` | Annotation JSON files |
-| `OPENFLY_IMAGE_ROOT` | `OPENFLY_ROOT/uav_vln_data` | Extracted trajectory frames |
+| `OPENFLY_IMAGE_ROOT` | `~/assets/OpenFly/images/Image` | Extracted trajectory frames (the `Image/` tree from `IPEC-COMMUNITY/OpenFly`) |
 | `OPENFLY_TFDS_DIR` | (unset) | Output dir for `tfds build` |
 
 ## Files
@@ -192,14 +212,20 @@ The `dagger` / `grpo` / `paligemma` aliases all load the same `PaliGemmaVLNPolic
 | `models/openfly_agent_rl.py` | OpenFly-Agent 7B + LoRA + value head for PPO |
 | `train_paligemma.py` | Offline BC entrypoint for the custom model |
 | `train_dagger.py` | DAgger between SFT and online RL |
-| `train_grpo_paligemma.py` | GRPO online RL on the PaliGemma policy |
-| `train_ppo_openfly_agent.py` | PPO + LoRA online RL on OpenFly-Agent 7B |
+| `train_grpo_paligemma.py` | GRPO online RL on the PaliGemma policy (accepts `--reward_preset`) |
+| `train_curriculum_grpo.py` | Easy → medium → hard reward curriculum on top of GRPO |
+| `train_ppo_openfly_agent.py` | PPO + LoRA online RL on OpenFly-Agent 7B (accepts `--reward_preset`) |
+| `scripts/aggregate_results.py` | Aggregate `logs/benchmarks/*.json` into Markdown/CSV |
+| `scripts/analyse_failures.py` | Per-env failure-mode breakdown (wandered / stalled / oracle_only / near_miss / image_error) |
 | `envs/airsim_vln_env.py` | Gymnasium wrapper around the AirSim bridge |
 | `rewards.py` | Episode-level OpenFly-aligned reward |
 | `rollout.py` | Shared trajectory collector used by every RL trainer |
 | `scripts/smoke_rl_env.py` | Sanity-check the RL env with the heuristic |
 | `run_eval.sh` / `run_train_agent.sh` / `run_train_paligemma.sh` | CLI wrappers (SFT) |
-| `run_train_dagger.sh` / `run_train_grpo.sh` / `run_train_ppo_agent.sh` | CLI wrappers (RL) |
+| `run_train_dagger.sh` / `run_train_grpo.sh` / `run_train_curriculum.sh` / `run_train_ppo_agent.sh` | CLI wrappers (RL) |
+| `run_per_env_eval.sh` | Per-env unseen + seen eval for one checkpoint (writes `logs/benchmarks/openfly_*.json`) |
+| `run_experiments.sh` | End-to-end B0 → B5 experiment matrix orchestrator |
+| `scripts/verify_phase0.sh` | Phase-0 driver / annotation / image / preset / dataset gates |
 
 ## Metrics (OpenFly standard)
 

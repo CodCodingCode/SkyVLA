@@ -36,7 +36,12 @@ if str(_DRONE_ROOT) not in sys.path:
     sys.path.insert(0, str(_DRONE_ROOT))
 
 from openfly.actions import ACTION_NAMES, goal_heuristic_action
-from openfly.dataset import OpenFlyDataset, OpenFlySample, collate
+from openfly.dataset import (
+    NUM_OPENFLY_ACTIONS,
+    OpenFlyDataset,
+    OpenFlySample,
+    collate,
+)
 from openfly.envs import AirSimVLNEnv, AirSimVLNEnvConfig
 from openfly.models.paligemma_vln import (
     PaliGemmaVLNPolicy,
@@ -69,6 +74,13 @@ class DAggerBuffer(Dataset):
         Stops are *not* corrected — relabelling a non-stop action to
         "stop" hits the policy with high CE on a single label and tends
         to collapse training. We just keep the trajectory honest.
+
+        ``last_action`` records the previously *executed* (agent) action
+        — ``traj.actions[i-1]`` — because that's what produced the
+        current observation; at step 0 we emit the START token
+        (``NUM_OPENFLY_ACTIONS``) to match offline dataset semantics.
+        ``next_pose`` is the agent's pose at i+1, falling back to the
+        current pose at the terminal step.
         """
         added = 0
         for i, rgb in enumerate(traj.obs_rgb):
@@ -81,6 +93,18 @@ class DAggerBuffer(Dataset):
             history_arr = traj.obs_history[i] if i < len(traj.obs_history) else np.zeros(
                 (self.history_frames, self.image_size, self.image_size, 3), dtype=np.uint8
             )
+            if i == 0 or i - 1 >= len(traj.actions):
+                last_action = NUM_OPENFLY_ACTIONS  # START token
+            else:
+                last_action = int(traj.actions[i - 1])
+            if i + 1 < len(traj.obs_poses):
+                np_arr = traj.obs_poses[i + 1]
+                next_pose = np.asarray(
+                    np_arr.tolist() if hasattr(np_arr, "tolist") else list(np_arr),
+                    dtype=np.float32,
+                )
+            else:
+                next_pose = np.asarray(pose, dtype=np.float32)
             sample = OpenFlySample(
                 rgb=np.asarray(rgb, dtype=np.uint8),
                 history=np.asarray(history_arr, dtype=np.uint8),
@@ -88,6 +112,8 @@ class DAggerBuffer(Dataset):
                 action_id=int(expert),
                 pose=np.asarray(pose, dtype=np.float32),
                 goal=np.asarray(goal, dtype=np.float32),
+                last_action=int(last_action),
+                next_pose=next_pose,
             )
             self._samples.append(sample)
             added += 1
@@ -112,9 +138,17 @@ def _load_paligemma(args, device: torch.device) -> tuple[PaliGemmaVLNPolicy, Any
     if args.sft_ckpt:
         ckpt = torch.load(args.sft_ckpt, map_location=device)
         state = ckpt.get("model", ckpt)
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        model_state = model.state_dict()
+        compatible = {
+            k: v
+            for k, v in state.items()
+            if k in model_state and model_state[k].shape == v.shape
+        }
+        skipped = len(state) - len(compatible)
+        missing, unexpected = model.load_state_dict(compatible, strict=False)
         print(
             f"[dagger] loaded SFT ckpt {args.sft_ckpt}: "
+            f"{len(compatible)} tensors, {skipped} shape-skipped, "
             f"{len(missing)} missing, {len(unexpected)} unexpected"
         )
     processor = AutoProcessor.from_pretrained(args.paligemma_model)
@@ -143,6 +177,8 @@ def _train_step(
     history = batch["history"].to(device, non_blocking=True)
     pose = batch["pose"].to(device, non_blocking=True)
     actions = batch["action_id"].to(device, non_blocking=True)
+    last_action = batch["last_action"].to(device, non_blocking=True)
+    next_pose = batch["next_pose"].to(device, non_blocking=True)
     input_ids, attention_mask = _tokenise_batch(
         processor, batch["instruction"], rgb[0], device
     )
@@ -152,6 +188,8 @@ def _train_step(
         rgb_current=rgb,
         rgb_history=history,
         pose=pose,
+        last_action=last_action,
+        next_pose=next_pose,
         with_grad=True,
     )
     logits = out["action_logits"]
@@ -169,14 +207,29 @@ def _policy_factory_paligemma(
     device: torch.device,
 ):
     """Return a ``policy_fn`` compatible with :func:`collect_episode`."""
+    from openfly.dataset import NUM_OPENFLY_ACTIONS
+
+    # Mutable closure cell so the same policy_fn instance can track
+    # ``last_action`` across steps within an episode. Reset each time we
+    # see a step-0 observation (info["step"] == 0 when emitted by the env).
+    state = {"last_action": NUM_OPENFLY_ACTIONS}
 
     def policy_fn(obs, info):
+        # Reset last_action at the start of each episode. AirSimVLNEnv
+        # emits "step_idx" on every step (including 0); reset.info has no
+        # step_idx, so we treat its absence the same as step 0.
+        if int(info.get("step_idx", 0)) == 0:
+            state["last_action"] = NUM_OPENFLY_ACTIONS
         rgb = obs["rgb"]
         history = obs["rgb_history"]
         pose = obs["pose"]
         rgb_t = torch.from_numpy(rgb).unsqueeze(0).to(device)
         hist_t = torch.from_numpy(history).unsqueeze(0).to(device)
         pose_t = torch.from_numpy(pose).unsqueeze(0).to(device)
+        last_action_t = torch.tensor([state["last_action"]], dtype=torch.long, device=device)
+        # ``next_pose`` is only consumed by the trainer's aux goal target;
+        # at inference we duplicate the current pose.
+        next_pose_t = pose_t.clone()
         proc = processor(
             text=[f"<image>\n{info.get('instruction', '')}"],
             images=[rgb],
@@ -194,10 +247,13 @@ def _policy_factory_paligemma(
                 rgb_current=rgb_t,
                 rgb_history=hist_t,
                 pose=pose_t,
+                last_action=last_action_t,
+                next_pose=next_pose_t,
                 with_grad=False,
             )
             logits = out["action_logits"]
             action = int(logits.argmax(dim=-1).item())
+        state["last_action"] = action
         return action, {"logits": logits.detach().cpu()}
 
     return policy_fn
@@ -260,6 +316,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--env_filter", default="env_airsim_16")
     p.add_argument("--offline_mix", type=float, default=0.5, help="Fraction sampled from OpenFlyDataset")
+    p.add_argument("--offline_max_episodes", type=int, default=0, help="0 = all (smoke runs use small N)")
+    p.add_argument("--steps_per_update", type=int, default=0, help="0 = one full epoch over the mixed dataset; smaller values cap update length for smoke runs")
     p.add_argument("--lora_lr", type=float, default=1e-6)
     p.add_argument("--head_lr", type=float, default=3e-4)
     p.add_argument("--num_workers", type=int, default=2)
@@ -305,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
             split=args.offline_split,
             history_frames=args.history_frames,
             env_filter=args.env_filter,
+            max_episodes=args.offline_max_episodes,
         )
         print(f"[dagger] offline OpenFlyDataset size={len(offline_ds)}")
         policy_fn = _policy_factory_paligemma(model, processor, device)
@@ -368,8 +427,15 @@ def main(argv: list[str] | None = None) -> int:
         weights = [args.offline_mix / len(offline_ds)] * len(offline_ds) + [
             (1.0 - args.offline_mix) / len(buffer)
         ] * len(buffer)
+        # ``num_samples`` controls steps per iteration. By default we keep
+        # one full epoch over ``mixed``; smoke runs override with a small
+        # cap so the loop finishes in seconds.
+        if args.steps_per_update > 0:
+            num_samples = args.steps_per_update * args.batch_size
+        else:
+            num_samples = len(mixed)
         sampler = torch.utils.data.WeightedRandomSampler(
-            weights=weights, num_samples=len(mixed), replacement=True
+            weights=weights, num_samples=num_samples, replacement=True
         )
         loader = DataLoader(
             mixed,

@@ -1,0 +1,52 @@
+# GitHub Pages configuration for the SkyVLA research site.
+#
+# The site is served from the /docs directory of the main branch.
+# Enable in GitHub: Settings -> Pages -> Build from branch -> main -> /docs.
+#
+# We use the Cayman theme via remote_theme so we do not vendor any Ruby
+# gems; GitHub Pages resolves the theme at build time.
+
+title: SkyVLA
+description: >-
+  Curriculum sparse reinforcement learning for outdoor aerial
+  vision-language navigation on the OpenFly benchmark.
+url: "https://codcodingcode.github.io"
+baseurl: "/SkyVLA"
+repository: CodCodingCode/SkyVLA
+
+remote_theme: pages-themes/cayman@v0.2.0
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+# Exclude repo-only assets and large generated files from the site build.
+# Repo-only docs (A100_SETUP, BENCHMARK_FAIRNESS, NEXT_STEPS, RESEARCH)
+# are still copied as plain pages so cross-links from the site resolve.
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - node_modules
+  - "*.csv"
+  - "results_table.md"
+
+defaults:
+  - scope:
+      path: ""
+      type: "pages"
+    values:
+      layout: "default"
+
+# Navigation rendered in the header by the templates below.
+nav:
+  - title: Home
+    url: /
+  - title: Research
+    url: /research
+  - title: Results
+    url: /results
+  - title: Setup
+    url: /setup
+  - title: GitHub
+    url: https://github.com/CodCodingCode/SkyVLA

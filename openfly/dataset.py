@@ -27,7 +27,10 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from openfly.actions import ACTION_NAMES
 from openfly.episodes import load_episodes
+
+NUM_OPENFLY_ACTIONS = 10
 
 
 def default_image_root() -> Path:
@@ -74,7 +77,24 @@ def _load_rgb(path: Path | None, image_size: int = 224) -> np.ndarray:
 
 @dataclass
 class OpenFlySample:
-    """One training step from a trajectory."""
+    """One training step from a trajectory.
+
+    Fields:
+        rgb:          current-frame RGB image, (H, W, 3) uint8.
+        history:     stack of past keyframe RGBs, (n_history, H, W, 3) uint8.
+                     Keyframes are action-transition frames (plus step 0);
+                     padded on the left by repeating the oldest pick.
+        instruction:  natural-language navigation instruction.
+        action_id:    ground-truth discrete expert action at ``step`` (0..9).
+        pose:         (4,) float32 [x, y, z, yaw] at ``step``.
+        goal:         (3,) float32 episode terminal-pose xyz.
+        last_action:  expert action at ``step - 1`` (0..9), or
+                      ``NUM_OPENFLY_ACTIONS`` (= 10) as a START token when
+                      ``step == 0``. Used as a recurrence proxy by the policy.
+        next_pose:    (4,) float32 [x, y, z, yaw] at ``step + 1``; at the
+                      terminal step this duplicates ``pose``. Drives the
+                      next-pose auxiliary loss.
+    """
 
     rgb: np.ndarray             # (H, W, 3) uint8 — current frame
     history: np.ndarray         # (n_history, H, W, 3) uint8
@@ -82,6 +102,8 @@ class OpenFlySample:
     action_id: int              # ground-truth discrete action 0..9
     pose: np.ndarray            # (4,) float32  [x, y, z, yaw]
     goal: np.ndarray            # (3,) float32  episode goal xyz
+    last_action: int            # 0..9 expert action at step-1, or 10 (START)
+    next_pose: np.ndarray       # (4,) float32  [x, y, z, yaw] at step+1
 
 
 class OpenFlyDataset(Dataset):
@@ -90,12 +112,21 @@ class OpenFlyDataset(Dataset):
     Args:
         split:        ``train`` / ``seen`` / ``unseen`` / ``eval_test``.
         image_root:   Override default image root (see :func:`default_image_root`).
-        history_frames: Past frames concatenated to the current observation.
+        history_frames: Past keyframes returned in :attr:`OpenFlySample.history`.
+                        Keyframes are action-transition frames (plus step 0); left
+                        padded by repeating the oldest pick. Falls back to uniform
+                        ``step-k`` indexing for early steps without transitions.
         image_size:   Square crop size; matches PaliGemma's 224.
         env_filter:   Substring filter on episode env name.
         max_episodes: Cap loaded episodes (debug).
-        max_samples:  Cap unrolled steps (debug).
+        max_samples:  Cap unrolled steps (debug). Applied before stop oversampling.
         require_images: If True, raise when frames cannot be resolved on disk.
+        oversample_stop: Per-step duplication factor for ``action == 0`` (stop)
+                         samples. ``2.0`` means each stop step appears ~twice in
+                         ``_index`` (one extra copy). Set to ``<= 1.0`` to disable.
+                         Default ``2.0`` — existing callers automatically get
+                         stop-class oversampling; pass ``oversample_stop=1.0`` for
+                         the legacy behaviour.
     """
 
     def __init__(
@@ -109,11 +140,13 @@ class OpenFlyDataset(Dataset):
         max_episodes: int = 0,
         max_samples: int = 0,
         require_images: bool = False,
+        oversample_stop: float = 2.0,
     ) -> None:
         self.image_root = Path(image_root) if image_root else default_image_root()
         self.history_frames = max(0, int(history_frames))
         self.image_size = int(image_size)
         self.require_images = require_images
+        self.oversample_stop = float(oversample_stop)
 
         episodes = load_episodes(
             split,
@@ -123,12 +156,45 @@ class OpenFlyDataset(Dataset):
 
         # Flatten to per-step records: (episode_idx, step_idx)
         index: list[tuple[int, int]] = []
+        skipped_steps = 0
         for ep_i, ep in enumerate(episodes):
             n = min(len(ep.get("action", [])), len(ep.get("index_list", [])))
+            indices = ep.get("index_list", [])
             for s in range(n):
+                if int(ep["action"][s]) not in ACTION_NAMES:
+                    continue
+                if require_images:
+                    if _resolve_frame(
+                        self.image_root, ep["image_path"], indices[s]
+                    ) is None:
+                        skipped_steps += 1
+                        continue
                 index.append((ep_i, s))
+        if require_images and skipped_steps:
+            print(
+                f"[openfly.dataset] require_images: indexed {len(index)} steps "
+                f"(skipped {skipped_steps} without frames under {self.image_root})"
+            )
         if max_samples > 0:
             index = index[:max_samples]
+
+        if self.oversample_stop > 1.0:
+            extra_copies = int(round(self.oversample_stop)) - 1
+            if extra_copies > 0:
+                stop_entries = [
+                    (ep_i, s) for (ep_i, s) in index
+                    if int(episodes[ep_i]["action"][s]) == 0
+                ]
+                pre = len(index)
+                # Deterministic order: original index, then duplicated stops.
+                # DataLoader handles shuffling at training time.
+                index.extend(stop_entries * extra_copies)
+                print(
+                    f"[openfly.dataset] oversample_stop={self.oversample_stop}: "
+                    f"{pre} -> {len(index)} samples "
+                    f"(stop steps={len(stop_entries)}, "
+                    f"added {len(stop_entries) * extra_copies} copies)"
+                )
 
         self._episodes = episodes
         self._index = index
@@ -150,7 +216,30 @@ class OpenFlyDataset(Dataset):
         pose_xyz = positions[step] if step < len(positions) else positions[-1]
         yaw = float(yaws[step]) if step < len(yaws) else float(yaws[-1])
         pose = np.asarray([pose_xyz[0], pose_xyz[1], pose_xyz[2], yaw], dtype=np.float32)
-        goal = np.asarray(positions[-1], dtype=np.float32)
+        goal_xyz = positions[-1]
+        goal = np.asarray(goal_xyz[:3], dtype=np.float32)
+
+        # Last expert action (recurrence proxy). START token == NUM_OPENFLY_ACTIONS.
+        # train.json contains stray -1 / -2 values for some pre-trim steps,
+        # so coerce out-of-range values to the START sentinel rather than
+        # passing them into ``last_action_embed`` (which has 11 entries).
+        if step > 0:
+            prev = int(actions[step - 1])
+            last_action = prev if 0 <= prev < NUM_OPENFLY_ACTIONS else NUM_OPENFLY_ACTIONS
+        else:
+            last_action = NUM_OPENFLY_ACTIONS
+
+        # Next-step pose for the auxiliary "next pose" prediction head. At the
+        # terminal step we duplicate the current pose so the delta is zero.
+        np_step = step + 1
+        if np_step < len(positions):
+            np_xyz = positions[np_step]
+            np_yaw = float(yaws[np_step]) if np_step < len(yaws) else yaw
+            next_pose = np.asarray(
+                [np_xyz[0], np_xyz[1], np_xyz[2], np_yaw], dtype=np.float32
+            )
+        else:
+            next_pose = pose.copy()
 
         cur_path = _resolve_frame(self.image_root, ep["image_path"], indices[step])
         if cur_path is None and self.require_images:
@@ -168,13 +257,34 @@ class OpenFlyDataset(Dataset):
         rgb = _load_rgb(cur_path, self.image_size)
 
         history_imgs: list[np.ndarray] = []
-        for k in range(self.history_frames, 0, -1):
-            j = step - k
-            if j >= 0:
-                hp = _resolve_frame(self.image_root, ep["image_path"], indices[j])
+        if self.history_frames > 0:
+            # Keyframes: step 0 plus any action-transition frame strictly before
+            # ``step``. Falls back to uniform ``step-k`` indexing for early steps
+            # that have no transitions yet.
+            cands = [
+                j for j in range(step)
+                if j == 0 or int(actions[j]) != int(actions[j - 1])
+            ]
+            if cands:
+                picked = cands[-self.history_frames :]
+                if len(picked) < self.history_frames:
+                    # Left-pad by repeating the oldest pick.
+                    picked = [picked[0]] * (self.history_frames - len(picked)) + picked
+                for j in picked:
+                    hp = _resolve_frame(self.image_root, ep["image_path"], indices[j])
+                    history_imgs.append(_load_rgb(hp, self.image_size))
             else:
-                hp = cur_path  # repeat current frame for padding
-            history_imgs.append(_load_rgb(hp, self.image_size))
+                # Early-step fallback: uniform step-k stack with current-frame
+                # padding when j < 0 (matches the legacy behaviour).
+                for k in range(self.history_frames, 0, -1):
+                    j = step - k
+                    if j >= 0:
+                        hp = _resolve_frame(
+                            self.image_root, ep["image_path"], indices[j]
+                        )
+                    else:
+                        hp = cur_path  # repeat current frame for padding
+                    history_imgs.append(_load_rgb(hp, self.image_size))
         if not history_imgs:
             history = np.zeros((0, self.image_size, self.image_size, 3), dtype=np.uint8)
         else:
@@ -187,6 +297,8 @@ class OpenFlyDataset(Dataset):
             action_id=action_id,
             pose=pose,
             goal=goal,
+            last_action=last_action,
+            next_pose=next_pose,
         )
 
 
@@ -209,6 +321,12 @@ def collate(samples: Sequence[OpenFlySample]) -> dict[str, Any]:
     actions = torch.tensor([s.action_id for s in samples], dtype=torch.long)
     poses = torch.from_numpy(np.stack([s.pose for s in samples], axis=0))
     goals = torch.from_numpy(np.stack([s.goal for s in samples], axis=0))
+    last_actions = torch.tensor(
+        [s.last_action for s in samples], dtype=torch.long
+    )
+    next_poses = torch.from_numpy(
+        np.stack([s.next_pose for s in samples], axis=0)
+    )
     instructions = [s.instruction for s in samples]
     return {
         "rgb": rgb,
@@ -217,4 +335,6 @@ def collate(samples: Sequence[OpenFlySample]) -> dict[str, Any]:
         "action_id": actions,
         "pose": poses,
         "goal": goals,
+        "last_action": last_actions,
+        "next_pose": next_poses,
     }

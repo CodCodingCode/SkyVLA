@@ -2,16 +2,17 @@
 
 [![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/)
 [![OpenFly](https://img.shields.io/badge/OpenFly-VLN-1f6feb.svg)](https://github.com/SHAILAB-IPEC/OpenFly-Platform)
+[![Site](https://img.shields.io/badge/site-codcodingcode.github.io%2FSkyVLA-blue.svg)](https://codcodingcode.github.io/SkyVLA/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 Outdoor aerial vision-language navigation built on the [OpenFly](https://github.com/SHAILAB-IPEC/OpenFly-Platform) benchmark. The repository ships:
 
-- a thin evaluation harness around OpenFly's seen / unseen splits and SR / OSR / NE / SPL metrics;
+- a thin evaluation harness around OpenFly's seen / unseen splits and SR / OSR / NE / SPL metrics, with a **per-env breakdown** for the three unseen scenes (`env_game_gtav`, `env_ue_smallcity`, `env_gs_sjtu02`);
 - a wrapper around the official OpenFly-Agent (OpenVLA 7B) FSDP fine-tune;
 - a custom PaliGemma + LoRA + MLP behaviour-cloning policy with its own offline trainer; and
-- an RL pipeline on top of the AirSim bridge — DAgger, GRPO (PaliGemma), and PPO (OpenFly-Agent 7B with LoRA + value head).
+- an RL pipeline on top of the AirSim bridge — DAgger, GRPO (PaliGemma) with an **easy &rarr; medium &rarr; hard reward curriculum**, and PPO (OpenFly-Agent 7B with LoRA + value head).
 
-See [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) for design notes on the PaliGemma + LoRA backbone, and [`docs/A100_SETUP.md`](docs/A100_SETUP.md) for end-to-end setup on an x86_64 A100 host.
+The research narrative — what we are actually trying to learn from these splits — lives in [`docs/RESEARCH.md`](docs/RESEARCH.md) and on the project site at <https://codcodingcode.github.io/SkyVLA/>. See [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) for design notes on the PaliGemma + LoRA backbone, and [`docs/A100_SETUP.md`](docs/A100_SETUP.md) for end-to-end setup on an x86_64 A100 host.
 
 ## Quick start
 
@@ -45,7 +46,9 @@ export OPENFLY_TFDS_DIR=~/openfly_tfds
 bash openfly/run_train_agent.sh --run_root_dir runs/openfly_agent_7b
 
 # Track B — custom PaliGemma BC on train.json (single GPU, offline).
-export OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images
+# Grab the trajectory frames from IPEC-COMMUNITY/OpenFly (all 11 train scenes; ~100 GB):
+bash openfly/download_train_images.sh
+export OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images/Image
 bash openfly/run_train_paligemma.sh --epochs 10 --batch_size 8
 
 # Evaluate the custom checkpoint:
@@ -62,9 +65,11 @@ See [`openfly/README.md`](openfly/README.md) for the full eval / train reference
 |-----|----------|
 | [`openfly/README.md`](openfly/README.md) | OpenFly eval, both training tracks, environment variables |
 | [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) | PaliGemma + LoRA feature extractor design notes |
+| [`docs/RESEARCH.md`](docs/RESEARCH.md) | Living research plan — research question, splits, reward curriculum, experiment matrix, results |
 | [`docs/A100_SETUP.md`](docs/A100_SETUP.md) | End-to-end setup of the OpenFly RL stack on an x86_64 A100 host |
 | [`docs/BENCHMARK_FAIRNESS.md`](docs/BENCHMARK_FAIRNESS.md) | What is and is not claimable from each leaderboard number |
-| [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md) | Roadmap for extending the trainer and eval coverage |
+| [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md) | Engineering checklist feeding into `RESEARCH.md` |
+| [Project site](https://codcodingcode.github.io/SkyVLA/) | Public Jekyll site published from `docs/` on `main` |
 
 ## Repository layout
 
@@ -76,7 +81,10 @@ drone_project/
 │   ├── train_paligemma.py   Offline BC trainer for the custom model
 │   ├── train_dagger.py      DAgger relabel loop on top of the BC checkpoint
 │   ├── train_grpo_paligemma.py   GRPO RL fine-tune for the PaliGemma policy
+│   ├── train_curriculum_grpo.py  Reward-sparsity curriculum (easy -> medium -> hard) on top of GRPO
 │   ├── train_ppo_openfly_agent.py   PPO + LoRA + value head for OpenFly-Agent 7B
+│   ├── scripts/aggregate_results.py   Roll logs/benchmarks/*.json into Markdown/CSV
+│   ├── scripts/analyse_failures.py    Per-env failure-mode breakdown for unseen runs
 │   ├── run_train_agent.sh   Wrapper for upstream OpenVLA FSDP training
 │   ├── envs/airsim_vln_env.py    gymnasium env wrapping the AirSim bridge
 │   ├── rewards.py / rollout.py   Episode rewards + trajectory collection
@@ -84,7 +92,7 @@ drone_project/
 │   ├── models/paligemma_vln.py / models/openfly_agent_rl.py
 │   ├── actions.py / episodes.py / platform.py / policies.py
 ├── vla/                     Portable PaliGemma feature extractor + LoRA + design notes
-├── docs/                    A100_SETUP, BENCHMARK_FAIRNESS, NEXT_STEPS
+├── docs/                    RESEARCH, A100_SETUP, BENCHMARK_FAIRNESS, NEXT_STEPS + Jekyll site
 └── logs/                    Training and benchmark outputs (gitignored)
 ```
 

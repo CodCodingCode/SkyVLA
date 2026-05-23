@@ -1,0 +1,14 @@
+# Local-preview Gemfile. GitHub Pages itself does not consume this file
+# (it uses the github-pages gem on the build runner), but it keeps
+# `bundle exec jekyll serve` reproducible if you want to preview the
+# site locally.
+
+source "https://rubygems.org"
+
+gem "github-pages", group: :jekyll_plugins
+
+group :jekyll_plugins do
+  gem "jekyll-remote-theme"
+  gem "jekyll-seo-tag"
+  gem "jekyll-sitemap"
+end

@@ -49,6 +49,7 @@ from openfly.rewards import (
     RewardConfig,
     compute_episode_reward,
     compute_step_progress,
+    get_reward_preset,
 )
 
 
@@ -74,6 +75,16 @@ class AirSimVLNEnvConfig:
     dense_progress: bool = False
     seed: int | None = None
     reward_config: RewardConfig = field(default_factory=lambda: DEFAULT_REWARD)
+    # Curriculum knob: when set, looks up the preset in
+    # ``openfly.rewards.REWARD_PRESETS`` and overrides ``reward_config``.
+    # ``dense_progress`` is forced True for the ``easy`` preset and False
+    # for ``medium`` / ``hard`` so the two knobs stay consistent.
+    reward_preset: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.reward_preset is not None:
+            self.reward_config = get_reward_preset(self.reward_preset)
+            self.dense_progress = self.reward_preset.lower() == "easy"
 
 
 _AIRSIM_ENV_REGISTRY: dict[str, "AirSimVLNEnv"] = {}

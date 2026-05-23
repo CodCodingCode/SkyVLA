@@ -115,8 +115,13 @@ def run(args: argparse.Namespace) -> dict:
 
     results: list[dict] = []
     totals = {"n": 0, "success": 0, "osr": 0, "spl_sum": 0.0, "ne_sum": 0.0}
+    per_env: dict[str, dict[str, float]] = {}
 
     for env_name, env_eps in groups.items():
+        per_env.setdefault(
+            env_name,
+            {"n": 0, "success": 0, "osr": 0, "spl_sum": 0.0, "ne_sum": 0.0},
+        )
         print(f"[openfly] env={env_name} episodes={len(env_eps)}", flush=True)
         time.sleep(3)
         bridge, pos_ratio = make_bridge(env_name, eval_mod)
@@ -183,6 +188,12 @@ def run(args: argparse.Namespace) -> dict:
             totals["osr"] += osr
             totals["spl_sum"] += spl
             totals["ne_sum"] += ne
+            env_bucket = per_env[env_name]
+            env_bucket["n"] += 1
+            env_bucket["success"] += success
+            env_bucket["osr"] += osr
+            env_bucket["spl_sum"] += spl
+            env_bucket["ne_sum"] += ne
             print(
                 f"[openfly] ep={idx} SR={success} OSR={osr} NE={ne:.1f}m SPL={spl:.3f}",
                 flush=True,
@@ -192,15 +203,31 @@ def run(args: argparse.Namespace) -> dict:
         del bridge
 
     n = max(totals["n"], 1)
+    per_env_summary: dict[str, dict[str, float]] = {}
+    for env_name, bucket in per_env.items():
+        ne = max(bucket["n"], 1)
+        per_env_summary[env_name] = {
+            "n_episodes": int(bucket["n"]),
+            "success_rate": bucket["success"] / ne,
+            "osr": bucket["osr"] / ne,
+            "mean_ne_m": bucket["ne_sum"] / ne,
+            "mean_spl": bucket["spl_sum"] / ne,
+        }
+
     summary = {
         "benchmark": "OpenFly-VLN",
         "split": args.split,
         "policy": args.policy,
+        "env_filter": args.env_filter or "",
+        "max_steps": args.max_steps,
+        "success_dist": args.success_dist,
+        "checkpoint": args.paligemma_ckpt or args.ppo_ckpt or args.model_id,
         "success_rate": totals["success"] / n,
         "osr": totals["osr"] / n,
         "mean_ne_m": totals["ne_sum"] / n,
         "mean_spl": totals["spl_sum"] / n,
         "n_episodes": totals["n"],
+        "per_env": per_env_summary,
         "episodes": results,
     }
     return summary
@@ -225,9 +252,18 @@ def main() -> int:
     print(
         f"\n[openfly] done SR={summary['success_rate']:.3f} "
         f"OSR={summary['osr']:.3f} mean_NE={summary['mean_ne_m']:.1f}m "
-        f"→ {out}",
+        f"mean_SPL={summary['mean_spl']:.3f} → {out}",
         flush=True,
     )
+    if len(summary.get("per_env", {})) > 1:
+        print("[openfly] per-env breakdown:", flush=True)
+        for env_name, row in sorted(summary["per_env"].items()):
+            print(
+                f"  {env_name}: n={row['n_episodes']} "
+                f"SR={row['success_rate']:.3f} OSR={row['osr']:.3f} "
+                f"NE={row['mean_ne_m']:.1f}m SPL={row['mean_spl']:.3f}",
+                flush=True,
+            )
     return 0
 
 

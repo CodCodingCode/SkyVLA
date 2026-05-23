@@ -43,6 +43,74 @@ class RewardConfig:
 DEFAULT_REWARD = RewardConfig()
 
 
+# ---------------------------------------------------------------------------
+# Curriculum presets
+# ---------------------------------------------------------------------------
+#
+# Three stages used by the curriculum GRPO driver (see
+# ``openfly.train_curriculum_grpo``). The progression mirrors the research
+# plan: start with dense progress shaping so the value function and the
+# policy have a thick gradient, then strip the shaping term, and finally
+# pull the soft NE penalty down so the only meaningful signal is the
+# terminal success bonus plus SPL.
+#
+# The success radius and SPL scale are held constant across stages so the
+# OpenFly benchmark interpretation of the reward (20 m success, SPL aligned
+# with the leaderboard) stays comparable between checkpoints.
+
+REWARD_EASY = RewardConfig(
+    success_dist=20.0,
+    success_scale=15.0,
+    spl_scale=1.0,
+    overrun_penalty=0.25,
+    ne_scale=1.0 / 40.0,
+    progress_scale=0.1,
+    collision_penalty=0.5,
+    timeout_penalty=0.0,
+)
+
+REWARD_MEDIUM = RewardConfig(
+    success_dist=20.0,
+    success_scale=15.0,
+    spl_scale=1.0,
+    overrun_penalty=0.25,
+    ne_scale=1.0 / 40.0,
+    progress_scale=0.0,
+    collision_penalty=0.5,
+    timeout_penalty=0.0,
+)
+
+REWARD_HARD = RewardConfig(
+    success_dist=20.0,
+    success_scale=20.0,
+    spl_scale=1.0,
+    overrun_penalty=0.0,
+    ne_scale=0.0,
+    progress_scale=0.0,
+    collision_penalty=0.0,
+    timeout_penalty=0.0,
+)
+
+
+REWARD_PRESETS: dict[str, RewardConfig] = {
+    "default": DEFAULT_REWARD,
+    "easy": REWARD_EASY,
+    "medium": REWARD_MEDIUM,
+    "hard": REWARD_HARD,
+}
+
+
+def get_reward_preset(name: str) -> RewardConfig:
+    """Look up a named curriculum preset (case-insensitive)."""
+    key = name.lower().strip()
+    if key not in REWARD_PRESETS:
+        raise KeyError(
+            f"Unknown reward preset {name!r}. "
+            f"Available: {sorted(REWARD_PRESETS)}"
+        )
+    return REWARD_PRESETS[key]
+
+
 def _path_length(positions: Sequence[Sequence[float]]) -> float:
     """Sum of segment lengths along a sequence of (x, y, z) poses."""
     total = 0.0
@@ -150,6 +218,11 @@ def compute_step_progress(
 __all__ = [
     "RewardConfig",
     "DEFAULT_REWARD",
+    "REWARD_EASY",
+    "REWARD_MEDIUM",
+    "REWARD_HARD",
+    "REWARD_PRESETS",
+    "get_reward_preset",
     "compute_episode_reward",
     "compute_step_progress",
 ]

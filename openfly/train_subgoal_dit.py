@@ -344,6 +344,11 @@ def main(argv: list[str] | None = None) -> int:
     base_out = Path(args.out_dir)
     out_dir = base_out / time.strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Resolve symlinks now so subsequent saves don't depend on a path that
+    # could disappear mid-training (we hit this once already — a 20-minute
+    # epoch died because the ``~/drone_project -> ~/SkyVLA`` symlink got
+    # removed between startup mkdir and end-of-epoch save).
+    out_dir = out_dir.resolve()
     print(f"[train_subgoal_dit] writing to {out_dir}")
 
     dtype_map = {
@@ -508,7 +513,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[train_subgoal_dit] epoch {epoch} → {train_log}")
 
         if (epoch + 1) % max(1, args.save_every) == 0 or epoch == args.epochs - 1:
+            # Re-ensure the parent directory exists right before save. We
+            # had a 20-minute training run lose its only checkpoint because
+            # the symlink in ``out_dir``'s prefix vanished between startup
+            # mkdir and end-of-epoch save. Idempotent and cheap; cost is
+            # one stat call.
+            out_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = out_dir / "last.pt"
+            tmp_path = out_dir / "last.pt.tmp"
             torch.save(
                 {
                     "dit": dit.state_dict(),
@@ -517,8 +529,10 @@ def main(argv: list[str] | None = None) -> int:
                     "global_step": global_step,
                     "args": vars(args),
                 },
-                ckpt_path,
+                tmp_path,
             )
+            # Atomic rename so a save crash never leaves a half-written ckpt.
+            os.replace(tmp_path, ckpt_path)
             with open(out_dir / "history.json", "w") as f:
                 json.dump(history, f, indent=2)
             print(f"[train_subgoal_dit] saved {ckpt_path}")

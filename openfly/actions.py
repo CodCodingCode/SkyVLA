@@ -22,6 +22,40 @@ ACTION_NAMES: dict[int, str] = {
     9: "forward_9m",
 }
 
+# OpenFly's `train.json` never emits strafe actions (6 / 7) — the A* planner
+# doesn't use them. We therefore train a compact 8-class head over the action
+# ids the dataset actually supervises, in canonical order. The sim and
+# `apply_action` continue to speak raw OpenFly ids (0..9); only the model's
+# input/output and dataset CE targets live in this logit-index space.
+TRAINABLE_ACTION_IDS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 8, 9)
+NUM_TRAINABLE_ACTIONS: int = len(TRAINABLE_ACTION_IDS)  # 8
+
+_ACTION_ID_TO_LOGIT: dict[int, int] = {a: i for i, a in enumerate(TRAINABLE_ACTION_IDS)}
+
+TRAINABLE_ACTION_NAMES: dict[int, str] = {
+    i: ACTION_NAMES[a] for i, a in enumerate(TRAINABLE_ACTION_IDS)
+}
+
+
+def action_id_to_logit_index(action_id: int) -> int:
+    """Map a raw OpenFly action id (in ``TRAINABLE_ACTION_IDS``) to a logit index.
+
+    Strafe actions (6, 7) are never supervised; passing one raises ``ValueError``.
+    """
+    try:
+        return _ACTION_ID_TO_LOGIT[int(action_id)]
+    except KeyError as exc:
+        raise ValueError(
+            f"action id {action_id} is outside the supervised action space "
+            f"{TRAINABLE_ACTION_IDS}"
+        ) from exc
+
+
+def logit_index_to_action_id(logit_index: int) -> int:
+    """Inverse of :func:`action_id_to_logit_index`."""
+    return TRAINABLE_ACTION_IDS[int(logit_index)]
+
+
 STEP_SIZE = 3.0
 
 

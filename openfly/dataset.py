@@ -27,10 +27,61 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from openfly.actions import ACTION_NAMES
+from openfly.actions import (
+    ACTION_NAMES,
+    NUM_TRAINABLE_ACTIONS,
+    TRAINABLE_ACTION_IDS,
+    action_id_to_logit_index,
+)
 from openfly.episodes import load_episodes
 
-NUM_OPENFLY_ACTIONS = 10
+
+def _build_sub_instruction(actions: Sequence[int], step: int) -> str:
+    """Template sub-instruction over the maximal same-action run starting at ``step``.
+
+    OpenFly trajectories alternate long runs of one primitive (e.g. seven
+    consecutive ``forward_3m``) and single transition actions (turn, ascend).
+    Each run corresponds to one "sub-trajectory" in the OpenFly data-gen
+    pipeline. Until we have the original VLM-generated sub-instructions on
+    disk, we surface a deterministic textual summary of the upcoming run
+    so the model has *something* to condition on at the sub-segment level.
+
+    Mid-run steps see only the *remainder* of the run, which doubles as a
+    cheap within-segment progress signal ("3 meters of forward left").
+    """
+    if step >= len(actions):
+        return ""
+    cur = int(actions[step])
+    run = 1
+    for j in range(step + 1, len(actions)):
+        if int(actions[j]) == cur:
+            run += 1
+        else:
+            break
+    if cur == 0:
+        return "stop here"
+    if cur == 1:
+        return f"move forward {3 * run} meters"
+    if cur == 2:
+        return f"turn left {30 * run} degrees"
+    if cur == 3:
+        return f"turn right {30 * run} degrees"
+    if cur == 4:
+        return f"ascend {3 * run} meters"
+    if cur == 5:
+        return f"descend {3 * run} meters"
+    if cur == 8:
+        return f"move forward {6 * run} meters"
+    if cur == 9:
+        return f"move forward {9 * run} meters"
+    return ACTION_NAMES.get(cur, str(cur))
+
+# Number of classes the model's action head supervises. Strafe ids 6/7 are
+# never emitted by OpenFly's A* planner, so they're excluded — see
+# ``openfly.actions.TRAINABLE_ACTION_IDS``. The constant name is preserved
+# for backward compatibility with imports across the repo; semantically it
+# is now the trainable head dim, not the size of OpenFly's raw vocab.
+NUM_OPENFLY_ACTIONS = NUM_TRAINABLE_ACTIONS  # = 8
 
 
 def default_image_root() -> Path:
@@ -85,25 +136,40 @@ class OpenFlySample:
                      Keyframes are action-transition frames (plus step 0);
                      padded on the left by repeating the oldest pick.
         instruction:  natural-language navigation instruction.
-        action_id:    ground-truth discrete expert action at ``step`` (0..9).
+        action_id:    ground-truth expert action as a **logit index** in
+                      ``[0, NUM_OPENFLY_ACTIONS)``. See
+                      ``openfly.actions.TRAINABLE_ACTION_IDS`` for the
+                      logit-index → raw-OpenFly-id mapping.
         pose:         (4,) float32 [x, y, z, yaw] at ``step``.
         goal:         (3,) float32 episode terminal-pose xyz.
-        last_action:  expert action at ``step - 1`` (0..9), or
-                      ``NUM_OPENFLY_ACTIONS`` (= 10) as a START token when
+        last_action:  expert action at ``step - 1`` as a logit index, or
+                      ``NUM_OPENFLY_ACTIONS`` (= 8) as a START token when
                       ``step == 0``. Used as a recurrence proxy by the policy.
         next_pose:    (4,) float32 [x, y, z, yaw] at ``step + 1``; at the
                       terminal step this duplicates ``pose``. Drives the
                       next-pose auxiliary loss.
+        progress:     float in [0, 1] = ``step / max(1, traj_len - 1)``.
+                      Fed into the action head as a small embedding;
+                      targets VLN's stop-when-close failure mode (large
+                      OSR–SR gap) by giving the model an explicit "how
+                      far along am I" signal.
+        sub_instruction: text summary of the upcoming same-action run
+                      (see :func:`_build_sub_instruction`). Concatenated
+                      into the PaliGemma prompt at training time. Empty
+                      string is allowed (inference fallback when no
+                      high-level policy is plumbed in yet).
     """
 
     rgb: np.ndarray             # (H, W, 3) uint8 — current frame
     history: np.ndarray         # (n_history, H, W, 3) uint8
     instruction: str
-    action_id: int              # ground-truth discrete action 0..9
+    action_id: int              # ground-truth action as a logit index 0..7
     pose: np.ndarray            # (4,) float32  [x, y, z, yaw]
     goal: np.ndarray            # (3,) float32  episode goal xyz
-    last_action: int            # 0..9 expert action at step-1, or 10 (START)
+    last_action: int            # 0..7 logit index at step-1, or 8 (START)
     next_pose: np.ndarray       # (4,) float32  [x, y, z, yaw] at step+1
+    progress: float             # [0, 1] fraction of trajectory completed
+    sub_instruction: str        # upcoming same-action run summary
 
 
 class OpenFlyDataset(Dataset):
@@ -161,7 +227,9 @@ class OpenFlyDataset(Dataset):
             n = min(len(ep.get("action", [])), len(ep.get("index_list", [])))
             indices = ep.get("index_list", [])
             for s in range(n):
-                if int(ep["action"][s]) not in ACTION_NAMES:
+                # Restrict to actions the head supervises (excludes strafes,
+                # which never appear in train.json, and pre-trim -1 / -2).
+                if int(ep["action"][s]) not in TRAINABLE_ACTION_IDS:
                     continue
                 if require_images:
                     if _resolve_frame(
@@ -212,20 +280,27 @@ class OpenFlyDataset(Dataset):
         positions: list[list[float]] = ep["pos"]
         yaws: list[float] = ep["yaw"]
 
-        action_id = int(actions[step])
+        # Remap the raw OpenFly action id (0..9) to a compact logit index
+        # in [0, NUM_OPENFLY_ACTIONS). The index filter above guarantees
+        # ``actions[step]`` is a supervised id, so the lookup cannot fail.
+        action_id = action_id_to_logit_index(int(actions[step]))
         pose_xyz = positions[step] if step < len(positions) else positions[-1]
         yaw = float(yaws[step]) if step < len(yaws) else float(yaws[-1])
         pose = np.asarray([pose_xyz[0], pose_xyz[1], pose_xyz[2], yaw], dtype=np.float32)
         goal_xyz = positions[-1]
         goal = np.asarray(goal_xyz[:3], dtype=np.float32)
 
-        # Last expert action (recurrence proxy). START token == NUM_OPENFLY_ACTIONS.
-        # train.json contains stray -1 / -2 values for some pre-trim steps,
-        # so coerce out-of-range values to the START sentinel rather than
-        # passing them into ``last_action_embed`` (which has 11 entries).
+        # Last expert action (recurrence proxy). Stored as a logit index;
+        # START token == NUM_OPENFLY_ACTIONS (= 8). train.json contains
+        # stray -1 / -2 values and the occasional un-supervised id, so
+        # anything outside ``TRAINABLE_ACTION_IDS`` falls back to START
+        # rather than poisoning the embedding lookup.
         if step > 0:
             prev = int(actions[step - 1])
-            last_action = prev if 0 <= prev < NUM_OPENFLY_ACTIONS else NUM_OPENFLY_ACTIONS
+            if prev in TRAINABLE_ACTION_IDS:
+                last_action = action_id_to_logit_index(prev)
+            else:
+                last_action = NUM_OPENFLY_ACTIONS  # START sentinel
         else:
             last_action = NUM_OPENFLY_ACTIONS
 
@@ -290,6 +365,10 @@ class OpenFlyDataset(Dataset):
         else:
             history = np.stack(history_imgs, axis=0)
 
+        traj_len = min(len(actions), len(indices))
+        progress = float(step) / float(max(1, traj_len - 1))
+        sub_instruction = _build_sub_instruction(actions, step)
+
         return OpenFlySample(
             rgb=rgb,
             history=history,
@@ -299,6 +378,8 @@ class OpenFlyDataset(Dataset):
             goal=goal,
             last_action=last_action,
             next_pose=next_pose,
+            progress=progress,
+            sub_instruction=sub_instruction,
         )
 
 
@@ -328,13 +409,19 @@ def collate(samples: Sequence[OpenFlySample]) -> dict[str, Any]:
         np.stack([s.next_pose for s in samples], axis=0)
     )
     instructions = [s.instruction for s in samples]
+    sub_instructions = [s.sub_instruction for s in samples]
+    progress = torch.tensor(
+        [float(s.progress) for s in samples], dtype=torch.float32
+    )
     return {
         "rgb": rgb,
         "history": history,
         "instruction": instructions,
+        "sub_instruction": sub_instructions,
         "action_id": actions,
         "pose": poses,
         "goal": goals,
         "last_action": last_actions,
         "next_pose": next_poses,
+        "progress": progress,
     }

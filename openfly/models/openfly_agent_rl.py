@@ -30,7 +30,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from openfly.actions import vector_to_action_id
+from openfly.actions import NUM_TRAINABLE_ACTIONS, vector_to_action_id
+
+# Number of classes the auxiliary BC anchor head supervises — matches
+# ``openfly.dataset.NUM_OPENFLY_ACTIONS``. Strafe ids 6 / 7 are absent
+# from OpenFly's training data, so the head excludes them; targets must
+# be remapped to logit-index space via ``action_id_to_logit_index``.
+NUM_OPENFLY_ACTIONS = NUM_TRAINABLE_ACTIONS  # = 8
 
 
 def _apply_lora_to_named_module(
@@ -153,6 +159,15 @@ class OpenFlyAgentRL(nn.Module):
         # Detect hidden dim. OpenVLA-7B is Llama-2-7B based → 4096.
         hidden_dim = getattr(getattr(self.policy.config, "text_config", self.policy.config), "hidden_size", 4096)
         self.value_head = ValueHead(hidden_dim).to(self.device, dtype=dtype)
+        # Auxiliary BC-anchor head: 8-class classifier over OpenFly's
+        # supervised action ids (strafes excluded — see
+        # ``openfly.actions.TRAINABLE_ACTION_IDS``). Fed from the prefix's
+        # last hidden state and trained with CE against expert (oracle /
+        # DAgger) action ids — remapped to logit indices by the trainer —
+        # to prevent the LoRA-updated representation from forgetting the
+        # expert distribution during PPO. Active only when
+        # ``--bc_coef > 0`` in train_ppo_openfly_agent.py.
+        self.bc_head = nn.Linear(hidden_dim, NUM_OPENFLY_ACTIONS).to(self.device, dtype=dtype)
 
         if freeze_vision:
             for name, p in self.policy.named_parameters():
@@ -306,25 +321,60 @@ class OpenFlyAgentRL(nn.Module):
             entropy = -(probs * log_probs).sum(dim=-1).mean()
         return seq_lp, entropy, value
 
+    def forward_bc_logits(
+        self,
+        rgb: np.ndarray,
+        instruction: str,
+        history: list[int],
+    ) -> torch.Tensor:
+        """Return ``(NUM_OPENFLY_ACTIONS,)`` logits for the BC anchor head.
+
+        Reads the same prefix-last-hidden-state as the value head and
+        runs it through ``self.bc_head``. The caller computes CE against
+        the expert action id.
+        """
+        inputs = self._prepare_inputs([rgb], instruction, history)
+        prefix_out = self.policy.model(  # type: ignore[attr-defined]
+            **inputs,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        last_hidden = prefix_out.hidden_states[-1][:, -1, :]
+        return self.bc_head(last_hidden).squeeze(0).float()
+
     def trainable_param_groups(
         self,
         *,
         lora_lr: float = 1e-5,
         value_lr: float = 3e-4,
+        bc_lr: float | None = None,
     ) -> list[dict[str, Any]]:
         lora_params: list[nn.Parameter] = []
         value_params: list[nn.Parameter] = []
+        bc_params: list[nn.Parameter] = []
         for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
             if "value_head" in name:
                 value_params.append(p)
+            elif "bc_head" in name:
+                bc_params.append(p)
             else:
                 lora_params.append(p)
-        return [
+        groups: list[dict[str, Any]] = [
             {"params": lora_params, "lr": lora_lr, "name": "lora"},
             {"params": value_params, "lr": value_lr, "name": "value"},
         ]
+        if bc_params:
+            groups.append(
+                {
+                    "params": bc_params,
+                    "lr": bc_lr if bc_lr is not None else value_lr,
+                    "name": "bc",
+                }
+            )
+        return groups
 
 
 __all__ = ["OpenFlyAgentRL", "ValueHead"]

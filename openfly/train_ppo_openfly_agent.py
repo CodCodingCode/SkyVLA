@@ -21,7 +21,11 @@ Layout:
 3. Run ``ppo_epochs`` epochs of minibatch updates:
      * re-evaluate logprob+value+entropy under current policy,
      * clipped policy loss + MSE value loss + KL anchor to a frozen ref,
-     * optional CE anchor against a DAgger JSONL of corrected actions.
+     * optional BC anchor: a small auxiliary 10-class head on the
+       prefix's last hidden state, trained with CE against the
+       goal-heuristic oracle's action id at each rollout state.
+       Activated by ``--bc_coef > 0``; guards against forgetting the
+       expert action distribution during PPO.
 4. Save LoRA + value head deltas; periodic eval gates new checkpoints.
 
 This file is a working scaffold — it depends on the OpenVLA HF wrapper
@@ -50,6 +54,11 @@ _DRONE_ROOT = Path(__file__).resolve().parent.parent
 if str(_DRONE_ROOT) not in sys.path:
     sys.path.insert(0, str(_DRONE_ROOT))
 
+from openfly.actions import (
+    TRAINABLE_ACTION_IDS,
+    action_id_to_logit_index,
+    goal_heuristic_action,
+)
 from openfly.envs import AirSimVLNEnv, AirSimVLNEnvConfig
 from openfly.episodes import load_episodes
 from openfly.rewards import DEFAULT_REWARD, RewardConfig, compute_step_progress
@@ -114,6 +123,7 @@ def _collect_rollouts(
         history_list: list[list[int]] = []
         action_tokens: list[torch.Tensor] = []
         action_ids: list[int] = []
+        expert_action_ids: list[int] = []
         logprobs: list[float] = []
         values: list[float] = []
         rewards: list[float] = []
@@ -134,6 +144,12 @@ def _collect_rollouts(
             history_list.append(list(history))
             action_tokens.append(tokens.cpu())
             action_ids.append(int(action_id))
+            # BC anchor target: what the goal-heuristic oracle would have
+            # picked at this state. Cheap to compute (no network), and
+            # mirrors the expert label DAgger writes to its JSONL.
+            expert_action_ids.append(
+                int(goal_heuristic_action(obs["pose"].tolist(), obs["goal"].tolist()))
+            )
             logprobs.append(float(lp))
             values.append(float(value.item() if hasattr(value, "item") else value))
 
@@ -159,6 +175,7 @@ def _collect_rollouts(
             "histories": history_list,
             "action_tokens": action_tokens,
             "action_ids": action_ids,
+            "expert_action_ids": expert_action_ids,
             "logprobs": logprobs,
             "values": values,
             "rewards": rewards,
@@ -182,6 +199,7 @@ def _ppo_update(
     value_coef: float,
     entropy_coef: float,
     kl_coef: float,
+    bc_coef: float,
     ppo_epochs: int,
     minibatch_size: int,
     clip_grad: float,
@@ -201,6 +219,7 @@ def _ppo_update(
                     "instruction": ep["instructions"][i],
                     "history": ep["histories"][i],
                     "tokens": ep["action_tokens"][i],
+                    "expert_action_id": ep["expert_action_ids"][i],
                     "old_logprob": ep["logprobs"][i],
                     "old_value": ep["values"][i],
                     "advantage": adv[i],
@@ -208,7 +227,7 @@ def _ppo_update(
                 }
             )
     if not flat:
-        return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "kl": 0.0}
+        return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "kl_ref": 0.0, "bc_loss": 0.0}
 
     # Advantage normalisation across all transitions.
     advs = torch.tensor([f["advantage"] for f in flat], dtype=torch.float32)
@@ -223,6 +242,7 @@ def _ppo_update(
         "entropy": 0.0,
         "kl_ref": 0.0,
         "approx_kl": 0.0,
+        "bc_loss": 0.0,
     }
     n_updates = 0
     rng = np.random.default_rng()
@@ -236,6 +256,7 @@ def _ppo_update(
             mb_value = torch.zeros((), device=device)
             mb_kl = torch.zeros((), device=device)
             mb_ent = torch.zeros((), device=device)
+            mb_bc = torch.zeros((), device=device)
             for t in mb:
                 lp, ent, val = model.evaluate_actions(
                     t["rgb"], t["instruction"], t["history"], t["tokens"]
@@ -257,20 +278,45 @@ def _ppo_update(
                         )
                     kl_ref = lp - ref_lp  # log-ratio surrogate KL
 
+                bc_loss = torch.zeros((), device=device)
+                if bc_coef > 0:
+                    bc_logits = model.forward_bc_logits(
+                        t["rgb"], t["instruction"], t["history"]
+                    )
+                    # ``expert_action_id`` is a raw OpenFly id from
+                    # ``goal_heuristic_action`` (always in {0,1,2,3}), but
+                    # the BC head outputs ``NUM_OPENFLY_ACTIONS`` (=8)
+                    # logit-index classes — remap before CE. Any expert
+                    # outside the supervised set (defensive) skips the BC
+                    # term for that step.
+                    expert_raw = int(t["expert_action_id"])
+                    if expert_raw in TRAINABLE_ACTION_IDS:
+                        target = torch.tensor(
+                            action_id_to_logit_index(expert_raw),
+                            device=device,
+                            dtype=torch.long,
+                        )
+                        bc_loss = F.cross_entropy(
+                            bc_logits.unsqueeze(0), target.unsqueeze(0)
+                        )
+
                 mb_policy = mb_policy + policy_loss
                 mb_value = mb_value + value_loss
                 mb_kl = mb_kl + kl_ref
                 mb_ent = mb_ent + ent
+                mb_bc = mb_bc + bc_loss
             mb_policy = mb_policy / max(len(mb), 1)
             mb_value = mb_value / max(len(mb), 1)
             mb_kl = mb_kl / max(len(mb), 1)
             mb_ent = mb_ent / max(len(mb), 1)
+            mb_bc = mb_bc / max(len(mb), 1)
 
             loss = (
                 mb_policy
                 + value_coef * mb_value
                 - entropy_coef * mb_ent
                 + kl_coef * mb_kl
+                + bc_coef * mb_bc
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -283,6 +329,7 @@ def _ppo_update(
             sums["value_loss"] += float(mb_value.detach().item())
             sums["entropy"] += float(mb_ent.detach().item())
             sums["kl_ref"] += float(mb_kl.detach().item())
+            sums["bc_loss"] += float(mb_bc.detach().item())
             n_updates += 1
 
     return {k: v / max(n_updates, 1) for k, v in sums.items()}
@@ -320,6 +367,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--value_coef", type=float, default=0.5)
     p.add_argument("--entropy_coef", type=float, default=0.01)
     p.add_argument("--kl_coef", type=float, default=0.02)
+    p.add_argument(
+        "--bc_coef",
+        type=float,
+        default=0.0,
+        help="Weight on the auxiliary BC (CE-to-expert-action) head loss. "
+        "Set >0 to anchor the LoRA-updated representation against the "
+        "goal-heuristic oracle's action ids — guards against the policy "
+        "forgetting expert behaviour during PPO. Typical: 0.01–0.1.",
+    )
+    p.add_argument(
+        "--bc_lr",
+        type=float,
+        default=None,
+        help="LR for the BC head only. Defaults to --value_lr.",
+    )
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae_lambda", type=float, default=0.95)
     p.add_argument("--clip_grad", type=float, default=1.0)
@@ -383,7 +445,11 @@ def main() -> int:
     ref_model.eval()
 
     optimizer = torch.optim.AdamW(
-        model.trainable_param_groups(lora_lr=args.lora_lr, value_lr=args.value_lr)
+        model.trainable_param_groups(
+            lora_lr=args.lora_lr,
+            value_lr=args.value_lr,
+            bc_lr=args.bc_lr,
+        )
     )
 
     train_env_cfg = AirSimVLNEnvConfig(
@@ -430,6 +496,7 @@ def main() -> int:
             value_coef=args.value_coef,
             entropy_coef=args.entropy_coef,
             kl_coef=args.kl_coef,
+            bc_coef=args.bc_coef,
             ppo_epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             clip_grad=args.clip_grad,
@@ -454,6 +521,7 @@ def main() -> int:
             f"[ppo-agent] it={it:03d} R̄={mean_ret:+.2f} SR={success:.2f} NE={ne:.1f}m "
             f"loss={update_stats['loss']:+.3f} v_loss={update_stats['value_loss']:.3f} "
             f"ent={update_stats['entropy']:.3f} kl={update_stats['kl_ref']:+.3f} "
+            f"bc={update_stats['bc_loss']:.3f} "
             f"t={log_row['elapsed_s']:.1f}s"
         )
         with open(out_dir / "history.json", "w") as f:
@@ -472,7 +540,7 @@ def main() -> int:
                     for k, v in model.state_dict().items()
                     if any(
                         sub in k
-                        for sub in ("lora_", "value_head")
+                        for sub in ("lora_", "value_head", "bc_head")
                     )
                 }
                 torch.save(
@@ -489,7 +557,7 @@ def main() -> int:
         last_state = {
             k: v.detach().cpu()
             for k, v in model.state_dict().items()
-            if any(sub in k for sub in ("lora_", "value_head"))
+            if any(sub in k for sub in ("lora_", "value_head", "bc_head"))
         }
         torch.save(
             {"lora_state": last_state, "iteration": it, "args": vars(args)},

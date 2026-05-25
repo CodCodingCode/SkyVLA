@@ -35,11 +35,18 @@ _DRONE_ROOT = Path(__file__).resolve().parent.parent
 if str(_DRONE_ROOT) not in sys.path:
     sys.path.insert(0, str(_DRONE_ROOT))
 
-from openfly.actions import ACTION_NAMES, goal_heuristic_action
+from openfly.actions import (
+    ACTION_NAMES,
+    TRAINABLE_ACTION_IDS,
+    action_id_to_logit_index,
+    goal_heuristic_action,
+    logit_index_to_action_id,
+)
 from openfly.dataset import (
     NUM_OPENFLY_ACTIONS,
     OpenFlyDataset,
     OpenFlySample,
+    _build_sub_instruction,
     collate,
 )
 from openfly.envs import AirSimVLNEnv, AirSimVLNEnvConfig
@@ -76,27 +83,44 @@ class DAggerBuffer(Dataset):
         to collapse training. We just keep the trajectory honest.
 
         ``last_action`` records the previously *executed* (agent) action
-        — ``traj.actions[i-1]`` — because that's what produced the
-        current observation; at step 0 we emit the START token
-        (``NUM_OPENFLY_ACTIONS``) to match offline dataset semantics.
-        ``next_pose`` is the agent's pose at i+1, falling back to the
-        current pose at the terminal step.
+        — ``traj.actions[i-1]`` (a raw OpenFly id from the sim) — because
+        that's what produced the current observation. We remap it into
+        the model's logit-index space here; un-supervised ids fall back
+        to the START token (``NUM_OPENFLY_ACTIONS``). ``next_pose`` is
+        the agent's pose at i+1, falling back to the current pose at
+        the terminal step.
         """
         added = 0
+        # Sub-instruction is templated from the *expert* (oracle) action at
+        # this step extended into a single-action sub-segment. The oracle
+        # only emits one action at a time, so this collapses to a single
+        # primitive (e.g. "turn left 30 degrees"). Trajectory-length
+        # progress mirrors the offline dataset's ``step / (n-1)``.
+        traj_len = max(1, len(traj.obs_rgb))
         for i, rgb in enumerate(traj.obs_rgb):
             if i >= len(traj.obs_poses):
                 break
             pose_arr = traj.obs_poses[i]
             pose = pose_arr.tolist() if hasattr(pose_arr, "tolist") else list(pose_arr)
             goal = list(traj.goal)
-            expert = goal_heuristic_action(pose, goal)
+            # goal_heuristic_action only ever returns {0, 1, 2, 3} so the
+            # remap is always defined; assert keeps that contract honest.
+            expert_raw = int(goal_heuristic_action(pose, goal))
+            expert = action_id_to_logit_index(expert_raw)
+            sub_instruction = _build_sub_instruction([expert_raw], 0)
+            progress = float(i) / float(max(1, traj_len - 1))
             history_arr = traj.obs_history[i] if i < len(traj.obs_history) else np.zeros(
                 (self.history_frames, self.image_size, self.image_size, 3), dtype=np.uint8
             )
             if i == 0 or i - 1 >= len(traj.actions):
                 last_action = NUM_OPENFLY_ACTIONS  # START token
             else:
-                last_action = int(traj.actions[i - 1])
+                prev_raw = int(traj.actions[i - 1])
+                last_action = (
+                    action_id_to_logit_index(prev_raw)
+                    if prev_raw in TRAINABLE_ACTION_IDS
+                    else NUM_OPENFLY_ACTIONS
+                )
             if i + 1 < len(traj.obs_poses):
                 np_arr = traj.obs_poses[i + 1]
                 next_pose = np.asarray(
@@ -114,6 +138,8 @@ class DAggerBuffer(Dataset):
                 goal=np.asarray(goal, dtype=np.float32),
                 last_action=int(last_action),
                 next_pose=next_pose,
+                progress=progress,
+                sub_instruction=sub_instruction,
             )
             self._samples.append(sample)
             added += 1
@@ -155,9 +181,28 @@ def _load_paligemma(args, device: torch.device) -> tuple[PaliGemmaVLNPolicy, Any
     return model, processor
 
 
-def _tokenise_batch(processor, instructions: list[str], rgb_dummy, device, max_length=256):
+def _format_prompt(instruction: str, sub_instruction: str | None) -> str:
+    base = f"<image>\nTask: {instruction}"
+    if sub_instruction:
+        return f"{base}\nNow: {sub_instruction}"
+    return base
+
+
+def _tokenise_batch(
+    processor,
+    instructions: list[str],
+    rgb_dummy,
+    device,
+    max_length=256,
+    sub_instructions: list[str] | None = None,
+):
+    if sub_instructions is None:
+        sub_instructions = [""] * len(instructions)
+    texts = [
+        _format_prompt(ins, sub) for ins, sub in zip(instructions, sub_instructions)
+    ]
     batch = processor(
-        text=[f"<image>\n{ins}" for ins in instructions],
+        text=texts,
         images=[rgb_dummy.cpu().numpy()] * len(instructions),
         return_tensors="pt",
         padding="longest",
@@ -179,8 +224,15 @@ def _train_step(
     actions = batch["action_id"].to(device, non_blocking=True)
     last_action = batch["last_action"].to(device, non_blocking=True)
     next_pose = batch["next_pose"].to(device, non_blocking=True)
+    progress = batch.get("progress")
+    if progress is not None:
+        progress = progress.to(device, non_blocking=True)
     input_ids, attention_mask = _tokenise_batch(
-        processor, batch["instruction"], rgb[0], device
+        processor,
+        batch["instruction"],
+        rgb[0],
+        device,
+        sub_instructions=batch.get("sub_instruction"),
     )
     out = model(
         instruction_input_ids=input_ids,
@@ -190,6 +242,7 @@ def _train_step(
         pose=pose,
         last_action=last_action,
         next_pose=next_pose,
+        progress=progress,
         with_grad=True,
     )
     logits = out["action_logits"]
@@ -205,8 +258,15 @@ def _policy_factory_paligemma(
     model: PaliGemmaVLNPolicy,
     processor,
     device: torch.device,
+    max_steps: int = 60,
 ):
-    """Return a ``policy_fn`` compatible with :func:`collect_episode`."""
+    """Return a ``policy_fn`` compatible with :func:`collect_episode`.
+
+    ``max_steps`` is used as the denominator for the inference-time
+    ``progress`` proxy. This matches what the env actually budgets so the
+    scalar stays in [0, 1] and roughly aligns with the training signal
+    (step / traj_len).
+    """
     from openfly.dataset import NUM_OPENFLY_ACTIONS
 
     # Mutable closure cell so the same policy_fn instance can track
@@ -230,8 +290,17 @@ def _policy_factory_paligemma(
         # ``next_pose`` is only consumed by the trainer's aux goal target;
         # at inference we duplicate the current pose.
         next_pose_t = pose_t.clone()
+        # Budget-relative progress. Without a high-level expected-length
+        # estimate at inference, this is the best proxy that aligns with
+        # the [0, 1] signal the model saw during training.
+        step_idx = int(info.get("step_idx", 0))
+        progress_val = min(1.0, step_idx / float(max(max_steps - 1, 1)))
+        progress_t = torch.tensor([progress_val], dtype=torch.float32, device=device)
+        # No high-level policy plumbed in yet → empty sub-instruction.
+        # The prompt template drops the "Now:" line in this case so
+        # we don't fabricate a sub-step the model didn't choose.
         proc = processor(
-            text=[f"<image>\n{info.get('instruction', '')}"],
+            text=[_format_prompt(info.get("instruction", ""), None)],
             images=[rgb],
             return_tensors="pt",
             padding="longest",
@@ -249,12 +318,16 @@ def _policy_factory_paligemma(
                 pose=pose_t,
                 last_action=last_action_t,
                 next_pose=next_pose_t,
+                progress=progress_t,
                 with_grad=False,
             )
             logits = out["action_logits"]
-            action = int(logits.argmax(dim=-1).item())
-        state["last_action"] = action
-        return action, {"logits": logits.detach().cpu()}
+            logit_idx = int(logits.argmax(dim=-1).item())
+        # ``state["last_action"]`` is fed back into the model embedding, so
+        # we keep it in logit-index space. The env, however, expects a raw
+        # OpenFly id; remap at the boundary.
+        state["last_action"] = logit_idx
+        return logit_index_to_action_id(logit_idx), {"logits": logits.detach().cpu()}
 
     return policy_fn
 
@@ -366,7 +439,9 @@ def main(argv: list[str] | None = None) -> int:
             max_episodes=args.offline_max_episodes,
         )
         print(f"[dagger] offline OpenFlyDataset size={len(offline_ds)}")
-        policy_fn = _policy_factory_paligemma(model, processor, device)
+        policy_fn = _policy_factory_paligemma(
+            model, processor, device, max_steps=args.max_steps
+        )
     else:
         # Track A: collection-only. We rely on the existing OpenFlyAgentPolicy
         # for rollouts so the corrected JSONL feeds an upstream re-SFT later.

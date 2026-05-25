@@ -52,6 +52,11 @@ _DRONE_ROOT = Path(__file__).resolve().parent.parent
 if str(_DRONE_ROOT) not in sys.path:
     sys.path.insert(0, str(_DRONE_ROOT))
 
+from openfly.actions import (
+    TRAINABLE_ACTION_IDS,
+    action_id_to_logit_index,
+    logit_index_to_action_id,
+)
 from openfly.dataset import NUM_OPENFLY_ACTIONS, OpenFlyDataset, collate
 from openfly.envs import AirSimVLNEnv, AirSimVLNEnvConfig
 from openfly.episodes import load_episodes
@@ -99,20 +104,24 @@ def _forward_logits(
     """Single-step logits for one observation.
 
     ``last_action`` is sourced from the env's observation (``obs["last_action"]``
-    — see :class:`openfly.envs.AirSimVLNEnv`). The env initialises this to
-    ``-1`` at reset; we remap that to the START token (``NUM_OPENFLY_ACTIONS``)
-    so the model's embedding layer is consistent between offline SFT and
-    on-policy rollouts. ``next_pose`` is unknown at rollout time, so we
-    pass the current pose (the model's ``goal_pred`` auxiliary output is
-    not consumed during GRPO updates anyway).
+    — a raw OpenFly id; see :class:`openfly.envs.AirSimVLNEnv`). The env
+    initialises this to ``-1`` at reset; ids outside the supervised set
+    (including the reset value and any future strafes) fall back to the
+    START sentinel (``NUM_OPENFLY_ACTIONS``) so the model's embedding
+    table stays consistent between offline SFT and on-policy rollouts.
+    ``next_pose`` is unknown at rollout time, so we pass the current pose
+    (the model's ``goal_pred`` auxiliary output is not consumed during
+    GRPO updates anyway).
     """
     rgb_t = torch.from_numpy(obs["rgb"]).unsqueeze(0).to(device)
     hist_t = torch.from_numpy(obs["rgb_history"]).unsqueeze(0).to(device)
     pose_t = torch.from_numpy(obs["pose"]).unsqueeze(0).to(device)
     raw_la = int(obs.get("last_action", -1))
-    if raw_la < 0 or raw_la >= NUM_OPENFLY_ACTIONS:
-        raw_la = NUM_OPENFLY_ACTIONS  # START token
-    last_action_t = torch.tensor([raw_la], dtype=torch.long, device=device)
+    if raw_la in TRAINABLE_ACTION_IDS:
+        la_idx = action_id_to_logit_index(raw_la)
+    else:
+        la_idx = NUM_OPENFLY_ACTIONS  # START token
+    last_action_t = torch.tensor([la_idx], dtype=torch.long, device=device)
     next_pose_t = pose_t.clone()
     input_ids, attention_mask = _tokenise(processor, instruction, obs["rgb"], device)
     if with_grad:
@@ -160,7 +169,10 @@ def _sampling_policy_fn(
             dist = torch.distributions.Categorical(logits=logits)
             a = dist.sample()
             logprob = dist.log_prob(a)
-        return int(a.item()), {
+        # Env steps on raw OpenFly ids; convert at the boundary. The logit
+        # index is recoverable from the raw id via ``action_id_to_logit_index``
+        # downstream in the GRPO update, so we don't need to also record it.
+        return logit_index_to_action_id(int(a.item())), {
             "logprob": float(logprob.item()),
             "logits": logits.detach().cpu(),
         }
@@ -182,8 +194,8 @@ def _eval_loop(
         logits = _forward_logits(
             model, processor, obs, info.get("instruction", ""), device, with_grad=False
         )
-        action = int(logits.argmax(dim=-1).item())
-        return action, {"source": "argmax"}
+        logit_idx = int(logits.argmax(dim=-1).item())
+        return logit_index_to_action_id(logit_idx), {"source": "argmax"}
 
     model.eval()
     trajs = [collect_episode(env, greedy_fn, capture_obs=False) for _ in range(n_episodes)]
@@ -501,7 +513,10 @@ def main() -> int:
                         with_grad=True,
                     )
                     log_probs = F.log_softmax(logits_pi, dim=-1)
-                    log_pi_a = log_probs[0, int(action_id)]
+                    # ``action_id`` in traj is a raw OpenFly id (sim space);
+                    # remap to the model's logit-index space before scoring.
+                    a_idx = action_id_to_logit_index(int(action_id))
+                    log_pi_a = log_probs[0, a_idx]
                     old_lp = float(traj.extras[s_idx].get("logprob", log_pi_a.detach().item()))
                     ratio = torch.exp(log_pi_a - old_lp)
                     unclipped = ratio * advantage

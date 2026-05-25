@@ -7,7 +7,11 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from openfly.actions import goal_heuristic_action
+from openfly.actions import (
+    NUM_TRAINABLE_ACTIONS,
+    goal_heuristic_action,
+    logit_index_to_action_id,
+)
 
 
 class OpenFlyPolicy(ABC):
@@ -106,15 +110,17 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
     """Custom PaliGemma BC policy fine-tuned on OpenFly via `train_paligemma.py`.
 
     Loads a checkpoint produced by ``openfly.train_paligemma`` and predicts
-    discrete OpenFly action ids (0..9) from the current RGB frame plus a
-    rolling history. Mirrors the training-time forward signature
-    (``last_action`` + ``next_pose``); at inference we use ``next_pose ==
-    pose`` because we don't know the next state ahead of time — the model's
-    ``goal_pred`` auxiliary output is ignored.
+    a discrete action from the current RGB frame plus a rolling history.
+    The model emits a *logit index* in ``[0, NUM_TRAINABLE_ACTIONS)``; we
+    remap to a raw OpenFly id (in ``[0, 10)``) at the env boundary so the
+    sim's ``apply_action`` keeps working unchanged. ``self._last_action``
+    stays in logit-index space because it is fed back into the model's
+    embedding table on the next step.
     """
 
-    # START token id used during training when step == 0.
-    _START_ACTION_ID: int = 10
+    # START token used during training when step == 0; lives in
+    # logit-index space, so the sentinel is ``NUM_TRAINABLE_ACTIONS``.
+    _START_ACTION_ID: int = NUM_TRAINABLE_ACTIONS
 
     def __init__(
         self,
@@ -220,7 +226,7 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         input_ids = proc["input_ids"].to(self.device)
         attention_mask = proc["attention_mask"].to(self.device)
 
-        action = self.model.predict_action(
+        logit_idx = self.model.predict_action(
             instruction_input_ids=input_ids,
             instruction_attention_mask=attention_mask,
             rgb_current=rgb_t,
@@ -235,8 +241,10 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
             self._history.append(cur)
             if len(self._history) > self.history_frames:
                 self._history = self._history[-self.history_frames :]
-        self._last_action = int(action)
-        return int(action)
+        # last_action stays in logit-index space (fed back to model embed);
+        # the env wants a raw OpenFly id, so remap only at the return.
+        self._last_action = int(logit_idx)
+        return int(logit_index_to_action_id(int(logit_idx)))
 
 
 class OpenFlyAgentRLPolicy(OpenFlyPolicy):

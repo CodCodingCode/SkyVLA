@@ -25,7 +25,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
-from openfly.actions import ACTION_NAMES
+from openfly.actions import (
+    TRAINABLE_ACTION_IDS,
+    TRAINABLE_ACTION_NAMES,
+    action_id_to_logit_index,
+)
 from openfly.dataset import NUM_OPENFLY_ACTIONS, OpenFlyDataset, collate
 from openfly.models.paligemma_vln import (
     PaliGemmaVLNPolicy,
@@ -40,12 +44,26 @@ def _build_processor(model_name: str):
     return AutoProcessor.from_pretrained(model_name)
 
 
+def _format_prompt(instruction: str, sub_instruction: str | None) -> str:
+    """Compose the PaliGemma text prompt.
+
+    The "Now:" line is only emitted when ``sub_instruction`` is non-empty
+    so that inference paths without a high-level policy (which emit "")
+    don't introduce a dangling label and surprise the model.
+    """
+    base = f"<image>\nTask: {instruction}"
+    if sub_instruction:
+        return f"{base}\nNow: {sub_instruction}"
+    return base
+
+
 def _tokenise_batch(
     processor,
     instructions: list[str],
     rgb_dummy: torch.Tensor,
     device: torch.device,
     max_length: int = 512,
+    sub_instructions: list[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the PaliGemma processor on a batch of instructions.
 
@@ -53,8 +71,13 @@ def _tokenise_batch(
     the resulting image tokens are stripped downstream by
     ``PaliGemmaVLNPolicy._tokenize``.
     """
+    if sub_instructions is None:
+        sub_instructions = [""] * len(instructions)
+    texts = [
+        _format_prompt(ins, sub) for ins, sub in zip(instructions, sub_instructions)
+    ]
     batch = processor(
-        text=[f"<image>\n{ins}" for ins in instructions],
+        text=texts,
         images=[rgb_dummy.cpu().numpy()] * len(instructions),
         return_tensors="pt",
         padding="longest",
@@ -89,13 +112,17 @@ def _cache_key(split: str, max_episodes: int, env_filter: str | None) -> str:
 
 
 def _compute_action_counts(dataset: OpenFlyDataset) -> np.ndarray:
-    """Count action ids over ``dataset._index`` (no image loads)."""
+    """Count actions over ``dataset._index`` as logit-index histograms.
+
+    The dataset's index has already filtered to ``TRAINABLE_ACTION_IDS``,
+    so every raw id we read here is guaranteed to remap cleanly.
+    """
     counts = np.zeros(NUM_OPENFLY_ACTIONS, dtype=np.int64)
     episodes = dataset._episodes  # noqa: SLF001 — intentional read
     for ep_i, step in dataset._index:  # noqa: SLF001
         a = int(episodes[ep_i]["action"][step])
-        if 0 <= a < NUM_OPENFLY_ACTIONS:
-            counts[a] += 1
+        if a in TRAINABLE_ACTION_IDS:
+            counts[action_id_to_logit_index(a)] += 1
     return counts
 
 
@@ -200,9 +227,16 @@ def _step(
     actions = batch["action_id"].to(device, non_blocking=True)
     last_action = batch["last_action"].to(device, non_blocking=True)
     next_pose = batch["next_pose"].to(device, non_blocking=True)
+    progress = batch.get("progress")
+    if progress is not None:
+        progress = progress.to(device, non_blocking=True)
 
     input_ids, attention_mask = _tokenise_batch(
-        processor, batch["instruction"], rgb_dummy=rgb[0], device=device
+        processor,
+        batch["instruction"],
+        rgb_dummy=rgb[0],
+        device=device,
+        sub_instructions=batch.get("sub_instruction"),
     )
 
     out = model(
@@ -213,6 +247,7 @@ def _step(
         pose=pose,
         last_action=last_action,
         next_pose=next_pose,
+        progress=progress,
         with_grad=True,
     )
     logits = out["action_logits"]
@@ -332,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             env_filter=args.env_filter,
         )
         weight_str = ", ".join(
-            f"{c}({ACTION_NAMES.get(c, str(c))})={weights[c]:.3f}"
+            f"{c}({TRAINABLE_TRAINABLE_ACTION_NAMES.get(c, str(c))})={weights[c]:.3f}"
             for c in range(NUM_OPENFLY_ACTIONS)
         )
         count_str = ", ".join(
@@ -484,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
             acc = cor / tot if tot > 0 else float("nan")
             print(
                 f"[train_paligemma] epoch {epoch} train class {c} "
-                f"({ACTION_NAMES.get(c, str(c))}): {cor}/{tot} = {acc:.3f}"
+                f"({TRAINABLE_ACTION_NAMES.get(c, str(c))}): {cor}/{tot} = {acc:.3f}"
             )
 
         if val_loader is not None:
@@ -520,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
                 acc = cor / tot if tot > 0 else float("nan")
                 print(
                     f"[train_paligemma] epoch {epoch} val class {c} "
-                    f"({ACTION_NAMES.get(c, str(c))}): {cor}/{tot} = {acc:.3f}"
+                    f"({TRAINABLE_ACTION_NAMES.get(c, str(c))}): {cor}/{tot} = {acc:.3f}"
                 )
 
         history.append(train_log)

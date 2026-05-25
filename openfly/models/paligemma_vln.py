@@ -1,4 +1,10 @@
-"""PaliGemma BC policy for OpenFly's 10-class discrete action space.
+"""PaliGemma BC policy for OpenFly's 8-class supervised action space.
+
+The head outputs logits over the eight action ids OpenFly's A* planner
+actually emits (``openfly.actions.TRAINABLE_ACTION_IDS``). Strafe actions
+(raw ids 6 / 7) never appear in ``train.json``, so giving them dedicated
+logits only burns capacity. The simulator still speaks raw OpenFly ids;
+policy adapters remap argmax → raw id at the env boundary.
 
 Architecture (post-accuracy-fix; LSTM removed):
 
@@ -24,7 +30,8 @@ by default) + image/text/gemma projections + per-frame [CLS] pool +
 cross-attention + pose encoder + last-action embedding + action head.
 
 This file intentionally breaks state-dict compatibility with previous
-checkpoints (the LSTM is gone and new layers are added); train from scratch.
+checkpoints (the LSTM is gone, the action head shrank 10→8, and the
+last-action embedding shrank 11→9); train from scratch.
 """
 
 from __future__ import annotations
@@ -37,7 +44,8 @@ import torch.nn as nn
 from vla.vla_policy import PaliGemmaFeatureExtractor
 
 
-NUM_OPENFLY_ACTIONS = 10
+# Number of supervised action classes — see ``openfly.actions.TRAINABLE_ACTION_IDS``.
+NUM_OPENFLY_ACTIONS = 8
 # Sentinel value used for ``last_action`` at the first step of an episode.
 # Embedding table therefore has ``NUM_OPENFLY_ACTIONS + 1`` entries.
 LAST_ACTION_START_TOKEN = NUM_OPENFLY_ACTIONS
@@ -120,7 +128,18 @@ class PaliGemmaVLNPolicy(nn.Module):
         # LAST_ACTION_START_TOKEN as the sentinel for step 0.
         self.last_action_embed = nn.Embedding(NUM_OPENFLY_ACTIONS + 1, 32)
 
-        head_in_dim = embed_dim + 32 + 32
+        # Progress encoder: scalar in [0, 1] → 16-d feature. We pass the
+        # raw scalar through a small MLP; this gives the action head an
+        # explicit "how far through the trajectory am I" signal so the
+        # stop-class can be triggered more decisively as progress → 1.
+        # Targets the OSR–SR gap (flies near goal, never stops).
+        self.progress_proj = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ELU(),
+            nn.Linear(16, 16),
+        )
+
+        head_in_dim = embed_dim + 32 + 32 + 16
         self.action_head = nn.Sequential(
             nn.Linear(head_in_dim, 512),
             nn.LayerNorm(512),
@@ -264,6 +283,7 @@ class PaliGemmaVLNPolicy(nn.Module):
         pose: torch.Tensor,
         last_action: torch.Tensor,
         next_pose: torch.Tensor,  # noqa: ARG002 — signature parity; target derived by trainer
+        progress: torch.Tensor | None = None,
         with_grad: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Compute action logits (and optional goal regression) for one step.
@@ -280,6 +300,9 @@ class PaliGemmaVLNPolicy(nn.Module):
                 (or current pose at terminal step). Accepted for inference
                 signature parity; the trainer uses it to build the
                 ``goal_pred`` regression target.
+            progress: (B,) float32 in [0, 1] — fraction of expected
+                trajectory completed. Defaults to zeros when omitted
+                (legacy callers and the first step of a rollout).
             with_grad: enable LoRA gradients during training; False in eval.
         """
         image_tokens, text_tokens, text_mask, gemma_summary = self._tokenize(
@@ -310,7 +333,16 @@ class PaliGemmaVLNPolicy(nn.Module):
 
         pose_feat = self.pose_proj(pose.to(scene_summary.dtype))
         last_action_emb = self.last_action_embed(last_action.long())
-        head_in = torch.cat([scene_summary, pose_feat, last_action_emb], dim=-1)
+        if progress is None:
+            progress_scalar = torch.zeros(
+                pose.shape[0], 1, device=pose.device, dtype=scene_summary.dtype
+            )
+        else:
+            progress_scalar = progress.to(scene_summary.dtype).reshape(-1, 1).clamp(0.0, 1.0)
+        progress_feat = self.progress_proj(progress_scalar)
+        head_in = torch.cat(
+            [scene_summary, pose_feat, last_action_emb, progress_feat], dim=-1
+        )
 
         action_logits = self.action_head(head_in)
         out: dict[str, torch.Tensor] = {"action_logits": action_logits}
@@ -329,6 +361,7 @@ class PaliGemmaVLNPolicy(nn.Module):
         pose: torch.Tensor,
         last_action: torch.Tensor,
         next_pose: torch.Tensor,
+        progress: torch.Tensor | None = None,
     ) -> int:
         out = self.forward(
             instruction_input_ids=instruction_input_ids,
@@ -338,6 +371,7 @@ class PaliGemmaVLNPolicy(nn.Module):
             pose=pose,
             last_action=last_action,
             next_pose=next_pose,
+            progress=progress,
             with_grad=False,
         )
         return int(out["action_logits"].argmax(dim=-1).item())

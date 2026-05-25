@@ -2,11 +2,11 @@
 # GRPO online RL on the PaliGemma BC policy.
 #
 # Required:
-#   --init_ckpt PATH   PaliGemma checkpoint from DAgger (preferred) or SFT
+#   --init_ckpt PATH   PaliGemma SFT checkpoint
 #
 # Example:
 #   bash ~/drone_project/openfly/run_train_grpo.sh \
-#     --init_ckpt logs/openfly/dagger/<run>/last.pt \
+#     --init_ckpt logs/openfly/paligemma/<run>/last.pt \
 #     --steps 200 --group_size 4 --instructions_per_step 2
 
 set -euo pipefail

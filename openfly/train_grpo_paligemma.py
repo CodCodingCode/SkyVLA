@@ -80,9 +80,24 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _tokenise(processor, instruction: str, rgb: np.ndarray, device, max_length=256):
+def _format_prompt(instruction: str, sub_instruction: str | None) -> str:
+    """Local copy of the trainer prompt template; keeps this module import-light."""
+    base = f"<image>\nTask: {instruction}"
+    if sub_instruction:
+        return f"{base}\nNow: {sub_instruction}"
+    return base
+
+
+def _tokenise(
+    processor,
+    instruction: str,
+    rgb: np.ndarray,
+    device,
+    max_length=256,
+    sub_instruction: str | None = None,
+):
     proc = processor(
-        text=[f"<image>\n{instruction}"],
+        text=[_format_prompt(instruction, sub_instruction)],
         images=[rgb],
         return_tensors="pt",
         padding="longest",
@@ -100,6 +115,8 @@ def _forward_logits(
     device: torch.device,
     *,
     with_grad: bool,
+    progress: float | None = None,
+    sub_instruction: str | None = None,
 ) -> torch.Tensor:
     """Single-step logits for one observation.
 
@@ -112,6 +129,11 @@ def _forward_logits(
     ``next_pose`` is unknown at rollout time, so we pass the current pose
     (the model's ``goal_pred`` auxiliary output is not consumed during
     GRPO updates anyway).
+
+    ``progress`` and ``sub_instruction`` are threaded through to match
+    the SFT/eval conditioning. Callers that don't have them (e.g. the
+    GRPO sampler when it doesn't know episode length) pass None — the
+    model defaults progress to zeros and the prompt drops "Now:".
     """
     rgb_t = torch.from_numpy(obs["rgb"]).unsqueeze(0).to(device)
     hist_t = torch.from_numpy(obs["rgb_history"]).unsqueeze(0).to(device)
@@ -123,7 +145,12 @@ def _forward_logits(
         la_idx = NUM_OPENFLY_ACTIONS  # START token
     last_action_t = torch.tensor([la_idx], dtype=torch.long, device=device)
     next_pose_t = pose_t.clone()
-    input_ids, attention_mask = _tokenise(processor, instruction, obs["rgb"], device)
+    progress_t: torch.Tensor | None = None
+    if progress is not None:
+        progress_t = torch.tensor([float(progress)], device=device, dtype=torch.float32)
+    input_ids, attention_mask = _tokenise(
+        processor, instruction, obs["rgb"], device, sub_instruction=sub_instruction
+    )
     if with_grad:
         out = model(
             instruction_input_ids=input_ids,
@@ -133,6 +160,7 @@ def _forward_logits(
             pose=pose_t,
             last_action=last_action_t,
             next_pose=next_pose_t,
+            progress=progress_t,
             with_grad=True,
         )
     else:
@@ -145,9 +173,16 @@ def _forward_logits(
                 pose=pose_t,
                 last_action=last_action_t,
                 next_pose=next_pose_t,
+                progress=progress_t,
                 with_grad=False,
             )
     return out["action_logits"]
+
+
+def _step_progress(info: dict[str, Any], max_steps: int) -> float:
+    """Budget-relative progress for on-policy rollouts."""
+    step_idx = int(info.get("step_idx", 0))
+    return min(1.0, float(step_idx) / float(max(max_steps - 1, 1)))
 
 
 def _sampling_policy_fn(
@@ -156,13 +191,20 @@ def _sampling_policy_fn(
     device: torch.device,
     *,
     temperature: float = 1.0,
+    max_episode_steps: int = 60,
 ):
     """Build a ``policy_fn`` that samples from ``Categorical(logits)``."""
 
     def policy_fn(obs, info):
         with torch.no_grad():
             logits = _forward_logits(
-                model, processor, obs, info.get("instruction", ""), device, with_grad=False
+                model,
+                processor,
+                obs,
+                info.get("instruction", ""),
+                device,
+                with_grad=False,
+                progress=_step_progress(info, max_episode_steps),
             )
             if temperature != 1.0:
                 logits = logits / temperature
@@ -175,6 +217,10 @@ def _sampling_policy_fn(
         return logit_index_to_action_id(int(a.item())), {
             "logprob": float(logprob.item()),
             "logits": logits.detach().cpu(),
+            # Record the per-step progress so the GRPO update can replay
+            # the same conditioning without re-deriving it from a
+            # potentially-stale ``info["step_idx"]``.
+            "progress": _step_progress(info, max_episode_steps),
         }
 
     return policy_fn
@@ -187,12 +233,19 @@ def _eval_loop(
     device: torch.device,
     *,
     n_episodes: int,
+    max_episode_steps: int = 60,
 ) -> dict[str, float]:
     """Greedy rollout for gating; uses argmax not sampling."""
 
     def greedy_fn(obs, info):
         logits = _forward_logits(
-            model, processor, obs, info.get("instruction", ""), device, with_grad=False
+            model,
+            processor,
+            obs,
+            info.get("instruction", ""),
+            device,
+            with_grad=False,
+            progress=_step_progress(info, max_episode_steps),
         )
         logit_idx = int(logits.argmax(dim=-1).item())
         return logit_index_to_action_id(logit_idx), {"source": "argmax"}
@@ -230,8 +283,9 @@ def _demo_anchor_loss(
 ) -> torch.Tensor:
     """Standard CE on a batch from :class:`OpenFlyDataset`.
 
-    Forwards the same ``last_action`` / ``next_pose`` fields the SFT
-    trainer feeds so the action head stays consistent across stages.
+    Forwards the same ``last_action`` / ``next_pose`` / ``progress`` /
+    ``sub_instruction`` fields the SFT trainer feeds so the action head
+    sees identical conditioning across stages.
     """
     rgb = batch["rgb"].to(device, non_blocking=True)
     history = batch["history"].to(device, non_blocking=True)
@@ -239,9 +293,20 @@ def _demo_anchor_loss(
     actions = batch["action_id"].to(device, non_blocking=True)
     last_action = batch["last_action"].to(device, non_blocking=True)
     next_pose = batch["next_pose"].to(device, non_blocking=True)
+    progress = batch.get("progress")
+    if progress is not None:
+        progress = progress.to(device, non_blocking=True)
+    sub_instructions = batch.get("sub_instruction")
+    if sub_instructions is None:
+        prompts = [f"<image>\nTask: {ins}" for ins in batch["instruction"]]
+    else:
+        prompts = [
+            _format_prompt(ins, sub)
+            for ins, sub in zip(batch["instruction"], sub_instructions)
+        ]
 
     proc = processor(
-        text=[f"<image>\n{ins}" for ins in batch["instruction"]],
+        text=prompts,
         images=[rgb[0].cpu().numpy()] * rgb.shape[0],
         return_tensors="pt",
         padding="longest",
@@ -258,6 +323,7 @@ def _demo_anchor_loss(
         pose=pose,
         last_action=last_action,
         next_pose=next_pose,
+        progress=progress,
         with_grad=True,
     )
     return F.cross_entropy(out["action_logits"], actions)
@@ -265,7 +331,7 @@ def _demo_anchor_loss(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--init_ckpt", type=str, required=True, help="DAgger or SFT PaliGemma checkpoint")
+    p.add_argument("--init_ckpt", type=str, required=True, help="SFT PaliGemma checkpoint")
     p.add_argument("--paligemma_model", default="google/paligemma-3b-pt-224")
 
     p.add_argument("--steps", type=int, default=200, help="GRPO update steps")
@@ -419,7 +485,13 @@ def main() -> int:
         raise RuntimeError("No training episodes for GRPO rollouts.")
 
     rng = np.random.default_rng(args.seed)
-    sampling_fn = _sampling_policy_fn(model, processor, device, temperature=args.temperature)
+    sampling_fn = _sampling_policy_fn(
+        model,
+        processor,
+        device,
+        temperature=args.temperature,
+        max_episode_steps=args.max_episode_steps,
+    )
 
     log: list[dict[str, Any]] = []
     best_metric = -math.inf
@@ -504,6 +576,15 @@ def main() -> int:
                         if s_idx < len(traj.obs_poses)
                         else np.zeros(4, dtype=np.float32),
                     }
+                    # Recover the progress scalar captured at rollout time;
+                    # falls back to the budget-relative ratio if the
+                    # sampler didn't record one (e.g. older logs).
+                    step_progress = float(
+                        traj.extras[s_idx].get(
+                            "progress",
+                            min(1.0, float(s_idx) / float(max(args.max_episode_steps - 1, 1))),
+                        )
+                    )
                     logits_pi = _forward_logits(
                         model,
                         processor,
@@ -511,6 +592,7 @@ def main() -> int:
                         traj.instruction,
                         device,
                         with_grad=True,
+                        progress=step_progress,
                     )
                     log_probs = F.log_softmax(logits_pi, dim=-1)
                     # ``action_id`` in traj is a raw OpenFly id (sim space);
@@ -534,6 +616,7 @@ def main() -> int:
                                 traj.instruction,
                                 device,
                                 with_grad=False,
+                                progress=step_progress,
                             )
                         kl = _kl_term(logits_pi, logits_ref)
                         step_loss = step_loss + args.kl_coef * kl
@@ -597,7 +680,12 @@ def main() -> int:
         # 4. Periodic eval + checkpoint gating.
         if eval_env is not None and args.eval_every > 0 and (step + 1) % args.eval_every == 0:
             eval_metrics = _eval_loop(
-                eval_env, model, processor, device, n_episodes=args.eval_episodes
+                eval_env,
+                model,
+                processor,
+                device,
+                n_episodes=args.eval_episodes,
+                max_episode_steps=args.max_episode_steps,
             )
             print(f"[grpo] eval@{step}: {eval_metrics}")
             with open(out_dir / "eval.jsonl", "a") as f:

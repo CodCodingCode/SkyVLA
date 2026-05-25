@@ -48,7 +48,6 @@ Results land in `logs/benchmarks/openfly_*.json`.
 | `heuristic` | Oracle: face the goal, fly forward, stop within 20 m. Sanity check only. |
 | `openfly-agent` | Hugging Face `IPEC-COMMUNITY/openfly-agent-7b`. |
 | `paligemma` | Custom PaliGemma BC checkpoint produced by `train_paligemma.py`. |
-| `dagger` | PaliGemma checkpoint after DAgger refinement (`train_dagger.py`). |
 | `grpo` | PaliGemma checkpoint after GRPO online RL (`train_grpo_paligemma.py`). |
 | `ppo` | OpenFly-Agent LoRA + value head from PPO (`train_ppo_openfly_agent.py`); pass `--ppo_ckpt`. |
 
@@ -104,13 +103,12 @@ The custom training entrypoint lives in [`train_paligemma.py`](train_paligemma.p
 
 ## RL track (after SFT)
 
-Once you have an SFT checkpoint from Track A or B, the repo ships a three-stage RL pipeline that talks to AirSim through a Gymnasium wrapper.
+Once you have an SFT checkpoint from Track A or B, the repo ships an RL pipeline that talks to AirSim through a Gymnasium wrapper. RL bootstraps directly from the SFT checkpoint — there is no longer a DAgger stage in between (see commit "Remove DAgger from codebase" for the rationale: the geometric oracle was too weak to teach obstacle avoidance, and AirSim's kinematic teleport let the agent clip through buildings for false-positive successes).
 
 ```mermaid
 flowchart LR
-    SFT[SFT checkpoint] --> DAgger
-    DAgger --> GRPO[GRPO online RL\n(PaliGemma)]
-    DAgger --> PPO[PPO + LoRA\n(OpenFly-Agent 7B)]
+    SFT[SFT checkpoint] --> GRPO[GRPO online RL\n(PaliGemma)]
+    SFT --> PPO[PPO + LoRA\n(OpenFly-Agent 7B)]
     GRPO --> Eval
     PPO --> Eval
 ```
@@ -124,21 +122,11 @@ python -m openfly.scripts.smoke_rl_env --episodes 3 --split seen
 
 This drives [`AirSimVLNEnv`](envs/airsim_vln_env.py) with the oracle heuristic and writes a JSONL of trajectories under `logs/openfly/rollouts/`. Use it whenever AirSim changes or you tweak [`rewards.py`](rewards.py).
 
-### Step 1 — DAgger (between SFT and RL)
-
-```bash
-bash ~/drone_project/openfly/run_train_dagger.sh \
-  --sft_ckpt logs/openfly/paligemma/<run>/last.pt \
-  --iterations 3 --episodes_per_iter 200
-```
-
-Each iteration: rollout the current policy in AirSim, relabel visited states with [`goal_heuristic_action`](actions.py), and fine-tune on a 50/50 mix of the OpenFly offline dataset and the corrected buffer. For Track A (OpenFly-Agent), pass `--track openfly-agent` to collect a corrected JSONL only.
-
-### Step 2 — Track B online RL (GRPO)
+### Step 1 — Track B online RL (GRPO)
 
 ```bash
 bash ~/drone_project/openfly/run_train_grpo.sh \
-  --init_ckpt logs/openfly/dagger/<run>/last.pt \
+  --init_ckpt logs/openfly/paligemma/<run>/last.pt \
   --steps 200 --group_size 4 --instructions_per_step 2
 ```
 
@@ -148,7 +136,7 @@ which chains three GRPO stages and stitches the checkpoints together:
 
 ```bash
 bash ~/drone_project/openfly/run_train_curriculum.sh \
-  --init_ckpt logs/openfly/dagger/<run>/last.pt \
+  --init_ckpt logs/openfly/paligemma/<run>/last.pt \
   --env_filter env_airsim_16 \
   --steps_easy 80 --steps_medium 60 --steps_hard 60
 ```
@@ -160,7 +148,7 @@ changes.
 
 GRPO samples `K` trajectories per instruction, scores each with [`compute_episode_reward`](rewards.py), and applies a clipped policy-gradient update with a KL anchor against the frozen init checkpoint. Best checkpoints are gated on a small `unseen` eval (`--eval_every 10 --eval_episodes 8`).
 
-### Step 3 — Track A online RL (PPO + LoRA)
+### Step 2 — Track A online RL (PPO + LoRA)
 
 ```bash
 bash ~/drone_project/openfly/run_train_ppo_agent.sh \
@@ -185,7 +173,7 @@ bash ~/drone_project/openfly/run_eval.sh \
   --env_filter env_airsim_16
 ```
 
-The `dagger` / `grpo` / `paligemma` aliases all load the same `PaliGemmaVLNPolicy` state dict; the name only changes the label in `logs/benchmarks/`.
+The `grpo` / `paligemma` aliases both load the same `PaliGemmaVLNPolicy` state dict; the name only changes the label in `logs/benchmarks/`.
 
 ## Environment variables
 
@@ -211,7 +199,6 @@ The `dagger` / `grpo` / `paligemma` aliases all load the same `PaliGemmaVLNPolic
 | `models/paligemma_vln.py` | Custom PaliGemma + LoRA + LSTM action head |
 | `models/openfly_agent_rl.py` | OpenFly-Agent 7B + LoRA + value head for PPO |
 | `train_paligemma.py` | Offline BC entrypoint for the custom model |
-| `train_dagger.py` | DAgger between SFT and online RL |
 | `train_grpo_paligemma.py` | GRPO online RL on the PaliGemma policy (accepts `--reward_preset`) |
 | `train_curriculum_grpo.py` | Easy → medium → hard reward curriculum on top of GRPO |
 | `train_ppo_openfly_agent.py` | PPO + LoRA online RL on OpenFly-Agent 7B (accepts `--reward_preset`) |
@@ -222,7 +209,7 @@ The `dagger` / `grpo` / `paligemma` aliases all load the same `PaliGemmaVLNPolic
 | `rollout.py` | Shared trajectory collector used by every RL trainer |
 | `scripts/smoke_rl_env.py` | Sanity-check the RL env with the heuristic |
 | `run_eval.sh` / `run_train_agent.sh` / `run_train_paligemma.sh` | CLI wrappers (SFT) |
-| `run_train_dagger.sh` / `run_train_grpo.sh` / `run_train_curriculum.sh` / `run_train_ppo_agent.sh` | CLI wrappers (RL) |
+| `run_train_grpo.sh` / `run_train_curriculum.sh` / `run_train_ppo_agent.sh` | CLI wrappers (RL) |
 | `run_per_env_eval.sh` | Per-env unseen + seen eval for one checkpoint (writes `logs/benchmarks/openfly_*.json`) |
 | `run_experiments.sh` | End-to-end B0 → B5 experiment matrix orchestrator |
 | `scripts/verify_phase0.sh` | Phase-0 driver / annotation / image / preset / dataset gates |

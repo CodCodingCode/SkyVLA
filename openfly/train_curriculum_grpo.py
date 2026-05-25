@@ -30,7 +30,7 @@ Example
 ::
 
     bash openfly/run_train_curriculum.sh \\
-        --init_ckpt logs/openfly/dagger/<run>/last.pt \\
+        --init_ckpt logs/openfly/paligemma/<run>/last.pt \\
         --env_filter env_airsim_16 \\
         --steps_easy 80 --steps_medium 60 --steps_hard 60
 
@@ -166,7 +166,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--init_ckpt",
         required=True,
-        help="Bootstrap checkpoint (DAgger preferred, SFT acceptable).",
+        help="Bootstrap checkpoint (SFT from train_paligemma).",
     )
     p.add_argument(
         "--out_root",

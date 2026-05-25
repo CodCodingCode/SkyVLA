@@ -162,8 +162,8 @@ class OpenFlyAgentRL(nn.Module):
         # Auxiliary BC-anchor head: 8-class classifier over OpenFly's
         # supervised action ids (strafes excluded — see
         # ``openfly.actions.TRAINABLE_ACTION_IDS``). Fed from the prefix's
-        # last hidden state and trained with CE against expert (oracle /
-        # DAgger) action ids — remapped to logit indices by the trainer —
+        # last hidden state and trained with CE against the goal-heuristic
+        # oracle's action ids — remapped to logit indices by the trainer —
         # to prevent the LoRA-updated representation from forgetting the
         # expert distribution during PPO. Active only when
         # ``--bc_coef > 0`` in train_ppo_openfly_agent.py.

@@ -1,9 +1,9 @@
-"""Shared trajectory collection for DAgger, GRPO, and PPO.
+"""Shared trajectory collection for GRPO and PPO.
 
 Trainers should never call ``env.step`` directly: route through
 :func:`collect_episode`. That keeps reward bookkeeping, OpenFly metric
 calculation, and on-policy/expert label collection identical across the
-three RL pipelines so any improvements (e.g. better dense shaping) flow
+RL pipelines so any improvements (e.g. better dense shaping) flow
 to every trainer at once.
 
 The collector is intentionally policy-agnostic: it accepts any callable

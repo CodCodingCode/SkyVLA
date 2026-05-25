@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Evaluate one PaliGemma/DAgger/GRPO/PPO checkpoint on every OpenFly
-# unseen environment plus the full seen split, producing one
+# Evaluate one PaliGemma/GRPO/PPO checkpoint on every OpenFly unseen
+# environment plus the full seen split, producing one
 # ``logs/benchmarks/openfly_*.json`` per call. The per-env JSON files
 # can then be rolled up with ``openfly.scripts.aggregate_results``.
 #
 # Required:
-#   --paligemma_ckpt PATH    (for paligemma|dagger|grpo policies)
+#   --paligemma_ckpt PATH    (for paligemma|grpo policies)
 #     or
 #   --ppo_ckpt PATH          (for ppo)
 #
@@ -48,7 +48,7 @@ done
 
 CKPT_FLAG=()
 case "$POLICY" in
-  paligemma|dagger|grpo)
+  paligemma|grpo)
     if [[ -z "$PALIGEMMA_CKPT" ]]; then
       echo "--paligemma_ckpt is required for policy=$POLICY" >&2
       exit 1

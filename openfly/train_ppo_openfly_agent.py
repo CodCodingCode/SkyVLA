@@ -145,8 +145,7 @@ def _collect_rollouts(
             action_tokens.append(tokens.cpu())
             action_ids.append(int(action_id))
             # BC anchor target: what the goal-heuristic oracle would have
-            # picked at this state. Cheap to compute (no network), and
-            # mirrors the expert label DAgger writes to its JSONL.
+            # picked at this state. Cheap to compute (no network).
             expert_action_ids.append(
                 int(goal_heuristic_action(obs["pose"].tolist(), obs["goal"].tolist()))
             )

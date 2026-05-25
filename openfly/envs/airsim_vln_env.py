@@ -2,8 +2,8 @@
 
 The env replays the same loop the eval harness uses (``get_camera_data``
 → policy → ``apply_action`` → ``set_camera_pose``) but exposes it as a
-standard ``gymnasium.Env`` so DAgger, GRPO, and PPO trainers can talk to
-it with the usual ``reset``/``step``/``close`` contract.
+standard ``gymnasium.Env`` so the GRPO and PPO trainers can talk to it
+with the usual ``reset``/``step``/``close`` contract.
 
 One bridge maps to one ``AirSimVLNEnv`` instance. The class is **not**
 thread-safe; vectorisation should use process-level parallelism. AirSim
@@ -107,7 +107,7 @@ class AirSimVLNEnv(gym.Env if _HAS_GYM else object):  # type: ignore[misc]
 
     The ``instruction`` text and per-episode metadata live in the
     ``info`` dict because Gymnasium spaces do not represent strings
-    well; both DAgger and the RL trainers grab them from there.
+    well; the RL trainers grab them from there.
 
     Action
     ------

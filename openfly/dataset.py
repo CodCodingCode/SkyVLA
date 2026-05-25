@@ -158,6 +158,26 @@ class OpenFlySample:
                       into the PaliGemma prompt at training time. Empty
                       string is allowed (inference fallback when no
                       high-level policy is plumbed in yet).
+        subgoal_rgb:  RGB frame at the next action-transition step (end of
+                      the current same-action run). When no future
+                      transition exists (terminal run), this duplicates
+                      ``rgb`` and ``subgoal_valid`` is ``False``. Drives the
+                      world-model / subgoal-DiT supervision: the DiT learns
+                      ``(curr_siglip, instruction, sub_instruction) ->
+                      subgoal_siglip`` in feature space.
+        subgoal_horizon: integer number of trajectory steps between
+                      ``step`` and the subgoal step. ``0`` for invalid
+                      (terminal) subgoals; ``>= 1`` otherwise. Useful as a
+                      conditioning signal and as a sanity check.
+        subgoal_valid: ``True`` when a future action-transition was found.
+                      ``False`` for terminal-run steps; the DiT trainer
+                      skips invalid samples.
+        subgoal_pose: (4,) float32 [x, y, z, yaw] at the subgoal step.
+                      Used as an auxiliary pose-delta conditioning signal
+                      for the DiT (the env teleports kinematically so the
+                      delta is deterministic given the action sequence; we
+                      feed it explicitly to keep the DiT focused on visual
+                      content rather than reinventing forward kinematics).
     """
 
     rgb: np.ndarray             # (H, W, 3) uint8 — current frame
@@ -170,6 +190,10 @@ class OpenFlySample:
     next_pose: np.ndarray       # (4,) float32  [x, y, z, yaw] at step+1
     progress: float             # [0, 1] fraction of trajectory completed
     sub_instruction: str        # upcoming same-action run summary
+    subgoal_rgb: np.ndarray     # (H, W, 3) uint8 — next-transition frame
+    subgoal_horizon: int        # # steps between ``step`` and subgoal (0 if invalid)
+    subgoal_valid: bool         # False at terminal-run steps
+    subgoal_pose: np.ndarray    # (4,) float32 pose at subgoal step
 
 
 class OpenFlyDataset(Dataset):
@@ -369,6 +393,32 @@ class OpenFlyDataset(Dataset):
         progress = float(step) / float(max(1, traj_len - 1))
         sub_instruction = _build_sub_instruction(actions, step)
 
+        # Subgoal frame: the trajectory step where the current same-action
+        # run ends (next action-transition). When no future transition is
+        # found (terminal run, e.g. the final ``stop``) we duplicate the
+        # current frame and mark the sample invalid so the DiT trainer
+        # can skip it.
+        cur_action = int(actions[step])
+        sg_step = step
+        for j in range(step + 1, min(len(actions), len(indices))):
+            if int(actions[j]) != cur_action:
+                sg_step = j
+                break
+        subgoal_valid = sg_step > step
+        subgoal_horizon = max(0, sg_step - step)
+
+        if subgoal_valid:
+            sg_path = _resolve_frame(self.image_root, ep["image_path"], indices[sg_step])
+            subgoal_rgb = _load_rgb(sg_path, self.image_size)
+            sg_xyz = positions[sg_step] if sg_step < len(positions) else positions[-1]
+            sg_yaw = float(yaws[sg_step]) if sg_step < len(yaws) else yaw
+            subgoal_pose = np.asarray(
+                [sg_xyz[0], sg_xyz[1], sg_xyz[2], sg_yaw], dtype=np.float32
+            )
+        else:
+            subgoal_rgb = rgb.copy()
+            subgoal_pose = pose.copy()
+
         return OpenFlySample(
             rgb=rgb,
             history=history,
@@ -380,6 +430,10 @@ class OpenFlyDataset(Dataset):
             next_pose=next_pose,
             progress=progress,
             sub_instruction=sub_instruction,
+            subgoal_rgb=subgoal_rgb,
+            subgoal_horizon=subgoal_horizon,
+            subgoal_valid=subgoal_valid,
+            subgoal_pose=subgoal_pose,
         )
 
 
@@ -413,6 +467,18 @@ def collate(samples: Sequence[OpenFlySample]) -> dict[str, Any]:
     progress = torch.tensor(
         [float(s.progress) for s in samples], dtype=torch.float32
     )
+    subgoal_rgb = torch.stack(
+        [_to_tensor_uint8_chw(s.subgoal_rgb) for s in samples], dim=0
+    )
+    subgoal_horizon = torch.tensor(
+        [int(s.subgoal_horizon) for s in samples], dtype=torch.long
+    )
+    subgoal_valid = torch.tensor(
+        [bool(s.subgoal_valid) for s in samples], dtype=torch.bool
+    )
+    subgoal_pose = torch.from_numpy(
+        np.stack([s.subgoal_pose for s in samples], axis=0)
+    )
     return {
         "rgb": rgb,
         "history": history,
@@ -424,4 +490,8 @@ def collate(samples: Sequence[OpenFlySample]) -> dict[str, Any]:
         "last_action": last_actions,
         "next_pose": next_poses,
         "progress": progress,
+        "subgoal_rgb": subgoal_rgb,
+        "subgoal_horizon": subgoal_horizon,
+        "subgoal_valid": subgoal_valid,
+        "subgoal_pose": subgoal_pose,
     }

@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         "--policy",
         type=str,
         default="heuristic",
-        help="heuristic|openfly-agent|paligemma|dagger|grpo|ppo",
+        help="heuristic|openfly-agent|paligemma|grpo|ppo",
     )
     p.add_argument("--max_episodes", type=int, default=0, help="0 = all in split")
     p.add_argument("--env_filter", type=str, default="", help="Substring filter on env name")
@@ -52,13 +52,37 @@ def parse_args() -> argparse.Namespace:
         "--paligemma_ckpt",
         type=str,
         default="",
-        help="PaliGemma checkpoint (train_paligemma / train_dagger / train_grpo_paligemma).",
+        help="PaliGemma checkpoint (train_paligemma / train_grpo_paligemma).",
     )
     p.add_argument(
         "--ppo_ckpt",
         type=str,
         default="",
         help="OpenFly-Agent LoRA+value-head checkpoint (train_ppo_openfly_agent).",
+    )
+    p.add_argument(
+        "--paligemma_use_progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="At inference, feed the progress scalar (step/max_steps) into "
+        "the PaliGemma policy. Use --no-paligemma_use_progress to match a "
+        "baseline checkpoint trained without progress conditioning.",
+    )
+    p.add_argument(
+        "--paligemma_use_sub_instruction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Append a sub-instruction line to the inference prompt. Off "
+        "by default because we have no high-level policy at eval time — "
+        "turn on only when you've plumbed one in upstream.",
+    )
+    p.add_argument(
+        "--paligemma_use_learned_progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the model's own progress_head prediction as the "
+        "conditioning scalar (two forwards per step). Useful for "
+        "checkpoints trained with --aux_progress_weight>0.",
     )
     return p.parse_args()
 
@@ -102,10 +126,15 @@ def run(args: argparse.Namespace) -> dict:
     pol = args.policy.lower()
     if pol in ("openfly", "openfly-agent", "agent"):
         policy_kwargs["model_id"] = args.model_id
-    elif pol in ("paligemma", "vla", "dagger", "grpo"):
+    elif pol in ("paligemma", "vla", "grpo"):
         if not args.paligemma_ckpt:
             raise SystemExit(f"--policy {pol} requires --paligemma_ckpt PATH")
         policy_kwargs["checkpoint"] = args.paligemma_ckpt
+        # Mirror the trainer ablation flags through to inference.
+        policy_kwargs["max_steps"] = args.max_steps
+        policy_kwargs["use_progress"] = args.paligemma_use_progress
+        policy_kwargs["use_sub_instruction"] = args.paligemma_use_sub_instruction
+        policy_kwargs["use_learned_progress"] = args.paligemma_use_learned_progress
     elif pol in ("ppo", "ppo-agent", "openfly-agent-rl"):
         if not args.ppo_ckpt:
             raise SystemExit(f"--policy {pol} requires --ppo_ckpt PATH")

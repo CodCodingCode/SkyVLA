@@ -132,6 +132,10 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         image_size: int = 224,
         lora_rank: int = 16,
         lora_alpha: float = 32.0,
+        max_steps: int = 100,
+        use_progress: bool = True,
+        use_sub_instruction: bool = False,
+        use_learned_progress: bool = False,
     ):
         import torch
         from transformers import AutoProcessor
@@ -162,6 +166,25 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         self.instruction = ""
         self._history: list[np.ndarray] = []
         self._last_action: int = self._START_ACTION_ID
+        # Inference-side conditioning flags. Mirror the trainer flags so
+        # we can run controlled ablations end-to-end (train with flag X,
+        # eval with flag X).
+        self.max_steps = int(max_steps)
+        self.use_progress = bool(use_progress)
+        self.use_sub_instruction = bool(use_sub_instruction)
+        # When True we run the aux progress head and feed its scalar back
+        # into the action head instead of the ``step / max_steps`` proxy.
+        # Only meaningful when the loaded checkpoint actually has the
+        # ``progress_head`` weights (e.g. trained with --aux_progress_weight>0).
+        self.use_learned_progress = bool(use_learned_progress)
+        if self.use_learned_progress and not getattr(
+            self.model, "aux_progress_head", False
+        ):
+            print(
+                "[paligemma] WARN use_learned_progress=True but the model "
+                "has no progress_head; falling back to step/max_steps proxy."
+            )
+            self.use_learned_progress = False
 
     def _resize_rgb(self, rgb: np.ndarray) -> np.ndarray:
         if rgb.shape[0] != self.image_size or rgb.shape[1] != self.image_size:
@@ -179,6 +202,17 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         self._history = []
         self._last_action = self._START_ACTION_ID
 
+    def _format_prompt(self, sub_instruction: str | None) -> str:
+        """Mirror the trainer's prompt template.
+
+        Local copy so this module stays import-light (no dependency on
+        :mod:`openfly.train_paligemma`).
+        """
+        base = f"<image>\nTask: {self.instruction}"
+        if self.use_sub_instruction and sub_instruction:
+            return f"{base}\nNow: {sub_instruction}"
+        return base
+
     def act(
         self,
         rgb: np.ndarray,
@@ -186,7 +220,7 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         step: int,
         history: list[int],
     ) -> int:
-        del step, history
+        del history
         torch = self._torch
 
         cur = self._resize_rgb(rgb)
@@ -215,8 +249,26 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
             [int(self._last_action)], device=self.device, dtype=torch.long
         )
 
+        # Progress proxy: matches the trainer signal as closely as we can.
+        # ``step`` from the eval loop is the 0-indexed step within the
+        # episode; ``max_steps`` is the budget that the dataset's
+        # ``traj_len`` is a rough analogue of.
+        progress_val = (
+            min(1.0, float(step) / float(max(self.max_steps - 1, 1)))
+            if self.use_progress
+            else 0.0
+        )
+        progress_t = torch.tensor(
+            [progress_val], device=self.device, dtype=torch.float32
+        )
+
+        # Without a high-level policy at eval time we have no real
+        # sub-instruction to emit. The trainer's template drops the
+        # "Now:" line when the sub-instruction is empty, so passing
+        # None keeps train/eval prompts aligned for any model trained
+        # without sub-instructions or with --use_sub_instruction.
         proc = self.processor(
-            text=[f"<image>\n{self.instruction}"],
+            text=[self._format_prompt(None)],
             images=[cur],
             return_tensors="pt",
             padding="longest",
@@ -226,6 +278,25 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         input_ids = proc["input_ids"].to(self.device)
         attention_mask = proc["attention_mask"].to(self.device)
 
+        # Optional: run the model once to read the learned progress head,
+        # then re-feed that scalar as the conditioning input. Two forwards
+        # per step (slow) — gated on ``use_learned_progress`` for now.
+        if self.use_progress and self.use_learned_progress:
+            with torch.no_grad():
+                probe = self.model(
+                    instruction_input_ids=input_ids,
+                    instruction_attention_mask=attention_mask,
+                    rgb_current=rgb_t,
+                    rgb_history=history_t,
+                    pose=pose_t,
+                    last_action=last_action_t,
+                    next_pose=next_pose_t,
+                    progress=None,
+                    with_grad=False,
+                )
+            if "progress_pred" in probe:
+                progress_t = probe["progress_pred"].detach().to(torch.float32).reshape(-1)
+
         logit_idx = self.model.predict_action(
             instruction_input_ids=input_ids,
             instruction_attention_mask=attention_mask,
@@ -234,6 +305,7 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
             pose=pose_t,
             last_action=last_action_t,
             next_pose=next_pose_t,
+            progress=progress_t if self.use_progress else None,
         )
 
         # Slide history window after acting.
@@ -312,14 +384,14 @@ def build_policy(name: str, **kwargs: Any) -> OpenFlyPolicy:
         return GoalHeuristicPolicy(**kwargs)
     if name in ("openfly", "openfly-agent", "agent"):
         return OpenFlyAgentPolicy(**kwargs)
-    if name in ("paligemma", "vla", "grpo", "dagger"):
-        # GRPO and DAgger ckpts share the PaliGemmaVLNPolicy state dict, so
+    if name in ("paligemma", "vla", "grpo"):
+        # SFT and GRPO ckpts share the PaliGemmaVLNPolicy state dict, so
         # they are loaded by the same adapter — the alias just signals which
         # training stage produced the weights.
         if "checkpoint" not in kwargs:
             raise ValueError(
                 f"{name} policy requires --paligemma_ckpt (checkpoint=...) "
-                "produced by openfly.train_paligemma / train_dagger / train_grpo_paligemma"
+                "produced by openfly.train_paligemma / train_grpo_paligemma"
             )
         return PaliGemmaOpenFlyPolicy(**kwargs)
     if name in ("ppo", "ppo-agent", "openfly-agent-rl"):
@@ -330,5 +402,5 @@ def build_policy(name: str, **kwargs: Any) -> OpenFlyPolicy:
             )
         return OpenFlyAgentRLPolicy(**kwargs)
     raise ValueError(
-        f"Unknown policy {name!r}. Use: heuristic, openfly-agent, paligemma, dagger, grpo, ppo"
+        f"Unknown policy {name!r}. Use: heuristic, openfly-agent, paligemma, grpo, ppo"
     )

@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler, random_split
 
 from openfly.actions import (
     TRAINABLE_ACTION_IDS,
@@ -191,6 +191,57 @@ def _load_or_build_class_weights(
     return counts, weights
 
 
+def _subset_sample_labels(
+    train_subset: "Subset | OpenFlyDataset",
+) -> np.ndarray:
+    """Per-sample logit-index labels for a train Subset / Dataset.
+
+    Reads ``parent._index[i]`` for each item in the subset and remaps the
+    raw OpenFly action id to a logit index via ``action_id_to_logit_index``.
+    Used to build the stratified ``WeightedRandomSampler``.
+    """
+    if isinstance(train_subset, Subset):
+        parent = train_subset.dataset
+        indices = train_subset.indices
+    else:
+        parent = train_subset
+        indices = range(len(parent))
+    labels = np.zeros(len(indices), dtype=np.int64)
+    episodes = parent._episodes  # noqa: SLF001
+    index = parent._index  # noqa: SLF001
+    for k, i in enumerate(indices):
+        ep_i, step = index[int(i)]
+        labels[k] = action_id_to_logit_index(int(episodes[ep_i]["action"][step]))
+    return labels
+
+
+def _make_balanced_sampler(
+    train_subset: "Subset | OpenFlyDataset",
+    *,
+    num_classes: int,
+) -> tuple[WeightedRandomSampler, np.ndarray]:
+    """Action-stratified ``WeightedRandomSampler`` over the train split.
+
+    Per-sample sampling weight is ``1 / class_count(label)``, so each
+    class is drawn with equal expected frequency. ``num_samples`` is set
+    to ``len(train_subset)`` so each epoch sees the same volume as the
+    plain ``shuffle=True`` loader (with replacement — minority classes
+    get oversampled, ``fwd_9m`` undersampled). Returns the sampler and
+    the per-class count tensor (for logging).
+    """
+    labels = _subset_sample_labels(train_subset)
+    counts = np.bincount(labels, minlength=num_classes).astype(np.int64)
+    safe = np.maximum(counts, 1).astype(np.float64)
+    class_w = 1.0 / safe
+    sample_w = class_w[labels]
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_w, dtype=torch.double),
+        num_samples=len(labels),
+        replacement=True,
+    )
+    return sampler, counts
+
+
 def _format_per_class(
     name: str,
     correct: np.ndarray,
@@ -215,7 +266,10 @@ def _step(
     device: torch.device,
     aux_goal_weight: float,
     *,
+    aux_progress_weight: float = 0.0,
     class_weights: torch.Tensor | None = None,
+    use_progress: bool = True,
+    use_sub_instruction: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     rgb = batch["rgb"].to(device, non_blocking=True)
     history = (
@@ -230,13 +284,18 @@ def _step(
     progress = batch.get("progress")
     if progress is not None:
         progress = progress.to(device, non_blocking=True)
+    # ``progress_target`` keeps the ground-truth for the stratified metrics
+    # even when ``use_progress`` is off and we mask the model input.
+    progress_target = progress
+    if not use_progress:
+        progress = None
 
     input_ids, attention_mask = _tokenise_batch(
         processor,
         batch["instruction"],
         rgb_dummy=rgb[0],
         device=device,
-        sub_instructions=batch.get("sub_instruction"),
+        sub_instructions=batch.get("sub_instruction") if use_sub_instruction else None,
     )
 
     out = model(
@@ -259,6 +318,12 @@ def _step(
         "acc": (preds == actions).float().mean().item(),
         "preds": preds.detach(),
         "actions": actions.detach(),
+        # Always pass through the dataset's progress target so the trainer
+        # can compute progress-bin-stratified stop-class metrics even when
+        # ``use_progress`` is off (the baseline ablation arm).
+        "progress_target": (
+            progress_target.detach() if progress_target is not None else None
+        ),
     }
     loss = ce
 
@@ -269,6 +334,21 @@ def _step(
         l1 = F.smooth_l1_loss(out["goal_pred"], target)
         loss = loss + aux_goal_weight * l1
         metrics["goal_l1"] = l1.item()
+
+    if (
+        aux_progress_weight > 0
+        and use_progress
+        and "progress_pred" in out
+        and progress_target is not None
+    ):
+        # Regress predicted progress against the dataset's ground-truth
+        # path-fraction. Aux head reads from the no-progress feature
+        # slice, so the supervision can't leak through its own input —
+        # the gradient pushes ``scene + pose + last_action`` features
+        # toward encoding trajectory phase.
+        p_l1 = F.smooth_l1_loss(out["progress_pred"], progress_target)
+        loss = loss + aux_progress_weight * p_l1
+        metrics["progress_l1"] = p_l1.item()
 
     return loss, metrics
 
@@ -288,6 +368,91 @@ def _accumulate_per_class(
             correct[c] += int(((preds_np == c) & mask).sum())
 
 
+# Progress-bin boundaries for the stop-class stratified metric. Three
+# equal-width buckets over [0, 1]: early / mid / late phase of the
+# trajectory. This is the key diagnostic for the progress-feature
+# experiment — if the conditioning helps, the late bin's stop recall
+# should rise substantially over the baseline arm.
+_PROGRESS_BINS: tuple[tuple[float, float, str], ...] = (
+    (0.0, 0.34, "early"),
+    (0.34, 0.67, "mid"),
+    (0.67, 1.01, "late"),
+)
+N_PROGRESS_BINS: int = len(_PROGRESS_BINS)
+
+
+def _progress_bin_index(progress: float) -> int:
+    """Return 0 / 1 / 2 for early / mid / late."""
+    for i, (lo, hi, _) in enumerate(_PROGRESS_BINS):
+        if lo <= progress < hi:
+            return i
+    return N_PROGRESS_BINS - 1
+
+
+def _accumulate_progress_stop(
+    bin_samples: np.ndarray,           # (N_PROGRESS_BINS,)
+    bin_stop_total: np.ndarray,        # (N_PROGRESS_BINS,) — gt action == 0
+    bin_stop_correct: np.ndarray,      # (N_PROGRESS_BINS,) — pred == gt == 0
+    bin_stop_predicted: np.ndarray,    # (N_PROGRESS_BINS,) — any pred == 0
+    preds: torch.Tensor,
+    actions: torch.Tensor,
+    progress_target: torch.Tensor | None,
+) -> None:
+    """Bucket each step into early/mid/late and tally stop-class stats.
+
+    Reports (per bin):
+      * stop_recall   = correct / gt_stop_total  — does the model stop
+                        when it should?  Late-bin recall is the headline.
+      * stop_share    = gt_stop_total / samples — distribution of stops
+                        across phases (concentrates in late by design).
+      * stop_predicted = how often the model emits stop — useful for
+                        spotting collapse to ``always stop``.
+
+    When ``progress_target`` is None (e.g. legacy batches), the function
+    is a no-op so callers can wire it unconditionally.
+    """
+    if progress_target is None:
+        return
+    preds_np = preds.cpu().numpy()
+    actions_np = actions.cpu().numpy()
+    prog_np = progress_target.cpu().numpy()
+    for i in range(prog_np.shape[0]):
+        b = _progress_bin_index(float(prog_np[i]))
+        bin_samples[b] += 1
+        if int(actions_np[i]) == 0:
+            bin_stop_total[b] += 1
+            if int(preds_np[i]) == 0:
+                bin_stop_correct[b] += 1
+        if int(preds_np[i]) == 0:
+            bin_stop_predicted[b] += 1
+
+
+def _format_progress_stop(
+    name: str,
+    bin_samples: np.ndarray,
+    bin_stop_total: np.ndarray,
+    bin_stop_correct: np.ndarray,
+    bin_stop_predicted: np.ndarray,
+) -> str:
+    """One-line per-bin summary, mirrors ``_format_per_class``."""
+    parts = []
+    for b, (_, _, label) in enumerate(_PROGRESS_BINS):
+        n = int(bin_samples[b])
+        n_stop = int(bin_stop_total[b])
+        n_pred = int(bin_stop_predicted[b])
+        if n_stop > 0:
+            recall = float(bin_stop_correct[b]) / n_stop
+            recall_str = f"{recall:.2f}"
+        else:
+            recall_str = "NA"
+        share = (n_stop / n) if n > 0 else 0.0
+        parts.append(
+            f"{label}=R{recall_str}(stops={n_stop}/{n} {100 * share:.1f}% "
+            f"pred_stops={n_pred})"
+        )
+    return f"[progress-bin stop {name}] " + " ".join(parts)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--split", default="train")
@@ -299,6 +464,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lora_alpha", type=float, default=32.0)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--aux_goal_weight", type=float, default=0.1)
+    parser.add_argument(
+        "--aux_progress_weight",
+        type=float,
+        default=0.1,
+        help="Weight on the Smooth-L1 loss between the model's "
+        "``progress_pred`` and the dataset's path-fraction target. "
+        "Aux supervision; set 0 to disable.",
+    )
     parser.add_argument("--history_frames", type=int, default=2)
     parser.add_argument(
         "--oversample_stop",
@@ -335,6 +508,35 @@ def main(argv: list[str] | None = None) -> int:
         help="Compute inverse-frequency class weights from the train split "
         "and pass them into cross_entropy (default ON).",
     )
+    parser.add_argument(
+        "--stratified_sampler",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use a ``WeightedRandomSampler`` over the train split so each "
+        "minibatch sees a roughly action-balanced mix (combats OpenFly's "
+        "~53%% fwd_9m dominance). When ON, --compute_class_weights is "
+        "usually redundant — the sampler already corrects imbalance — so "
+        "consider --no-compute_class_weights to avoid double-correction.",
+    )
+    parser.add_argument(
+        "--use_progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Feed the dataset's progress scalar into the action head "
+        "(and into the aux progress regression). With --no-use_progress, "
+        "the scalar is masked to None at the trainer boundary so "
+        "progress_proj sees zeros and the aux progress loss is skipped. "
+        "Use to compare baseline vs progress-conditioned model.",
+    )
+    parser.add_argument(
+        "--use_sub_instruction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append the templated sub-instruction to the PaliGemma prompt "
+        "as a `Now: <sub>` line. With --no-use_sub_instruction the prompt "
+        "collapses to the plain `Task: <ins>` form. Use to compare "
+        "baseline vs sub-instruction-conditioned model.",
+    )
     args = parser.parse_args(argv)
 
     device = torch.device(args.device)
@@ -367,7 +569,7 @@ def main(argv: list[str] | None = None) -> int:
             env_filter=args.env_filter,
         )
         weight_str = ", ".join(
-            f"{c}({TRAINABLE_TRAINABLE_ACTION_NAMES.get(c, str(c))})={weights[c]:.3f}"
+            f"{c}({TRAINABLE_ACTION_NAMES.get(c, str(c))})={weights[c]:.3f}"
             for c in range(NUM_OPENFLY_ACTIONS)
         )
         count_str = ", ".join(
@@ -394,10 +596,33 @@ def main(argv: list[str] | None = None) -> int:
         f"(samples per epoch: {math.ceil(train_size / args.batch_size)})"
     )
 
+    train_sampler: WeightedRandomSampler | None = None
+    if args.stratified_sampler:
+        train_sampler, strat_counts = _make_balanced_sampler(
+            train_ds, num_classes=NUM_OPENFLY_ACTIONS
+        )
+        strat_counts_str = ", ".join(
+            f"{c}({TRAINABLE_ACTION_NAMES.get(c, str(c))})={int(strat_counts[c])}"
+            for c in range(NUM_OPENFLY_ACTIONS)
+        )
+        print(
+            f"[train_paligemma] stratified sampler ON — pre-sampling "
+            f"per-class counts: {strat_counts_str}"
+        )
+        if args.compute_class_weights:
+            print(
+                "[train_paligemma] WARNING: both --stratified_sampler and "
+                "--compute_class_weights are ON. The sampler already "
+                "balances classes; the CE weights will re-amplify rare "
+                "classes (double-correction). Consider "
+                "--no-compute_class_weights."
+            )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate,
         pin_memory=device.type == "cuda",
@@ -453,13 +678,25 @@ def main(argv: list[str] | None = None) -> int:
             if pg.get("name") == "lora":
                 pg["lr"] = base_lrs["lora"] * frac
 
+    print(
+        f"[train_paligemma] ablation flags: "
+        f"use_progress={args.use_progress} "
+        f"use_sub_instruction={args.use_sub_instruction} "
+        f"aux_progress_weight={args.aux_progress_weight}"
+    )
+
     history: list[dict[str, Any]] = []
     for epoch in range(start_epoch, args.epochs):
         model.train()
         t0 = time.time()
-        n, ce_sum, acc_sum, goal_sum = 0, 0.0, 0.0, 0.0
+        n, ce_sum, acc_sum, goal_sum, progress_sum = 0, 0.0, 0.0, 0.0, 0.0
         train_correct = np.zeros(NUM_OPENFLY_ACTIONS, dtype=np.int64)
         train_total = np.zeros(NUM_OPENFLY_ACTIONS, dtype=np.int64)
+        # Progress-bin counters: early / mid / late.
+        train_bin_samples = np.zeros(N_PROGRESS_BINS, dtype=np.int64)
+        train_bin_stop_total = np.zeros(N_PROGRESS_BINS, dtype=np.int64)
+        train_bin_stop_correct = np.zeros(N_PROGRESS_BINS, dtype=np.int64)
+        train_bin_stop_predicted = np.zeros(N_PROGRESS_BINS, dtype=np.int64)
         for step, batch in enumerate(train_loader):
             _apply_warmup(global_step)
             optimizer.zero_grad(set_to_none=True)
@@ -469,7 +706,10 @@ def main(argv: list[str] | None = None) -> int:
                 processor,
                 device,
                 args.aux_goal_weight,
+                aux_progress_weight=args.aux_progress_weight,
                 class_weights=class_weights_t,
+                use_progress=args.use_progress,
+                use_sub_instruction=args.use_sub_instruction,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -484,8 +724,19 @@ def main(argv: list[str] | None = None) -> int:
             acc_sum += metrics["acc"] * bs
             if "goal_l1" in metrics:
                 goal_sum += metrics["goal_l1"] * bs
+            if "progress_l1" in metrics:
+                progress_sum += metrics["progress_l1"] * bs
             _accumulate_per_class(
                 train_correct, train_total, metrics["preds"], metrics["actions"]
+            )
+            _accumulate_progress_stop(
+                train_bin_samples,
+                train_bin_stop_total,
+                train_bin_stop_correct,
+                train_bin_stop_predicted,
+                metrics["preds"],
+                metrics["actions"],
+                metrics.get("progress_target"),
             )
 
             if step % 20 == 0:
@@ -500,6 +751,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if "goal_l1" in metrics:
                     msg += f" goal={metrics['goal_l1']:.3f}"
+                if "progress_l1" in metrics:
+                    msg += f" progress={metrics['progress_l1']:.3f}"
                 print(msg, flush=True)
 
         train_log: dict[str, Any] = {
@@ -507,11 +760,25 @@ def main(argv: list[str] | None = None) -> int:
             "train_ce": ce_sum / max(n, 1),
             "train_acc": acc_sum / max(n, 1),
             "train_goal_l1": goal_sum / max(n, 1),
+            "train_progress_l1": progress_sum / max(n, 1),
             "time_s": time.time() - t0,
             "train_per_class_correct": train_correct.tolist(),
             "train_per_class_total": train_total.tolist(),
+            "train_progress_bin_samples": train_bin_samples.tolist(),
+            "train_progress_bin_stop_total": train_bin_stop_total.tolist(),
+            "train_progress_bin_stop_correct": train_bin_stop_correct.tolist(),
+            "train_progress_bin_stop_predicted": train_bin_stop_predicted.tolist(),
         }
         print(_format_per_class("train", train_correct, train_total))
+        print(
+            _format_progress_stop(
+                "train",
+                train_bin_samples,
+                train_bin_stop_total,
+                train_bin_stop_correct,
+                train_bin_stop_predicted,
+            )
+        )
         # Surface a few critical classes (stop + turns) explicitly.
         for c in (0, 2, 3):
             tot = int(train_total[c])
@@ -526,6 +793,10 @@ def main(argv: list[str] | None = None) -> int:
             model.eval()
             val_correct = np.zeros(NUM_OPENFLY_ACTIONS, dtype=np.int64)
             val_total = np.zeros(NUM_OPENFLY_ACTIONS, dtype=np.int64)
+            val_bin_samples = np.zeros(N_PROGRESS_BINS, dtype=np.int64)
+            val_bin_stop_total = np.zeros(N_PROGRESS_BINS, dtype=np.int64)
+            val_bin_stop_correct = np.zeros(N_PROGRESS_BINS, dtype=np.int64)
+            val_bin_stop_predicted = np.zeros(N_PROGRESS_BINS, dtype=np.int64)
             with torch.no_grad():
                 vn, vce, vacc = 0, 0.0, 0.0
                 for batch in val_loader:
@@ -536,6 +807,8 @@ def main(argv: list[str] | None = None) -> int:
                         device,
                         0.0,
                         class_weights=None,
+                        use_progress=args.use_progress,
+                        use_sub_instruction=args.use_sub_instruction,
                     )
                     bs = batch["action_id"].shape[0]
                     vn += bs
@@ -544,11 +817,33 @@ def main(argv: list[str] | None = None) -> int:
                     _accumulate_per_class(
                         val_correct, val_total, m["preds"], m["actions"]
                     )
+                    _accumulate_progress_stop(
+                        val_bin_samples,
+                        val_bin_stop_total,
+                        val_bin_stop_correct,
+                        val_bin_stop_predicted,
+                        m["preds"],
+                        m["actions"],
+                        m.get("progress_target"),
+                    )
             train_log["val_ce"] = vce / max(vn, 1)
             train_log["val_acc"] = vacc / max(vn, 1)
             train_log["val_per_class_correct"] = val_correct.tolist()
             train_log["val_per_class_total"] = val_total.tolist()
+            train_log["val_progress_bin_samples"] = val_bin_samples.tolist()
+            train_log["val_progress_bin_stop_total"] = val_bin_stop_total.tolist()
+            train_log["val_progress_bin_stop_correct"] = val_bin_stop_correct.tolist()
+            train_log["val_progress_bin_stop_predicted"] = val_bin_stop_predicted.tolist()
             print(_format_per_class("val", val_correct, val_total))
+            print(
+                _format_progress_stop(
+                    "val",
+                    val_bin_samples,
+                    val_bin_stop_total,
+                    val_bin_stop_correct,
+                    val_bin_stop_predicted,
+                )
+            )
             for c in (0, 2, 3):
                 tot = int(val_total[c])
                 cor = int(val_correct[c])

@@ -63,6 +63,8 @@ See [`openfly/README.md`](openfly/README.md) for the full eval / train reference
 
 | Doc | Contents |
 |-----|----------|
+| [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md) | What SkyVLA is trying to achieve — motivation, architecture, expected contribution |
+| [`docs/implementation.md`](docs/implementation.md) | One-page tour of the implementation (env, data, policy, world model, training tracks, eval) |
 | [`openfly/README.md`](openfly/README.md) | OpenFly eval, both training tracks, environment variables |
 | [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) | PaliGemma + LoRA feature extractor design notes |
 | [`docs/RESEARCH.md`](docs/RESEARCH.md) | Living research plan — research question, splits, reward curriculum, experiment matrix, results |

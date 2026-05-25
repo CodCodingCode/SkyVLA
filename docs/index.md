@@ -16,6 +16,8 @@ reward-sparsity curriculum during online RL improve navigation on
 genuinely new scenes — and which type of domain shift does RL actually
 fix?**
 
+[**Implementation tour**](implementation) ·
+[Whitepaper](whitepaper) ·
 [Research method](research) ·
 [Results](results) ·
 [Setup](setup) ·

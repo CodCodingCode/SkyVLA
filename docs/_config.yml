@@ -42,6 +42,10 @@ defaults:
 nav:
   - title: Home
     url: /
+  - title: Implementation
+    url: /implementation
+  - title: Whitepaper
+    url: /whitepaper
   - title: Research
     url: /research
   - title: Results

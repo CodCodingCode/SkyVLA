@@ -335,6 +335,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=1,
                         help="Save checkpoint every N epochs.")
+    parser.add_argument("--early_stop_patience", type=int, default=0,
+                        help="Stop training if val_cos hasn't improved for N "
+                        "consecutive epochs. 0 disables early stopping.")
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -437,6 +440,8 @@ def main(argv: list[str] | None = None) -> int:
 
     start_epoch = 0
     global_step = 0
+    best_val_cos = float("-inf")
+    epochs_since_best = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         dit.load_state_dict(ckpt["dit"])
@@ -519,23 +524,58 @@ def main(argv: list[str] | None = None) -> int:
             # mkdir and end-of-epoch save. Idempotent and cheap; cost is
             # one stat call.
             out_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_path = out_dir / "last.pt"
+            ckpt_state = {
+                "dit": dit.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "global_step": global_step,
+                "args": vars(args),
+                "val_cos": float(train_log.get("val_cos", float("nan"))),
+            }
+            # 1) Always update ``last.pt`` (atomic).
             tmp_path = out_dir / "last.pt.tmp"
-            torch.save(
-                {
-                    "dit": dit.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "args": vars(args),
-                },
-                tmp_path,
-            )
-            # Atomic rename so a save crash never leaves a half-written ckpt.
+            ckpt_path = out_dir / "last.pt"
+            torch.save(ckpt_state, tmp_path)
             os.replace(tmp_path, ckpt_path)
+            print(f"[train_subgoal_dit] saved {ckpt_path}")
+
             with open(out_dir / "history.json", "w") as f:
                 json.dump(history, f, indent=2)
-            print(f"[train_subgoal_dit] saved {ckpt_path}")
+
+            # 2) Update ``best.pt`` if this epoch is the new best by val_cos.
+            #    Falls back to comparing train_loss if val isn't available.
+            current_val = train_log.get("val_cos", None)
+            if current_val is not None and current_val > best_val_cos:
+                best_val_cos = float(current_val)
+                epochs_since_best = 0
+                best_tmp = out_dir / "best.pt.tmp"
+                best_path = out_dir / "best.pt"
+                torch.save(ckpt_state, best_tmp)
+                os.replace(best_tmp, best_path)
+                print(
+                    f"[train_subgoal_dit] new best val_cos={best_val_cos:.4f}; "
+                    f"saved {best_path}"
+                )
+            else:
+                epochs_since_best += 1
+                if current_val is not None:
+                    print(
+                        f"[train_subgoal_dit] val_cos={current_val:.4f} "
+                        f"(best={best_val_cos:.4f}, no improvement for "
+                        f"{epochs_since_best} epoch(s))"
+                    )
+
+            # 3) Early-stop if val_cos hasn't improved in --early_stop_patience epochs.
+            if (
+                args.early_stop_patience > 0
+                and epochs_since_best >= args.early_stop_patience
+            ):
+                print(
+                    f"[train_subgoal_dit] early stop: val_cos has not improved "
+                    f"for {epochs_since_best} epochs "
+                    f"(--early_stop_patience={args.early_stop_patience})"
+                )
+                break
 
     return 0
 

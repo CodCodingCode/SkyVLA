@@ -18,6 +18,7 @@ We unroll each entry into per-step training samples
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -117,10 +118,31 @@ def _resolve_frame(image_root: Path, image_path: str, index: str) -> Path | None
     return None
 
 
+# Process-local cache of paths we've already warned about being unreadable.
+# Avoids spamming the log when the same corrupted file is hit repeatedly by
+# DataLoader workers.
+_BAD_IMAGE_PATHS: set[str] = set()
+
+
 def _load_rgb(path: Path | None, image_size: int = 224) -> np.ndarray:
+    """Load an RGB image to (H, W, 3) uint8.
+
+    Returns a zero image if ``path`` is None, missing, or unreadable
+    (truncated / corrupted PNGs from partial downloads). The caller is
+    expected to either tolerate zero frames or mask them via the
+    ``subgoal_valid`` field — we don't raise here because a single
+    bad file shouldn't kill a multi-hour training run.
+    """
     if path is None:
         return np.zeros((image_size, image_size, 3), dtype=np.uint8)
-    img = Image.open(path).convert("RGB")
+    try:
+        img = Image.open(path).convert("RGB")
+    except (OSError, ValueError) as exc:  # incl. PIL.UnidentifiedImageError (OSError subclass)
+        sp = str(path)
+        if sp not in _BAD_IMAGE_PATHS:
+            _BAD_IMAGE_PATHS.add(sp)
+            print(f"[openfly.dataset] WARN unreadable image, returning zeros: {sp} ({exc})")
+        return np.zeros((image_size, image_size, 3), dtype=np.uint8)
     if img.size != (image_size, image_size):
         img = img.resize((image_size, image_size), Image.BILINEAR)
     return np.asarray(img, dtype=np.uint8)
@@ -217,6 +239,30 @@ class OpenFlyDataset(Dataset):
                          Default ``2.0`` — existing callers automatically get
                          stop-class oversampling; pass ``oversample_stop=1.0`` for
                          the legacy behaviour.
+        subgoal_pairing: How to pick the subgoal step relative to the current
+                         step ``t``. Follows the π0.7 recipe (arXiv 2604.15483
+                         Appendix C):
+
+                         * ``"semantic_only"`` — always end-of-same-action-run
+                           (the templated sub-instruction boundary). Variable
+                           horizon; matches the deterministic default we used
+                           pre-π0.7.
+                         * ``"uniform_only"`` — always ``t + k`` with
+                           ``k ~ Uniform(1, subgoal_uniform_max)``. Fixed-range
+                           horizon.
+                         * ``"mixed"`` (default) — with
+                           ``p = subgoal_semantic_prob`` use semantic, else
+                           uniform. The π0.7 paper uses 0.25/0.75 with a
+                           uniform window of 0–4 seconds ahead; one OpenFly
+                           macro ≈ one second of drone motion, so the analog
+                           is ``k ~ Uniform(1, 4)``. Defaults here track that.
+        subgoal_semantic_prob: Probability of choosing the semantic mode in
+                         ``mixed`` pairing. ``0.25`` reproduces π0.7.
+        subgoal_uniform_max: Upper bound (inclusive) on ``k`` for the uniform
+                         mode. ``4`` reproduces π0.7's 0–4 s window for
+                         OpenFly's macro-action granularity. Drop to ``2``
+                         for a tighter horizon if rollouts show that the
+                         farther-ahead subgoals are too noisy.
     """
 
     def __init__(
@@ -231,12 +277,23 @@ class OpenFlyDataset(Dataset):
         max_samples: int = 0,
         require_images: bool = False,
         oversample_stop: float = 2.0,
+        subgoal_pairing: str = "mixed",
+        subgoal_semantic_prob: float = 0.25,
+        subgoal_uniform_max: int = 4,
     ) -> None:
         self.image_root = Path(image_root) if image_root else default_image_root()
         self.history_frames = max(0, int(history_frames))
         self.image_size = int(image_size)
         self.require_images = require_images
         self.oversample_stop = float(oversample_stop)
+        valid_modes = {"semantic_only", "uniform_only", "mixed"}
+        if subgoal_pairing not in valid_modes:
+            raise ValueError(
+                f"subgoal_pairing must be one of {sorted(valid_modes)}; got {subgoal_pairing!r}"
+            )
+        self.subgoal_pairing = subgoal_pairing
+        self.subgoal_semantic_prob = float(subgoal_semantic_prob)
+        self.subgoal_uniform_max = max(1, int(subgoal_uniform_max))
 
         episodes = load_episodes(
             split,
@@ -393,28 +450,62 @@ class OpenFlyDataset(Dataset):
         progress = float(step) / float(max(1, traj_len - 1))
         sub_instruction = _build_sub_instruction(actions, step)
 
-        # Subgoal frame: the trajectory step where the current same-action
-        # run ends (next action-transition). When no future transition is
-        # found (terminal run, e.g. the final ``stop``) we duplicate the
-        # current frame and mark the sample invalid so the DiT trainer
-        # can skip it.
-        cur_action = int(actions[step])
+        # Subgoal frame selection. Per the π0.7 recipe (arXiv 2604.15483
+        # Appendix C), we pick between two pairing modes per ``__getitem__``
+        # call so the world model sees a mix of semantic (end-of-segment)
+        # and dense (uniform short-horizon) supervision. The deterministic
+        # next-action-transition lookup we used previously corresponds to
+        # the ``semantic_only`` mode and is preserved for ablations.
+        #
+        # When no valid future step is available (terminal-run case for
+        # semantic, or trajectory too short for the requested uniform k),
+        # we duplicate the current frame and mark the sample invalid so
+        # the DiT trainer can mask it out of the loss.
+        traj_max = min(len(actions), len(indices)) - 1
+
         sg_step = step
-        for j in range(step + 1, min(len(actions), len(indices))):
-            if int(actions[j]) != cur_action:
-                sg_step = j
-                break
+        if self.subgoal_pairing == "semantic_only":
+            cur_action = int(actions[step])
+            for j in range(step + 1, traj_max + 1):
+                if int(actions[j]) != cur_action:
+                    sg_step = j
+                    break
+        elif self.subgoal_pairing == "uniform_only":
+            if step < traj_max:
+                k = random.randint(1, self.subgoal_uniform_max)
+                sg_step = min(step + k, traj_max)
+        else:  # "mixed"
+            if random.random() < self.subgoal_semantic_prob:
+                cur_action = int(actions[step])
+                for j in range(step + 1, traj_max + 1):
+                    if int(actions[j]) != cur_action:
+                        sg_step = j
+                        break
+            else:
+                if step < traj_max:
+                    k = random.randint(1, self.subgoal_uniform_max)
+                    sg_step = min(step + k, traj_max)
+
         subgoal_valid = sg_step > step
         subgoal_horizon = max(0, sg_step - step)
 
         if subgoal_valid:
             sg_path = _resolve_frame(self.image_root, ep["image_path"], indices[sg_step])
             subgoal_rgb = _load_rgb(sg_path, self.image_size)
-            sg_xyz = positions[sg_step] if sg_step < len(positions) else positions[-1]
-            sg_yaw = float(yaws[sg_step]) if sg_step < len(yaws) else yaw
-            subgoal_pose = np.asarray(
-                [sg_xyz[0], sg_xyz[1], sg_xyz[2], sg_yaw], dtype=np.float32
-            )
+            # If the subgoal file is unreadable (zero-byte or truncated), mark
+            # the sample invalid so the DiT trainer masks the loss for this
+            # row instead of treating a black frame as a real supervision target.
+            if sg_path is None or str(sg_path) in _BAD_IMAGE_PATHS:
+                subgoal_valid = False
+                subgoal_horizon = 0
+                subgoal_rgb = rgb.copy()
+                subgoal_pose = pose.copy()
+            else:
+                sg_xyz = positions[sg_step] if sg_step < len(positions) else positions[-1]
+                sg_yaw = float(yaws[sg_step]) if sg_step < len(yaws) else yaw
+                subgoal_pose = np.asarray(
+                    [sg_xyz[0], sg_xyz[1], sg_xyz[2], sg_yaw], dtype=np.float32
+                )
         else:
             subgoal_rgb = rgb.copy()
             subgoal_pose = pose.copy()

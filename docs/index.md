@@ -1,87 +1,78 @@
 ---
 layout: default
 title: SkyVLA
-description: Curriculum sparse RL for outdoor aerial vision-language navigation on the OpenFly benchmark.
+description: Aerial vision-language navigation on OpenFly — generative visual subgoals + curriculum sparse RL.
 ---
 
 # SkyVLA
 
-**Curriculum sparse RL for outdoor aerial vision-language navigation
-on the [OpenFly](https://github.com/SHAILAB-IPEC/OpenFly-Platform)
-benchmark.**
+Aerial vision-language navigation on the [OpenFly](https://arxiv.org/abs/2502.18041) benchmark. Two models, two ideas:
 
-This site documents an ongoing study: *after* imitation-learning a
-PaliGemma-based VLN policy on OpenFly's training scenes, **does a
-reward-sparsity curriculum during online RL improve navigation on
-genuinely new scenes — and which type of domain shift does RL actually
-fix?**
-
-[**Implementation tour**](implementation) ·
-[Whitepaper](whitepaper) ·
-[Research method](research) ·
-[Results](results) ·
-[Setup](setup) ·
-[GitHub repository](https://github.com/CodCodingCode/SkyVLA)
+1. A **feature-space diffusion world model** that imagines the next-keyframe view (π0.7 / SuSIE-style, but in SigLIP token space — no pixels).
+2. A **PaliGemma-VLN policy** that picks one of 8 discrete macros per step, conditioned on the imagined subgoal.
 
 ## Research question
 
-> After imitation on OpenFly `train`, does a reward-sparsity curriculum
-> during online RL improve navigation on the three never-trained
-> environments below — and which kind of domain shift does RL actually
-> close?
+Do generative visual subgoals + a reward-sparsity curriculum during online RL improve navigation on **genuinely new scenes** — and which type of domain shift does each piece actually close?
 
-We deliberately break the unseen set apart by **shift type** rather
-than averaging it into a single number.
+## The stack
+
+```
+RGB ─► PaliGemma 3B ─► curr SigLIP ──┬──► SubgoalDiT  (~150M) ──► predicted subgoal SigLIP
+                                     │                                       │
+                                     └─────────────► cross-attn + action head ◄──┘
+                                                            │
+                                                            ▼
+                                                discrete action (0..7)
+```
+
+PaliGemma is frozen except for LoRA. The DiT trains offline (P2) and is then frozen for the rest of the pipeline. RL only updates the action head.
+
+## The OOD set
+
+We never report unseen as one averaged number. The three unseen envs test three different shifts:
 
 <div class="env-grid" markdown="1">
 <div class="env-card" markdown="1">
 ### env_game_gtav
-Cross-renderer shift. **Zero GTA episodes in training.** Hardest
-visual OOD.
+**Renderer shift.** Zero GTA episodes in training. Hardest visual OOD.
 </div>
 <div class="env-card" markdown="1">
 ### env_ue_smallcity
-New Unreal Engine layout. Same engine as training (`ue_bigcity` is in
-train) but different city geometry and semantics.
+**Layout shift.** Same Unreal engine as `ue_bigcity` in train, different city geometry.
 </div>
 <div class="env-card" markdown="1">
 ### env_gs_sjtu02
-New 3D Gaussian Splatting campus. Same pipeline as training
-(`gs_sjtu01`) but a different real-to-sim reconstruction.
+**Recon shift.** Same 3D-Gaussian-Splatting pipeline as `gs_sjtu01` in train, different campus.
 </div>
 </div>
 
-## Method at a glance
+## Borrowed vs. new
 
-```mermaid
-flowchart LR
-    train[Train_100k_episodes_11_scenes] --> SFT[SFT_PaliGemma_BC]
-    SFT --> DAgger[DAgger_on_train_scenes]
-    DAgger --> RL_easy[GRPO_easy_dense_progress]
-    RL_easy --> RL_medium[GRPO_medium_terminal_NE]
-    RL_medium --> RL_hard[GRPO_hard_success_SPL_only]
-    DAgger --> RL_baseline_dense[PPO_dense_baseline]
-    DAgger --> RL_baseline_sparse[GRPO_cold_sparse]
-    RL_hard --> Eval[Per_env_eval_seen_and_unseen]
-    RL_baseline_dense --> Eval
-    RL_baseline_sparse --> Eval
-```
+| Borrowed | Source |
+|----------|--------|
+| Visual subgoals as a steering lever for VLAs | [π0.7](https://arxiv.org/abs/2604.15483) (Physical Intelligence, 2026) |
+| Diffusion-based subgoal generation | [SuSIE](https://arxiv.org/abs/2310.10639) (Black et al., ICLR 2024) |
+| 25 % end-of-segment + 75 % uniform 0–4 s pairing | π0.7 Appendix C |
+| Curriculum sparse reward in online RL | This repo |
 
-The full method, reward presets, and experiment matrix are on the
-[research page](research).
+| New here | What |
+|----------|------|
+| Feature-space diffusion over SigLIP tokens (not pixels) | Skips VAE decode — predictions feed straight into PaliGemma's cross-attention. ~5× faster than pixel diffusion. |
+| Pose-delta conditioning | OpenFly teleports kinematically. Feeding the body-frame delta explicitly forces the DiT to predict visual content given the pose, not the pose itself. |
+| First feature-space visual-subgoal generator for aerial VLN | To our knowledge. |
 
-## What is fair to claim
+## Where to look next
 
-We follow the project's
-[benchmark fairness guidelines](https://github.com/CodCodingCode/SkyVLA/blob/main/docs/BENCHMARK_FAIRNESS.md).
-Headline rules:
+- [**Implementation tour**](implementation/) — five-minute walk through env, data, policy, world model, training tracks, eval.
+- [**Whitepaper**](whitepaper/) — what we are trying to achieve and what we will not claim.
+- [Research plan](research-plan/) — long-form experimental matrix.
+- [Results](results/) — per-env unseen table, populated as runs complete.
+- [Setup](setup/) — quickstart on an A100 host.
+- [GitHub](https://github.com/CodCodingCode/SkyVLA) — code.
 
-- Report **per-env** unseen results, not a single averaged number.
-- Use the same eval harness and `--max_steps` budget for every checkpoint.
-- Do not call fine-tuned numbers *zero-shot*.
-- The oracle heuristic is a geometric upper bound, not a model result.
-
-## Citation
+<details markdown="1">
+<summary>BibTeX</summary>
 
 ```bibtex
 @software{codcodingcode_skyvla,
@@ -91,3 +82,4 @@ Headline rules:
   url    = {https://github.com/CodCodingCode/SkyVLA}
 }
 ```
+</details>

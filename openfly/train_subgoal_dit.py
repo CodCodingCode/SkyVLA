@@ -389,6 +389,22 @@ def main(argv: list[str] | None = None) -> int:
         "but loses the chance to adapt the backbone to aerial features. "
         "Only relevant with --pretrained_path.",
     )
+    parser.add_argument(
+        "--backbone_lr",
+        type=float,
+        default=1e-6,
+        help="LR for the pretrained PixArt backbone params. Only used with "
+        "--pretrained_path (and ignored when --freeze_backbone is on). "
+        "1e-6 is standard finetuning-of-pretrained-image-DiT territory.",
+    )
+    parser.add_argument(
+        "--adapter_lr",
+        type=float,
+        default=1e-4,
+        help="LR for the randomly-initialised SigLIP I/O adapters + extra "
+        "conditioning modules. Only used with --pretrained_path. ~100× "
+        "higher than --backbone_lr because these need to learn from scratch.",
+    )
 
     # Data
     parser.add_argument("--history_frames", type=int, default=0,
@@ -541,10 +557,36 @@ def main(argv: list[str] | None = None) -> int:
 
     processor = _build_processor(args.paligemma_model)
 
-    optimizer = torch.optim.AdamW(
-        [p for p in dit.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99),
-    )
+    # When using the PixArt-pretrained backbone, use separate LRs for the
+    # backbone (gentle, 1e-6) and the random-init adapters (aggressive,
+    # 1e-4). Single global LR was the underlying cause of v1–v4 plateauing
+    # at loss ~1.0 with PixArt init.
+    if args.pretrained_path and not args.freeze_backbone:
+        param_groups = dit.param_groups(
+            backbone_lr=args.backbone_lr,
+            adapter_lr=args.adapter_lr,
+        )
+        n_backbone = sum(p.numel() for p in param_groups[0]["params"])
+        n_adapter = sum(p.numel() for p in param_groups[1]["params"])
+        print(
+            f"[train_subgoal_dit] param groups: "
+            f"backbone={n_backbone/1e6:.1f}M @ lr={args.backbone_lr:.1e}, "
+            f"adapter={n_adapter/1e6:.1f}M @ lr={args.adapter_lr:.1e}"
+        )
+        optimizer = torch.optim.AdamW(
+            param_groups, weight_decay=args.weight_decay, betas=(0.9, 0.99),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            [p for p in dit.parameters() if p.requires_grad],
+            lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99),
+        )
+    # Snapshot the per-group base LRs so warmup scales each one to its own
+    # target instead of clobbering them all to a single ``args.lr``.
+    _base_lrs = {
+        pg.get("name", str(i)): float(pg["lr"])
+        for i, pg in enumerate(optimizer.param_groups)
+    }
 
     start_epoch = 0
     global_step = 0
@@ -563,8 +605,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.warmup_steps <= 0:
             return
         frac = min(1.0, (step_idx + 1) / float(args.warmup_steps))
-        for pg in optimizer.param_groups:
-            pg["lr"] = args.lr * frac
+        # Scale each group toward its OWN base LR — preserves the backbone
+        # vs adapter ratio through warmup instead of dragging both to args.lr.
+        for i, pg in enumerate(optimizer.param_groups):
+            name = pg.get("name", str(i))
+            pg["lr"] = _base_lrs[name] * frac
 
     # ----- train --------------------------------------------------------
     history: list[dict[str, Any]] = []

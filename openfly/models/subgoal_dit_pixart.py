@@ -117,18 +117,41 @@ class PixArtSubgoalDiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, 512, self.HIDDEN_DIM))
         nn.init.normal_(self.pos_embed, std=0.02)
 
-        # ---- Text condition adapter (Gemma → PixArt caption_channels) ----
-        # PixArt-Σ was trained with T5-XXL (4096-d); we feed a single text
-        # token assembled from the Gemma summary projected to 4096.
-        self.text_to_caption = nn.Linear(text_dim, self.caption_channels)
+        # ---- Text condition adapter -------------------------------------
+        # FIX (vs the earlier broken wrapper): we used to project Gemma's
+        # 2048-d summary to 4096-d and then run it through PixArt's
+        # pretrained ``caption_projection`` (a 4096 → 1152 Linear trained
+        # for T5-XXL embeddings). That fed the cross-attention layers
+        # encoder_hidden_states with statistics nothing like what they
+        # learned to handle, and the model collapsed to a "predict zero"
+        # plateau (loss ~0.99 indefinitely). The pretrained
+        # ``caption_projection`` is now bypassed: we learn a fresh
+        # Gemma 2048 → 1152 projection that directly produces the
+        # encoder_hidden_states the transformer blocks expect. This is
+        # what diffusers calls "swapping the text encoder."
+        self.text_to_caption = nn.Linear(text_dim, self.HIDDEN_DIM)
 
         # ---- Extra conditioning (pose, last_action, horizon) -----------
-        # These get added into PixArt's ``embedded_timestep`` so they
-        # influence the final output modulation in the same channel
-        # the model is already trained to use for global conditioning.
+        # FIX: we used to fold these directly into PixArt's
+        # ``embedded_timestep`` so they participated in the final
+        # ``scale_shift_table`` modulation. That blew up the pretrained
+        # modulation's expected distribution. They now feed a separate
+        # zero-init modulation branch that adds an extra shift/scale to
+        # the final hidden, leaving PixArt's pretrained timestep path
+        # untouched and learning the new conditioning gradually.
         self.pose_proj = nn.Linear(pose_delta_dim, self.HIDDEN_DIM)
         self.last_action_emb = nn.Embedding(num_last_actions, self.HIDDEN_DIM)
         self.horizon_embed = nn.Embedding(33, self.HIDDEN_DIM)
+        # Zero-init the extra-modulation projection so the wrapper starts
+        # as a pure PixArt forward (extras contribute nothing) and learns
+        # to use them only if training data warrants it. Mirrors DiT-Zero
+        # gate-zero init philosophy.
+        self.extra_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.HIDDEN_DIM, 2 * self.HIDDEN_DIM),
+        )
+        nn.init.zeros_(self.extra_modulation[-1].weight)
+        nn.init.zeros_(self.extra_modulation[-1].bias)
 
         # ---- Diffusion schedule (buffer follows .to(device)) ---------
         alpha_bar = cosine_alpha_bar(self.num_timesteps)
@@ -146,6 +169,42 @@ class PixArtSubgoalDiT(nn.Module):
             f"[pixart_subgoal_dit] backbone={'frozen' if freeze_backbone else 'trainable'} "
             f"params trainable={n_train:,} total={n_total:,}"
         )
+
+    # ---- Optimizer parameter groups -------------------------------
+
+    def param_groups(
+        self,
+        *,
+        backbone_lr: float = 1e-6,
+        adapter_lr: float = 1e-4,
+    ) -> list[dict]:
+        """Optimizer parameter groups with separate LRs for backbone vs adapters.
+
+        Pretrained ``backbone.*`` params want gentle updates (default 1e-6)
+        so the priors don't wash out. The randomly-initialised adapters
+        (``token_in``, ``token_out``, ``role_embed``, ``pos_embed``,
+        ``text_to_caption``, ``pose_proj``, ``last_action_emb``,
+        ``horizon_embed``, ``extra_modulation``) need to learn from
+        scratch and want ~100× higher LR (default 1e-4).
+
+        Using a single global LR for all 624M params was the underlying
+        reason v1–v4 plateaued at loss ~1.0: adapters never got enough
+        gradient signal to escape near-zero predictions while the
+        backbone-friendly LR was being applied. This helper fixes that.
+        """
+        backbone_params = []
+        adapter_params = []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.startswith("backbone."):
+                backbone_params.append(p)
+            else:
+                adapter_params.append(p)
+        return [
+            {"params": backbone_params, "lr": float(backbone_lr), "name": "backbone"},
+            {"params": adapter_params,  "lr": float(adapter_lr),  "name": "adapter"},
+        ]
 
     # ---- Diffusion utilities --------------------------------------
 
@@ -187,28 +246,33 @@ class PixArtSubgoalDiT(nn.Module):
         backbone_dtype = next(self.backbone.parameters()).dtype
         hidden = hidden.to(backbone_dtype)
 
-        # 2) PixArt timestep modulation: (t_mod, embedded_t).
-        #    PixArt-Σ doesn't use additional conditions (size/aspect-ratio),
-        #    so added_cond_kwargs=None is fine.
+        # 2) PixArt timestep modulation. Keep ``embedded_t`` PURE here —
+        #    the pretrained ``scale_shift_table`` expects this distribution.
+        #    Our extras enter through a separate zero-init branch below.
         t_mod, embedded_t = self.backbone.adaln_single(
             t, None, batch_size=B, hidden_dtype=hidden.dtype
         )
 
-        # Fold our extra conditioning into embedded_t (used for final modulation).
-        extra = (
-            self.pose_proj(pose_delta.to(embedded_t.dtype))
+        # Build the extra conditioning vector (pose + last_action + horizon).
+        # Will only contribute non-trivially once ``extra_modulation`` learns.
+        extra_cond = (
+            self.pose_proj(pose_delta.to(hidden.dtype))
             + self.last_action_emb(last_action.long())
             + self.horizon_embed(horizon.clamp(min=0, max=32).long())
         )
-        embedded_t = embedded_t + extra
 
-        # 3) Text -> PixArt caption embedding (single text-token).
-        caption_raw = self.text_to_caption(text_embed.to(hidden.dtype))  # (B, 4096)
-        caption_raw = caption_raw.unsqueeze(1)                            # (B, 1, 4096)
-        caption = self.backbone.caption_projection(caption_raw)           # (B, 1, 1152)
+        # 3) Text → encoder_hidden_states. FIX: bypass the pretrained
+        #    ``caption_projection`` (trained for T5-XXL) and feed our
+        #    Gemma-projected vector straight into the transformer-block
+        #    cross-attention. The pretrained cross-attn KV projections
+        #    will be re-learned as a byproduct of the finetune; that's a
+        #    lot more stable than feeding them garbage and expecting them
+        #    to compensate.
+        caption = self.text_to_caption(text_embed.to(hidden.dtype))      # (B, HIDDEN_DIM)
+        caption = caption.unsqueeze(1)                                    # (B, 1, HIDDEN_DIM)
 
-        # PixArt's blocks expect a 2D-broadcastable mask formed the same way
-        # ``PixArtTransformer2DModel.forward`` builds it.
+        # PixArt-style cross-attention mask (same shape construction as
+        # ``PixArtTransformer2DModel.forward`` produces internally).
         ones = torch.ones(B, 1, dtype=hidden.dtype, device=device)
         encoder_attention_mask = (1 - ones) * -10000.0
         encoder_attention_mask = encoder_attention_mask.unsqueeze(1)      # (B, 1, 1)
@@ -225,12 +289,21 @@ class PixArtSubgoalDiT(nn.Module):
                 class_labels=None,
             )
 
-        # 5) Final PixArt-style modulation (shift / scale from scale_shift_table + t).
+        # 5) Final PixArt-style modulation. ``shift``/``scale`` come from
+        #    the pretrained ``scale_shift_table`` + the PURE
+        #    ``embedded_t`` (timestep only). Our extras add an extra
+        #    shift/scale through a zero-init projection — starts as a no-op,
+        #    grows in only if useful.
         shift, scale = (
             self.backbone.scale_shift_table[None] + embedded_t[:, None]
         ).chunk(2, dim=1)
+        extra_shift, extra_scale = self.extra_modulation(extra_cond).chunk(2, dim=-1)
+        # broadcast extras to (B, 1, HIDDEN_DIM) so they apply uniformly across tokens
+        extra_shift = extra_shift.unsqueeze(1)
+        extra_scale = extra_scale.unsqueeze(1)
+
         hidden = self.backbone.norm_out(hidden)
-        hidden = hidden * (1 + scale) + shift
+        hidden = hidden * (1 + scale + extra_scale) + shift + extra_shift
 
         # Keep only the subgoal half and project back to SigLIP space.
         subgoal_hidden = hidden[:, S:]                                     # (B, 256, 1152)

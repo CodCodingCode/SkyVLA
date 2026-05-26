@@ -17,7 +17,7 @@ RGB ─► PaliGemma 3B (frozen + LoRA) ─► curr SigLIP ──┬──► Su
 Three training phases:
 
 1. **P1 — behaviour cloning.** PaliGemma + LoRA + action head, offline on OpenFly's `train.json`.
-2. **P2 — world model.** `SubgoalDiT` is a feature-space DDPM (PixArt-Σ backbone) that predicts the next-keyframe SigLIP tokens from the current frame, instruction, and pose delta. PaliGemma is frozen for this stage so the diffusion loss is the only signal.
+2. **P2 — world model.** `SubgoalDiT` is a feature-space DDPM (~150M, from-scratch DiT) that predicts the next-keyframe SigLIP tokens from the current frame, instruction, and pose delta. PaliGemma is frozen for this stage so the diffusion loss is the only signal. A web-pretrained PixArt-Σ backbone with a thin SigLIP adapter was tried as a π0.7-style init — it didn't transfer (see whitepaper §10).
 3. **P3 — subgoal-conditioned policy.** The frozen world model feeds the policy via cross-attention. Online RL — GRPO on PaliGemma, PPO on the OpenFly-Agent 7B baseline — updates only the action head, with an easy → medium → hard reward curriculum on the GRPO run.
 
 Eval uses OpenFly's seen / unseen splits, with a per-env breakdown for the three unseen scenes (`env_game_gtav`, `env_ue_smallcity`, `env_gs_sjtu02`).
@@ -73,7 +73,7 @@ openfly/
   models/
     paligemma_vln.py             BC backbone
     subgoal_dit.py               world model (vanilla DiT)
-    subgoal_dit_pixart.py        world model (PixArt-Σ pretrained)
+    subgoal_dit_pixart.py        failed ablation — PixArt-Σ frozen backbone + thin adapter
     openfly_agent_rl.py          7B + value head
   envs/airsim_vln_env.py         gymnasium wrapper around the AirSim / UE bridge
   rewards.py, rollout.py         episode rewards + trajectory collection

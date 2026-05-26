@@ -84,12 +84,11 @@ Two consequences:
   Predicting pixels and re-encoding them with SigLIP throws away effort
   and adds drift.
 
-The default world model is from-scratch, ~150M params (depth 12, hidden
-1024). The repo also ships a [PixArt-Σ-initialised
-variant](../openfly/models/subgoal_dit_pixart.py) — ~620M total, of
-which only the ~20M SigLIP-shaped I/O adapters are trainable when the
-backbone is frozen — for the π0.7-style "start from a model that already
-knows what scenes look like" experiment.
+The world model is ~150M params, trained from scratch (depth 12, hidden
+1024) with a NaN-guarded skip-step for LR stability. We tried a
+PixArt-Σ web-pretrained backbone as a π0.7-style "start from a model
+that already knows what scenes look like" alternative; it didn't
+transfer. The negative result and the mechanism are in §10.
 
 The policy backbone is the same
 [`PaliGemmaVLNPolicy`](../openfly/models/paligemma_vln.py) the BC and
@@ -105,7 +104,6 @@ frame and history.
 | Diffusion subgoal generation | SuSIE (Black et al., ICLR 2024) |
 | 25 % end-of-segment + 75 % uniform 0–4 s pairing | π0.7 Appendix C |
 | Training the policy on world-model-generated subgoals | π0.7 |
-| Web-pretrained DiT backbone | π0.7's BAGEL-init recipe, adapted |
 | Curriculum sparse reward in online RL | The existing GRPO curriculum in this repo (B5 in the experimental matrix) |
 | The OpenFly benchmark and the seen / unseen split | Gao et al., 2025 |
 
@@ -203,11 +201,35 @@ Three failure modes, ordered by how likely they are to bite:
 3. **The drone teleports through obstacles.** OpenFly's A* paths are
    collision-free, but the renderer doesn't enforce occlusion. A world
    model trained only on this data may happily synthesise subgoals
-   inside a building. Mitigation is already in the repo: PixArt-Σ
-   initialisation for the world model, plus the point-cloud collision
-   penalty in [`rewards.py`](../openfly/rewards.py) for the RL phase.
+   inside a building. Mitigation: the point-cloud collision penalty in
+   [`rewards.py`](../openfly/rewards.py) for the RL phase, fed by the
+   `.pcd` voxel maps we ship for the AirSim and smallcity scenes.
 
-## 10. The honest endpoint
+## 10. Ablations: what didn't work
+
+Worth reporting because each one rules out a recipe other people would
+also try.
+
+- **Frozen PixArt-Σ backbone + thin SigLIP I/O adapter** (`subgoal_dit_pixart.py`,
+  ~620M total / ~14M trainable adapter heads). The bet: web-pretrained
+  scene priors from a DiT-XL/2 trained on 33M image-text pairs should
+  transfer to aerial subgoal prediction through a small adapter that
+  translates between SigLIP token space and the backbone's VAE-latent
+  hidden dim. The reality: PaliGemma's SigLIP feature distribution and
+  PixArt's VAE-latent hidden distribution are far enough apart that a
+  14M-param adapter can't bridge them. Validation cosine similarity
+  stayed near zero. The pretrained backbone needs to actually adapt for
+  the priors to be useful — a frozen backbone with a thin adapter is
+  not the right partition.
+
+  This is the cleanest comparison we could have run against the
+  from-scratch DiT, and the negative result is the takeaway:
+  *frozen pretrained-DiT init fails for SigLIP-feature-space subgoal
+  diffusion*. The from-scratch ~150M DiT (full finetune, NaN-guarded
+  step) remains the only world model in the live pipeline. A
+  full-finetune PixArt-Σ run is open but not on the critical path.
+
+## 11. The honest endpoint
 
 A clean negative result is publishable —
 *"web-pretrained visual subgoals don't close OpenFly's renderer OOD
@@ -225,14 +247,14 @@ mechanism (instruction-conditioned visual subgoals as a regulariser for
 OOD generalisation in aerial VLN) hasn't been characterised on outdoor
 aerial data before.
 
-## 11. Pointers into the code
+## 12. Pointers into the code
 
 | Concern | File |
 |---|---|
 | OpenFly env wiring + action space | [`openfly/envs/airsim_vln_env.py`](../openfly/envs/airsim_vln_env.py), [`openfly/actions.py`](../openfly/actions.py) |
 | PaliGemma BC policy + subgoal slot | [`openfly/models/paligemma_vln.py`](../openfly/models/paligemma_vln.py) |
-| Feature-space DiT (from-scratch, ~150M) | [`openfly/models/subgoal_dit.py`](../openfly/models/subgoal_dit.py) |
-| Feature-space DiT (PixArt-Σ backbone, ~620M) | [`openfly/models/subgoal_dit_pixart.py`](../openfly/models/subgoal_dit_pixart.py) |
+| Feature-space DiT — live world model (~150M, from-scratch) | [`openfly/models/subgoal_dit.py`](../openfly/models/subgoal_dit.py) |
+| Feature-space DiT — failed ablation (PixArt-Σ frozen + adapter; see §10) | [`openfly/models/subgoal_dit_pixart.py`](../openfly/models/subgoal_dit_pixart.py) |
 | P2 world-model trainer | [`openfly/train_subgoal_dit.py`](../openfly/train_subgoal_dit.py) |
 | Dataset + 25 / 75 subgoal pairing | [`openfly/dataset.py`](../openfly/dataset.py) |
 | Reward presets + curriculum | [`openfly/rewards.py`](../openfly/rewards.py), [`openfly/train_curriculum_grpo.py`](../openfly/train_curriculum_grpo.py) |

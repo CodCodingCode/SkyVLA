@@ -74,12 +74,13 @@ Two models, trained largely independently:
 - **World model** — [`SubgoalDiT`](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/models/subgoal_dit.py).
   ~150M-param DiT operating entirely in PaliGemma's 2048-d SigLIP token
   space — no pixel decoder, no VAE. Predicts the SigLIP tokens of the
-  next-keyframe view. An optional
+  next-keyframe view. Trained from scratch with a NaN-guarded skip-step
+  for LR stability. We also tried a frozen
   [PixArt-Σ-initialised variant](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/models/subgoal_dit_pixart.py)
-  (~620M total, ~20M trainable when the backbone is frozen) swaps the
-  from-scratch backbone for web-pretrained DiT-XL/2 weights — the
-  π0.7-style "start from a model that already knows what scenes look
-  like" experiment.
+  with a thin SigLIP adapter; it didn't transfer (the SigLIP-token vs
+  VAE-latent feature distance is too large for a 14M-param adapter to
+  bridge). The from-scratch DiT is the only world model in the live
+  pipeline. See the whitepaper §10 for the negative-result writeup.
 
 Why feature space? PaliGemma's cross-attention eats SigLIP tokens
 already; predicting pixels just to re-encode them is wasted compute.
@@ -195,16 +196,11 @@ bash openfly/download_train_images.sh           # ~100 GB of train frames
 # P1 — BC baseline
 bash openfly/run_train_paligemma.sh --epochs 10 --batch_size 8
 
-# P2 — SubgoalDiT pretrain (from-scratch, default)
+# P2 — SubgoalDiT pretrain (from-scratch, the live world model)
 bash openfly/run_train_subgoal_dit.sh \
   --epochs 5 --batch_size 8 \
   --depth 12 --hidden 1024 --num_heads 16 \
   --subgoal_pairing mixed --subgoal_semantic_prob 0.25
-
-# P2 — SubgoalDiT with PixArt-Σ web-pretrained backbone
-bash openfly/run_train_subgoal_dit.sh \
-  --pretrained_path <hf-model-id-or-path> \
-  --freeze_backbone --epochs 5 --batch_size 4
 
 # Per-env unseen eval
 for ENV in env_game_gtav env_ue_smallcity env_gs_sjtu02; do

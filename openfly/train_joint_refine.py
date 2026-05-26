@@ -354,8 +354,28 @@ def main(argv: list[str] | None = None) -> int:
         lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
     ).to(device)
     p3_state = torch.load(args.p3_ckpt, map_location=device, weights_only=False)
-    missing, unexpected = model.load_state_dict(p3_state["model"], strict=False)
-    print(f"[train_joint_refine] P3 init — missing={len(missing)} unexpected={len(unexpected)}")
+    # Filter shape-mismatched keys before loading (in case the P3 checkpoint
+    # predates a later policy-architecture change).
+    own = model.state_dict()
+    filtered: dict[str, torch.Tensor] = {}
+    shape_mismatches: list[str] = []
+    for k, v in p3_state["model"].items():
+        if k not in own:
+            continue
+        if tuple(own[k].shape) != tuple(v.shape):
+            shape_mismatches.append(f"{k} ({tuple(v.shape)} → {tuple(own[k].shape)})")
+            continue
+        filtered[k] = v
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    print(
+        f"[train_joint_refine] P3 init — loaded={len(filtered)} "
+        f"missing={len(missing)} unexpected={len(unexpected)} "
+        f"shape_mismatch={len(shape_mismatches)}"
+    )
+    if shape_mismatches:
+        print(f"[train_joint_refine]   shape mismatches (using fresh init):")
+        for m in shape_mismatches:
+            print(f"     {m}")
     processor = _build_processor(args.paligemma_model)
 
     # ----- optimizer with three groups: dit-backbone, dit-adapter, policy-lora, policy-heads

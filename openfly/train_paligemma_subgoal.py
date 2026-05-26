@@ -433,8 +433,35 @@ def main(argv: list[str] | None = None) -> int:
         lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
     ).to(device)
     bc_state = torch.load(args.bc_init_ckpt, map_location=device, weights_only=False)
-    missing, unexpected = model.load_state_dict(bc_state["model"], strict=False)
-    print(f"[train_paligemma_subgoal] BC init — missing={len(missing)} unexpected={len(unexpected)}")
+    # ``strict=False`` ignores missing/unexpected keys but still raises on
+    # SHAPE mismatches. Older BC checkpoints predate the subgoal slot in
+    # ``frame_embed`` (3 → 4 entries) and use a smaller ``progress_head``,
+    # so we filter shape-mismatched keys explicitly and let them stay at
+    # the current architecture's fresh init (they're tiny, learn fast).
+    own = model.state_dict()
+    filtered: dict[str, torch.Tensor] = {}
+    shape_mismatches: list[str] = []
+    for k, v in bc_state["model"].items():
+        if k not in own:
+            continue
+        if tuple(own[k].shape) != tuple(v.shape):
+            shape_mismatches.append(
+                f"{k} ({tuple(v.shape)} → {tuple(own[k].shape)})"
+            )
+            continue
+        filtered[k] = v
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    print(
+        f"[train_paligemma_subgoal] BC init — loaded={len(filtered)} "
+        f"missing={len(missing)} unexpected={len(unexpected)} "
+        f"shape_mismatch={len(shape_mismatches)}"
+    )
+    if shape_mismatches:
+        print(
+            f"[train_paligemma_subgoal]   shape mismatches (using fresh init):"
+        )
+        for m in shape_mismatches:
+            print(f"     {m}")
     processor = _build_processor(args.paligemma_model)
 
     optimizer = torch.optim.AdamW(

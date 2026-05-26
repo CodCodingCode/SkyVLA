@@ -126,30 +126,31 @@ For the long-form motivation see the
 
 ## 5. Training tracks
 
-The repo ships six tracks, three pre-existing and three new for the
+The repo ships five tracks, two pre-existing and three new for the
 world-model direction:
 
 | Track | Trains | Notes |
 |-------|--------|-------|
 | **B1 BC SFT** | PaliGemma LoRA + heads | Offline imitation on `train.json`. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_paligemma.py) |
-| **B2 DAgger** | LoRA + heads | On-policy correction over AirSim scenes. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_dagger.py) |
-| **B3 PPO (OpenFly-Agent 7B)** | LoRA + value head | OpenVLA 7B with PPO + LoRA. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_ppo_openfly_agent.py) |
-| **B4 GRPO (PaliGemma)** | LoRA + heads | On-policy RL with reward presets. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_grpo_paligemma.py) |
-| **B5 Curriculum GRPO** | same as B4 | Easy → medium → hard reward sparsity. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_curriculum_grpo.py) |
+| **B2 PPO (OpenFly-Agent 7B)** | LoRA + value head | OpenVLA 7B with PPO + LoRA. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_ppo_openfly_agent.py) |
+| **B3 GRPO (PaliGemma)** | LoRA + heads | On-policy RL with reward presets. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_grpo_paligemma.py) |
+| **B4 Curriculum GRPO** | same as B3 | Easy → medium → hard reward sparsity. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_curriculum_grpo.py) |
 | **P2 Subgoal-DiT pretrain** *(new)* | DiT only (PaliGemma frozen) | Offline feature-space diffusion. [Code](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_subgoal_dit.py) |
+
+We deliberately do **not** ship a DAgger stage. PPO's on-policy rollouts
+subsume DAgger's distribution-shift fix, and the geometric oracle DAgger
+needs was too weak to teach obstacle avoidance in OpenFly's kinematic env.
 
 Phases that touch the world model:
 
 ```
 P1 BC ─► P2 World-model pretrain ─► P3 BC with subgoals ─► P4 CM distill (opt.)
-   │                                       │
-   └──────────────────────────────────────► P5 DAgger + subgoals
-                                                  │
-                                                  ▼
-                                    P6 PPO/GRPO + curriculum + subgoals
-                                                  │
-                                                  ▼
-                                          Per-env eval
+                                              │
+                                              ▼
+                                P5 PPO/GRPO + curriculum + subgoals
+                                              │
+                                              ▼
+                                      Per-env eval
 ```
 
 The world model is frozen everywhere outside P2 and P4. RL never trains
@@ -174,7 +175,7 @@ the reward stays comparable to OpenFly's eval metrics — see
 ## 7. Evaluation
 
 One harness, [`openfly/eval_benchmark.py`](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/eval_benchmark.py),
-handles every policy (`heuristic`, `paligemma`, `dagger`, `grpo`,
+handles every policy (`heuristic`, `paligemma`, `grpo`,
 `openfly_agent`, `ppo`). Each run writes
 `logs/benchmarks/openfly_<split>_<policy>_<env>.json` with:
 

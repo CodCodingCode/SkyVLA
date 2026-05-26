@@ -24,8 +24,7 @@ Training on a benchmark's **train** split and reporting the held-out **seen / un
 | Heuristic policy | None — closed-form oracle | OpenFly `seen` / `unseen` | Receives the episode goal directly. Always label as oracle. |
 | OpenFly-Agent (7B) | OpenFly `train.json` (RLDS / TFDS) | OpenFly `seen` / `unseen` | Upstream FSDP fine-tune wrapped via [`openfly/run_train_agent.sh`](../openfly/run_train_agent.sh). |
 | Custom PaliGemma BC | OpenFly `train.json` only | OpenFly `seen` / `unseen` | Cross-entropy on the discrete expert actions. |
-| PaliGemma + DAgger | OpenFly `train.json` + on-policy rollouts in `train` AirSim scenes | OpenFly `seen` / `unseen` | DAgger relabels visited states with the goal-oracle heuristic. Train-split AirSim scenes only — eval scenes are untouched. |
-| PaliGemma + GRPO | DAgger checkpoint + online rollouts in `train` scenes | OpenFly `seen` / `unseen` | Reward is computed from `train` episode goals; KL anchor keeps the policy close to DAgger init. |
+| PaliGemma + GRPO | BC checkpoint + online rollouts in `train` scenes | OpenFly `seen` / `unseen` | Reward is computed from `train` episode goals; KL anchor keeps the policy close to the BC init. RL bootstraps directly from BC — no DAgger stage. |
 | OpenFly-Agent + PPO/LoRA | HF checkpoint + online rollouts in `train` scenes | OpenFly `seen` / `unseen` | LoRA on `q_proj`/`v_proj` plus value head; backbone frozen. |
 
 The heuristic policy never sees an image and gets the goal coordinate from the episode definition; numbers from it are an upper bound on geometry, not a vision-language result.
@@ -35,7 +34,7 @@ The heuristic policy never sees an image and gets the goal coordinate from the e
 - "Custom PaliGemma BC policy fine-tuned on OpenFly train; reports `seen=X`, `unseen=Y`." — Yes.
 - "Hierarchical VLA: PaliGemma + LoRA + LSTM head trained on `train.json`, low-level discrete actions decoded directly." — Yes; this is a valid hierarchical method and worth flagging because the action space is shared with the upstream OpenFly-Agent.
 - "Reproduces the OpenFly-Agent baseline within ε using upstream checkpoint plus our eval harness." — Yes, when reporting `--policy openfly-agent`.
-- "SFT → DAgger → GRPO/PPO on the AirSim `train` scenes; eval on held-out `unseen` scenes." — Yes. The RL stage only sees `train`-split AirSim instances (the env wrapper filters to `env_filter=env_airsim_16` by default), and the goal-oracle heuristic used during DAgger only labels states the policy actually visited.
+- "SFT → GRPO/PPO on the AirSim `train` scenes; eval on held-out `unseen` scenes." — Yes. The RL stage only sees `train`-split AirSim instances (the env wrapper filters to `env_filter=env_airsim_16` by default). RL bootstraps directly from the BC checkpoint — there is no DAgger stage.
 
 ## What is not fair
 

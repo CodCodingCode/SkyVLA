@@ -7,9 +7,9 @@ permalink: /a100-setup/
 
 # Running the OpenFly RL system on an A100 host
 
-This guide walks through bringing the repo up on a fresh **A100 40 GB SXM4** instance — the smallest configuration that runs the full pipeline (SFT → DAgger → GRPO → PPO) without modification, plus the AirSim simulator itself.
+This guide walks through bringing the repo up on a fresh **A100 40 GB SXM4** instance — the smallest configuration that runs the full pipeline (SFT → GRPO → PPO) without modification, plus the AirSim simulator itself.
 
-Tested target: **1× A100 40 GB, ~30 vCPU, 200 GB RAM, ≥ 200 GB SSD, x86_64 Ubuntu 22.04**. Any equivalent x86_64 + NVIDIA box works (L40S 48 GB, H100 80 GB, even a single 4090 24 GB if you skip Phase 5).
+Tested target: **1× A100 40 GB, ~30 vCPU, 200 GB RAM, ≥ 200 GB SSD, x86_64 Ubuntu 22.04**. Any equivalent x86_64 + NVIDIA box works (L40S 48 GB, H100 80 GB, even a single 4090 24 GB if you skip Phase 4).
 
 ---
 
@@ -198,7 +198,7 @@ xvfb-run -a bash ~/drone_project/openfly/run_eval.sh \
 
 ### 3.2 Track A — OpenFly-Agent 7B (eval-only on A100 40 GB)
 
-The 7B model fits in inference mode (~14 GB bf16). For RL fine-tuning see Phase 5.
+The 7B model fits in inference mode (~14 GB bf16). For RL fine-tuning see Phase 4.
 
 ```bash
 xvfb-run -a bash ~/drone_project/openfly/run_eval.sh \
@@ -210,7 +210,7 @@ Domain re-SFT via `run_train_agent.sh` (upstream FSDP) needs **multi-GPU** capac
 
 ---
 
-## 4. RL pipeline (Phase 2–5)
+## 4. RL pipeline (Phase 2–4)
 
 ### Gate G2 — smoke-test the Gymnasium env
 
@@ -220,28 +220,23 @@ xvfb-run -a python -m openfly.scripts.smoke_rl_env --episodes 3 --split seen
 
 Drives `AirSimVLNEnv` with the heuristic policy and writes `logs/openfly/rollouts/smoke_rl_env.jsonl`. Watch for finite rewards and `success=True` on at least one episode.
 
-### Phase 3 — DAgger
+### Phase 3 — GRPO on PaliGemma (~22 GB VRAM)
 
-```bash
-xvfb-run -a bash ~/drone_project/openfly/run_train_dagger.sh \
-  --sft_ckpt logs/openfly/paligemma/<timestamp>/last.pt \
-  --iterations 3 --episodes_per_iter 200 --env_filter env_airsim_16
-```
-
-~6–8 hours on a single A100; output at `logs/openfly/dagger/<run>/last.pt`.
-
-### Phase 4 — GRPO on PaliGemma (~22 GB VRAM)
+RL stages bootstrap directly from the SFT checkpoint — no DAgger.
+PPO's on-policy rollouts subsume DAgger's distribution-shift fix,
+and OpenFly's available DAgger oracle is too weak (no obstacle map)
+to be useful here.
 
 ```bash
 xvfb-run -a bash ~/drone_project/openfly/run_train_grpo.sh \
-  --init_ckpt logs/openfly/dagger/<run>/last.pt \
+  --init_ckpt logs/openfly/paligemma/<timestamp>/last.pt \
   --steps 200 --group_size 4 --instructions_per_step 2 \
   --kl_coef 0.02 --eval_every 10 --eval_episodes 8
 ```
 
 This is the primary RL milestone (validation gate G4). Output: `logs/openfly/grpo/<run>/best.pt`.
 
-### Phase 5 — PPO + LoRA on OpenFly-Agent 7B (tight on 40 GB)
+### Phase 4 — PPO + LoRA on OpenFly-Agent 7B (tight on 40 GB)
 
 Default config keeps a frozen reference copy of the 7B for the KL anchor → ~30–36 GB. **On a 40 GB A100 you'll want one of the workarounds:**
 
@@ -307,8 +302,8 @@ I haven't shipped a `RemoteAirsimBridge` module yet — ask if you want it wired
 | `No module named 'msgpack_rpc'` | `pip install msgpack-rpc-python` (setup.sh does this). |
 | AirSim shows black frames | Vulkan failed to bind a GPU; add `xvfb-run -a -s "-screen 0 1024x768x24 +extension GLX +render"` or run with `vulkaninfo` to verify the ICD. |
 | `flash-attn` build fails | OK; `OpenFlyAgentPolicy` falls back to eager attention automatically (a touch slower). |
-| OOM on Phase 5 | Use the small-footprint flags in §4; or rent an 80 GB GPU for that phase only. |
-| Phase 1A FSDP errors | Multi-GPU only; out of scope for a single A100. Use the HF baseline checkpoint and jump to Phase 5 RL. |
+| OOM on Phase 4 | Use the small-footprint flags in §4; or rent an 80 GB GPU for that phase only. |
+| Phase 1A FSDP errors | Multi-GPU only; out of scope for a single A100. Use the HF baseline checkpoint and jump to Phase 4 RL. |
 | HF 403 on `OpenFly_DataGen` | You're logged in but not yet approved. Wait for the dataset gating approval email. |
 
 ---
@@ -332,9 +327,8 @@ bash ~/drone_project/openfly/run_train_paligemma.sh --epochs 10 --batch_size 8
 # Smoke RL env
 xvfb-run -a python -m openfly.scripts.smoke_rl_env --episodes 3
 
-# RL chain
-xvfb-run -a bash ~/drone_project/openfly/run_train_dagger.sh --sft_ckpt logs/openfly/paligemma/<run>/last.pt
-xvfb-run -a bash ~/drone_project/openfly/run_train_grpo.sh   --init_ckpt logs/openfly/dagger/<run>/last.pt
+# RL chain (bootstraps directly from SFT — no DAgger stage)
+xvfb-run -a bash ~/drone_project/openfly/run_train_grpo.sh   --init_ckpt logs/openfly/paligemma/<run>/last.pt
 xvfb-run -a bash ~/drone_project/openfly/run_train_ppo_agent.sh --iterations 30 --episodes_per_iter 2 --minibatch_size 1 --kl_coef 0.0
 
 # Eval the result

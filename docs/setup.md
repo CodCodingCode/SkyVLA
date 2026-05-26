@@ -46,7 +46,6 @@ covers the driver / sim / image-download path in detail.
 | Stage | Script |
 |-------|--------|
 | SFT | [`openfly/run_train_paligemma.sh`](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/run_train_paligemma.sh) |
-| DAgger | [`openfly/run_train_dagger.sh`](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/run_train_dagger.sh) |
 | PPO (OpenFly-Agent 7B) | [`openfly/run_train_ppo_agent.sh`](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/run_train_ppo_agent.sh) |
 | GRPO (single stage) | [`openfly/run_train_grpo.sh`](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/run_train_grpo.sh) |
 | **GRPO curriculum** | [`openfly/run_train_curriculum.sh`](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/run_train_curriculum.sh) |

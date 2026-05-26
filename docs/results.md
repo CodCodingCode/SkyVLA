@@ -26,10 +26,9 @@ appear in
 |--------|-------:|-------------:|----------:|--------:|------------:|
 | B0 Heuristic | TBD | TBD | TBD | TBD | TBD |
 | B1 SFT | TBD | TBD | TBD | TBD | TBD |
-| B2 DAgger | TBD | TBD | TBD | TBD | TBD |
-| B3 RL dense | TBD | TBD | TBD | TBD | TBD |
-| B4 RL cold sparse | TBD | TBD | TBD | TBD | TBD |
-| **B5 RL curriculum** | **TBD** | **TBD** | **TBD** | TBD | TBD |
+| B2 RL dense | TBD | TBD | TBD | TBD | TBD |
+| B3 RL cold sparse | TBD | TBD | TBD | TBD | TBD |
+| **B4 RL curriculum** | **TBD** | **TBD** | **TBD** | TBD | TBD |
 
 ## Sample budget vs unseen SR (curriculum)
 

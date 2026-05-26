@@ -10,7 +10,7 @@ Outdoor aerial vision-language navigation built on the [OpenFly](https://github.
 - a thin evaluation harness around OpenFly's seen / unseen splits and SR / OSR / NE / SPL metrics, with a **per-env breakdown** for the three unseen scenes (`env_game_gtav`, `env_ue_smallcity`, `env_gs_sjtu02`);
 - a wrapper around the official OpenFly-Agent (OpenVLA 7B) FSDP fine-tune;
 - a custom PaliGemma + LoRA + MLP behaviour-cloning policy with its own offline trainer; and
-- an RL pipeline on top of the AirSim bridge — DAgger, GRPO (PaliGemma) with an **easy &rarr; medium &rarr; hard reward curriculum**, and PPO (OpenFly-Agent 7B with LoRA + value head).
+- an RL pipeline on top of the AirSim bridge — GRPO (PaliGemma) with an **easy &rarr; medium &rarr; hard reward curriculum**, and PPO (OpenFly-Agent 7B with LoRA + value head). RL bootstraps directly from the BC checkpoint (no DAgger stage — PPO's on-policy rollouts subsume it, and the geometric oracle DAgger needs was too weak to teach obstacle avoidance in OpenFly's kinematic env).
 
 The research narrative — what we are actually trying to learn from these splits — lives in [`docs/RESEARCH.md`](docs/RESEARCH.md) and on the project site at <https://codcodingcode.github.io/SkyVLA/>. See [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) for design notes on the PaliGemma + LoRA backbone, and [`docs/A100_SETUP.md`](docs/A100_SETUP.md) for end-to-end setup on an x86_64 A100 host.
 
@@ -79,9 +79,8 @@ See [`openfly/README.md`](openfly/README.md) for the full eval / train reference
 drone_project/
 ├── README.md, LICENSE, requirements.txt
 ├── openfly/                 OpenFly eval, dataset, training, RL pipeline, policies
-│   ├── eval_benchmark.py    Main eval harness (heuristic / OpenFly-Agent / PaliGemma / DAgger / GRPO / PPO)
+│   ├── eval_benchmark.py    Main eval harness (heuristic / OpenFly-Agent / PaliGemma / GRPO / PPO)
 │   ├── train_paligemma.py   Offline BC trainer for the custom model
-│   ├── train_dagger.py      DAgger relabel loop on top of the BC checkpoint
 │   ├── train_grpo_paligemma.py   GRPO RL fine-tune for the PaliGemma policy
 │   ├── train_curriculum_grpo.py  Reward-sparsity curriculum (easy -> medium -> hard) on top of GRPO
 │   ├── train_ppo_openfly_agent.py   PPO + LoRA + value head for OpenFly-Agent 7B

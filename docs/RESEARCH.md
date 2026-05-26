@@ -22,9 +22,8 @@ statement could be written from it without overclaiming.
 
 > After imitation on OpenFly `train`, does a reward-sparsity curriculum
 > during online RL improve navigation on **genuinely new scenes**
-> (`env_game_gtav`, `env_ue_smallcity`, `env_gs_sjtu02`) beyond BC and
-> DAgger alone — and **which type of domain shift does RL actually
-> fix**?
+> (`env_game_gtav`, `env_ue_smallcity`, `env_gs_sjtu02`) beyond BC
+> alone — and **which type of domain shift does RL actually fix**?
 
 The contribution we are aiming for is not a new VLN architecture or a
 new benchmark. It is a careful study of when online RL with
@@ -39,7 +38,7 @@ cross-scene splits, and that is what makes them informative.
 
 | Split | File | Episodes | Role in this project |
 |-------|------|----------|----------------------|
-| `train` | [`assets/OpenFly/Annotation/train.json`](https://huggingface.co/datasets/IPEC-COMMUNITY/OpenFly/tree/main/Annotation) | 100,226 | SFT, DAgger, RL rollouts |
+| `train` | [`assets/OpenFly/Annotation/train.json`](https://huggingface.co/datasets/IPEC-COMMUNITY/OpenFly/tree/main/Annotation) | 100,226 | SFT, RL rollouts |
 | `seen` | `seen.json` | 1,800 | Dev / monitoring (same 11 scenes as train) |
 | `unseen` | `unseen.json` | 1,200 | **Primary claim**: 3 never-trained scenes |
 
@@ -61,16 +60,20 @@ altitude as a covariate in the failure analysis.
 ```mermaid
 flowchart LR
     train[Train_100k_episodes_11_scenes] --> SFT[SFT_PaliGemma_BC]
-    SFT --> DAgger[DAgger_on_train_scenes]
-    DAgger --> RL_easy[GRPO_easy_dense_progress]
+    SFT --> RL_easy[GRPO_easy_dense_progress]
     RL_easy --> RL_medium[GRPO_medium_terminal_NE]
     RL_medium --> RL_hard[GRPO_hard_success_SPL_only]
-    DAgger --> RL_baseline_dense[PPO_dense_baseline]
-    DAgger --> RL_baseline_sparse[GRPO_cold_sparse]
+    SFT --> RL_baseline_dense[PPO_dense_baseline]
+    SFT --> RL_baseline_sparse[GRPO_cold_sparse]
     RL_hard --> Eval[Per_env_eval_seen_and_unseen]
     RL_baseline_dense --> Eval
     RL_baseline_sparse --> Eval
 ```
+
+RL stages bootstrap directly from the SFT checkpoint — no DAgger stage.
+PPO's on-policy rollouts subsume DAgger's distribution-shift fix, and
+OpenFly's available DAgger oracle (geometric direction-to-goal, no
+obstacle map) was too weak to teach meaningful obstacle avoidance.
 
 We use [`PaliGemmaVLNPolicy`](../openfly/models/paligemma_vln.py)
 (PaliGemma 3B with LoRA, plus a small cross-attention pool, LSTM, and
@@ -120,10 +123,9 @@ All training checkpoints are evaluated identically: same harness, same
 |-------|--------|--------|------|-------|
 | **B0** Heuristic | [`run_eval.sh --policy heuristic`](../openfly/run_eval.sh) | n/a | n/a | Oracle (gets goal). Sanity check, not a VLM result. |
 | **B1** SFT | [`run_train_paligemma.sh`](../openfly/run_train_paligemma.sh) | n/a | random head | CE on expert actions, full `train`. |
-| **B2** DAgger | [`run_train_dagger.sh`](../openfly/run_train_dagger.sh) | n/a | B1 | On-policy correction in train AirSim scenes. |
-| **B3** RL dense | [`run_train_ppo_agent.sh --dense_progress`](../openfly/run_train_ppo_agent.sh) or `--reward_preset easy` | easy | B2 | Strong baseline; dense shaping. |
-| **B4** RL cold sparse | [`run_train_grpo.sh --reward_preset hard`](../openfly/run_train_grpo.sh) | hard | B2 | Goes straight to sparse; tests whether curriculum is needed. |
-| **B5** RL curriculum | [`run_train_curriculum.sh`](../openfly/run_train_curriculum.sh) | easy -> medium -> hard | B2 | The method we are studying. |
+| **B2** RL dense | [`run_train_ppo_agent.sh --dense_progress`](../openfly/run_train_ppo_agent.sh) or `--reward_preset easy` | easy | B1 | Strong baseline; dense shaping. |
+| **B3** RL cold sparse | [`run_train_grpo.sh --reward_preset hard`](../openfly/run_train_grpo.sh) | hard | B1 | Goes straight to sparse; tests whether curriculum is needed. |
+| **B4** RL curriculum | [`run_train_curriculum.sh`](../openfly/run_train_curriculum.sh) | easy -> medium -> hard | B1 | The method we are studying. |
 
 ### 4.1 Reproducible commands
 
@@ -134,14 +136,14 @@ All training checkpoints are evaluated identically: same harness, same
 bash openfly/scripts/verify_phase0.sh
 
 # Phase 0 — scene binaries (each is multi-GB; only env_airsim_16 is
-# needed for SFT/DAgger/RL training; the three unseen binaries are
-# only needed for the per-env unseen eval).
+# needed for SFT/RL training; the three unseen binaries are only
+# needed for the per-env unseen eval).
 bash openfly/download_scene.sh env_airsim_16
 bash openfly/download_scene.sh env_game_gtav
 bash openfly/download_scene.sh env_ue_smallcity
 bash openfly/download_scene.sh env_gs_sjtu02
 
-# Full B0 -> B5 matrix in one go (run under tmux/nohup; ~hours):
+# Full B0 -> B4 matrix in one go (run under tmux/nohup; ~hours):
 bash openfly/run_experiments.sh
 
 # Or stage-by-stage:
@@ -149,24 +151,19 @@ bash openfly/run_experiments.sh
 # B1: SFT (~10 epochs)
 bash openfly/run_train_paligemma.sh --epochs 10 --batch_size 8
 
-# B2: DAgger from B1
-bash openfly/run_train_dagger.sh \
-  --sft_ckpt logs/openfly/paligemma/<run>/last.pt \
-  --iterations 3 --episodes_per_iter 200
-
-# B3: PPO dense baseline from B2 (using easy preset)
+# B2: PPO dense baseline from B1 (using easy preset)
 bash openfly/run_train_ppo_agent.sh \
   --reward_preset easy \
   --iterations 20 --episodes_per_iter 4
 
-# B4: GRPO cold sparse from B2
+# B3: GRPO cold sparse from B1
 bash openfly/run_train_grpo.sh \
-  --init_ckpt logs/openfly/dagger/<run>/last.pt \
+  --init_ckpt logs/openfly/paligemma/<run>/last.pt \
   --steps 200 --reward_preset hard
 
-# B5: curriculum GRPO from B2
+# B4: curriculum GRPO from B1
 bash openfly/run_train_curriculum.sh \
-  --init_ckpt logs/openfly/dagger/<run>/last.pt \
+  --init_ckpt logs/openfly/paligemma/<run>/last.pt \
   --env_filter env_airsim_16 \
   --steps_easy 80 --steps_medium 60 --steps_hard 60
 ```
@@ -221,17 +218,17 @@ benchmark JSON, plus from the GRPO `rollouts.jsonl`):
   Run with `--inputs 'logs/benchmarks/openfly_unseen_*.json' --output
   docs/failure_modes.md` and copy the resulting tables into
   [`results.md`](results.md).
-* Reward curve per stage of B5 (does the policy keep improving when the
+* Reward curve per stage of B4 (does the policy keep improving when the
   shaping drops?).
 
 ### Success criterion for "research worked"
 
 The study is informative if **either** of the following holds:
 
-1. **B5 beats B2 on at least one unseen env** with the same eval budget,
-   and the ablation shows **B5 also beats B4** (so curriculum, not just
+1. **B4 beats B1 on at least one unseen env** with the same eval budget,
+   and the ablation shows **B4 also beats B3** (so curriculum, not just
    RL, is the credit).
-2. **B5 fails on `env_game_gtav` but improves smallcity / sjtu02**, in
+2. **B4 fails on `env_game_gtav` but improves smallcity / sjtu02**, in
    which case the finding is "RL closes layout/recon gaps but not
    renderer gaps without a domain bridge."
 
@@ -250,10 +247,9 @@ negative finding in a workshop venue, provided the ablations are clean.
 |--------|--------|--------------|-----------|---------|-------------|
 | B0 Heuristic | TBD | TBD | TBD | TBD | TBD |
 | B1 SFT | TBD | TBD | TBD | TBD | TBD |
-| B2 DAgger | TBD | TBD | TBD | TBD | TBD |
-| B3 RL dense | TBD | TBD | TBD | TBD | TBD |
-| B4 RL cold sparse | TBD | TBD | TBD | TBD | TBD |
-| **B5 RL curriculum** | **TBD** | **TBD** | **TBD** | TBD | TBD |
+| B2 RL dense | TBD | TBD | TBD | TBD | TBD |
+| B3 RL cold sparse | TBD | TBD | TBD | TBD | TBD |
+| **B4 RL curriculum** | **TBD** | **TBD** | **TBD** | TBD | TBD |
 
 ### Sample budget vs unseen SR (curriculum)
 

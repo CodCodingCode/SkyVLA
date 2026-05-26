@@ -26,6 +26,6 @@
 ## See also
 
 - [`openfly/README.md`](../openfly/README.md) — eval and training reference for the OpenFly stack.
-- [`openfly/models/paligemma_vln.py`](../openfly/models/paligemma_vln.py) — the OpenFly BC / DAgger / GRPO model.
+- [`openfly/models/paligemma_vln.py`](../openfly/models/paligemma_vln.py) — the OpenFly BC / GRPO model.
 - [`openfly/models/openfly_agent_rl.py`](../openfly/models/openfly_agent_rl.py) — the OpenFly-Agent PPO wrapper.
 - [`openfly/train_paligemma.py`](../openfly/train_paligemma.py) — offline behaviour-cloning trainer.

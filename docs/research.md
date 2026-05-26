@@ -19,7 +19,7 @@ generalisation.
 
 | Split | Episodes | Role |
 |-------|---------:|------|
-| `train` | 100,226 | 11 scenes — SFT, DAgger, RL rollouts |
+| `train` | 100,226 | 11 scenes — SFT, RL rollouts |
 | `seen` | 1,800 | Dev / monitoring on the same 11 scenes |
 | `unseen` | 1,200 | Primary claim — 3 never-trained scenes |
 
@@ -54,16 +54,17 @@ reward stays comparable to the OpenFly leaderboard metric.
 
 ```mermaid
 flowchart LR
-    SFT[B1_SFT_PaliGemma_BC] --> DAgger[B2_DAgger]
-    DAgger --> B3[B3_PPO_dense_baseline]
-    DAgger --> B4[B4_GRPO_cold_sparse]
-    DAgger --> B5e[B5_easy]
-    B5e --> B5m[B5_medium]
-    B5m --> B5h[B5_hard]
-    B3 --> Eval[Per_env_unseen_eval]
-    B4 --> Eval
-    B5h --> Eval
+    SFT[B1_SFT_PaliGemma_BC] --> B2[B2_PPO_dense_baseline]
+    SFT --> B3[B3_GRPO_cold_sparse]
+    SFT --> B4e[B4_easy]
+    B4e --> B4m[B4_medium]
+    B4m --> B4h[B4_hard]
+    B2 --> Eval[Per_env_unseen_eval]
+    B3 --> Eval
+    B4h --> Eval
 ```
+
+RL stages bootstrap directly from the SFT checkpoint — no DAgger stage.
 
 ## Experiment matrix
 
@@ -71,10 +72,9 @@ flowchart LR
 |-------|--------|--------|------|
 | **B0** Heuristic | `run_eval.sh --policy heuristic` | n/a | n/a |
 | **B1** SFT | `run_train_paligemma.sh` | n/a | random head |
-| **B2** DAgger | `run_train_dagger.sh` | n/a | B1 |
-| **B3** RL dense | `run_train_ppo_agent.sh --reward_preset easy` | easy | B2 |
-| **B4** RL cold sparse | `run_train_grpo.sh --reward_preset hard` | hard | B2 |
-| **B5** RL curriculum | `run_train_curriculum.sh` | easy &rarr; medium &rarr; hard | B2 |
+| **B2** RL dense | `run_train_ppo_agent.sh --reward_preset easy` | easy | B1 |
+| **B3** RL cold sparse | `run_train_grpo.sh --reward_preset hard` | hard | B1 |
+| **B4** RL curriculum | `run_train_curriculum.sh` | easy &rarr; medium &rarr; hard | B1 |
 
 The curriculum driver
 ([`openfly/train_curriculum_grpo.py`](https://github.com/CodCodingCode/SkyVLA/blob/main/openfly/train_curriculum_grpo.py))
@@ -90,10 +90,10 @@ for `env_game_gtav`, `env_ue_smallcity`, and `env_gs_sjtu02`.
 
 We consider the study informative when **either**:
 
-1. B5 beats B2 on at least one unseen env with the same eval budget
-   *and* B5 also beats B4 (so the credit goes to the curriculum, not
+1. B4 beats B1 on at least one unseen env with the same eval budget
+   *and* B4 also beats B3 (so the credit goes to the curriculum, not
    just to RL); or
-2. B5 fails on GTA but improves smallcity and sjtu02, in which case the
+2. B4 fails on GTA but improves smallcity and sjtu02, in which case the
    finding is: **RL closes layout/recon gaps but not renderer gaps
    without a domain bridge.**
 

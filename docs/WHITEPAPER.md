@@ -98,7 +98,7 @@ subgoal generator applied to aerial VLN.
 
 The policy backbone is unchanged: PaliGemma 3B with LoRA, the same
 [`PaliGemmaVLNPolicy`](../openfly/models/paligemma_vln.py) that powers
-the BC / DAgger / GRPO tracks already in this repository. The only
+the BC and GRPO tracks already in this repository. The only
 architectural change is that the cross-attention block now also attends
 over a slot of "predicted-subgoal" tokens alongside the current frame
 and history.
@@ -135,8 +135,7 @@ Two design choices specific to SkyVLA are not in any of the above:
 | **P2 World model**| `SubgoalDiT` (PaliGemma frozen) | Learn `(curr_siglip, instruction) → subgoal_siglip`. Uses the π0.7 25/75 pairing on real OpenFly frames. |
 | **P3 BC + subgoals** | PaliGemma LoRA + heads (DiT frozen) | Teach the policy to use subgoal tokens. Mixes oracle (real-frame) and DiT-generated subgoals 50/50 to close the train/test gap. |
 | **P4 CM distill** *(optional)* | A consistency-model student from the P2 teacher | Drop inference cost from 20-step DDIM to 4-step CM. |
-| **P5 DAgger + subgoals** | LoRA + heads (DiT frozen) | On-policy correction in the AirSim env with subgoals attached. |
-| **P6 PPO/GRPO + curriculum + subgoals** | Action head (+ optional LoRA) | Online RL with the easy → medium → hard sparse-reward curriculum already in [`train_curriculum_grpo.py`](../openfly/train_curriculum_grpo.py). |
+| **P5 PPO/GRPO + curriculum + subgoals** | Action head (+ optional LoRA) | Online RL with the easy → medium → hard sparse-reward curriculum already in [`train_curriculum_grpo.py`](../openfly/train_curriculum_grpo.py). PPO's on-policy rollouts subsume DAgger's distribution-shift fix, so we initialize directly from P3 — no DAgger stage. |
 | **Eval** | nothing | Per-env unseen breakdown over `env_game_gtav`, `env_ue_smallcity`, `env_gs_sjtu02`. |
 
 The world model is *never trained inside an RL loop*. P2 and P4 are

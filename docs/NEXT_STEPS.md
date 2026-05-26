@@ -18,10 +18,10 @@ The repository targets the OpenFly outdoor aerial VLN benchmark. This document t
 
 | Component | Status |
 |-----------|--------|
-| OpenFly evaluation harness | Implemented, runs the `heuristic`, `openfly-agent`, `paligemma`, `dagger`, `grpo`, and `ppo` policies |
+| OpenFly evaluation harness | Implemented, runs the `heuristic`, `openfly-agent`, `paligemma`, `grpo`, and `ppo` policies |
 | OpenFly-Agent (OpenVLA 7B) wrapper | [`openfly/run_train_agent.sh`](../openfly/run_train_agent.sh) calls upstream FSDP training |
 | Custom PaliGemma BC policy | [`openfly/train_paligemma.py`](../openfly/train_paligemma.py) — offline cross-entropy on `train.json` |
-| RL pipeline | DAgger / GRPO / PPO trainers under [`openfly/`](../openfly/) with shared Gymnasium env, rewards, and rollout collector |
+| RL pipeline | GRPO / PPO trainers under [`openfly/`](../openfly/) with shared Gymnasium env, rewards, and rollout collector. RL bootstraps directly from the BC checkpoint — no DAgger stage. |
 
 ## Recommended order of work
 
@@ -33,11 +33,10 @@ The repository targets the OpenFly outdoor aerial VLN benchmark. This document t
    - Use a larger history window (`--history_frames 4`).
    - Add the auxiliary body-frame goal regression (already implemented; tune `--aux_goal_weight`).
    - Feed the upstream OpenFly action vector (`openfly.actions.action_id_to_vector`) as a regression target to align with the OpenFly-Agent's continuous head.
-6. **Online RL on top of the BC initialisation.** Implemented as a three-stage pipeline:
+6. **Online RL on top of the BC initialisation.** Implemented as a two-stage pipeline:
    1. Smoke-test the Gymnasium env: `python -m openfly.scripts.smoke_rl_env --episodes 3 --split seen`.
-   2. DAgger between SFT and RL: `bash openfly/run_train_dagger.sh --sft_ckpt <BC>.pt --iterations 3 --episodes_per_iter 200`.
-   3. **Track B (PaliGemma)** — GRPO with a KL anchor: `bash openfly/run_train_grpo.sh --init_ckpt <DAgger>.pt --steps 200 --group_size 4`.
-   4. **Track A (OpenFly-Agent 7B)** — PPO + LoRA + value head: `bash openfly/run_train_ppo_agent.sh --iterations 30 --episodes_per_iter 4`. Heavier than Track B; do this only after GRPO validates the env/reward pipeline.
+   2. **Track B (PaliGemma)** — GRPO with a KL anchor: `bash openfly/run_train_grpo.sh --init_ckpt <BC>.pt --steps 200 --group_size 4`.
+   3. **Track A (OpenFly-Agent 7B)** — PPO + LoRA + value head: `bash openfly/run_train_ppo_agent.sh --iterations 30 --episodes_per_iter 4`. Heavier than Track B; do this only after GRPO validates the env/reward pipeline.
 
    Evaluate the resulting checkpoints with `--policy grpo` or `--policy ppo` (see [`openfly/README.md`](../openfly/README.md) "RL track"). Validation gates G0–G5 from the implementation plan are tracked in the benchmark JSON under `logs/openfly/`.
 

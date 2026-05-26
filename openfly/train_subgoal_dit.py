@@ -370,6 +370,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--num_heads", type=int, default=16)
     parser.add_argument("--num_timesteps", type=int, default=1000)
+    parser.add_argument(
+        "--pretrained_path",
+        type=str,
+        default=None,
+        help="Optional path to a PixArt-Σ HF snapshot directory. When set, "
+        "loads the pretrained transformer backbone (28 layers, hidden=1152, "
+        "with cross-attention to text) via ``PixArtSubgoalDiT`` instead of "
+        "the from-scratch ``SubgoalDiT``. ``--depth``/``--hidden``/"
+        "``--num_heads`` are ignored in that mode (PixArt config wins).",
+    )
+    parser.add_argument(
+        "--freeze_backbone",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Freeze the pretrained PixArt backbone and train only the SigLIP "
+        "I/O adapters + extra-conditioning modules. Smaller VRAM footprint "
+        "but loses the chance to adapt the backbone to aerial features. "
+        "Only relevant with --pretrained_path.",
+    )
 
     # Data
     parser.add_argument("--history_frames", type=int, default=0,
@@ -493,16 +512,32 @@ def main(argv: list[str] | None = None) -> int:
     for p in paligemma.parameters():
         p.requires_grad = False
 
-    dit = SubgoalDiT(
-        token_dim=PaliGemmaFeatureExtractor.FEATURE_DIM,
-        hidden=args.hidden,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        text_dim=PaliGemmaFeatureExtractor.FEATURE_DIM,
-        pose_delta_dim=4,
-        num_last_actions=9,
-        num_timesteps=args.num_timesteps,
-    ).to(device)
+    if args.pretrained_path:
+        from openfly.models.subgoal_dit_pixart import PixArtSubgoalDiT
+        dit = PixArtSubgoalDiT(
+            pretrained_path=args.pretrained_path,
+            token_dim=PaliGemmaFeatureExtractor.FEATURE_DIM,
+            text_dim=PaliGemmaFeatureExtractor.FEATURE_DIM,
+            pose_delta_dim=4,
+            num_last_actions=9,
+            num_timesteps=args.num_timesteps,
+            freeze_backbone=args.freeze_backbone,
+        ).to(device)
+        print(
+            f"[train_subgoal_dit] using PixArt-Σ pretrained backbone "
+            f"from {args.pretrained_path} (freeze={args.freeze_backbone})"
+        )
+    else:
+        dit = SubgoalDiT(
+            token_dim=PaliGemmaFeatureExtractor.FEATURE_DIM,
+            hidden=args.hidden,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            text_dim=PaliGemmaFeatureExtractor.FEATURE_DIM,
+            pose_delta_dim=4,
+            num_last_actions=9,
+            num_timesteps=args.num_timesteps,
+        ).to(device)
 
     processor = _build_processor(args.paligemma_model)
 

@@ -572,17 +572,48 @@ def main(argv: list[str] | None = None) -> int:
         dit.train()
         t0 = time.time()
         loss_sum, n_valid_sum, n_steps = 0.0, 0, 0
+        nan_skip_count = 0
         for step, batch in enumerate(train_loader):
             _apply_warmup(global_step)
             optimizer.zero_grad(set_to_none=True)
             loss, metrics = _train_step(dit, paligemma, processor, batch, device)
             if metrics["n_valid"] == 0:
                 continue
+            # NaN guard: a single bad batch (numerically unlucky timestep
+            # sample, fp16 overflow in the backbone, etc.) shouldn't be
+            # allowed to corrupt the optimizer state. Zero the grads and
+            # skip the step. The PixArt run @ lr=5e-5 spiked to NaN around
+            # gstep 700 — this is the defense-in-depth fix even after we
+            # also lowered the LR.
+            if not torch.isfinite(loss):
+                nan_skip_count += 1
+                if nan_skip_count <= 5 or nan_skip_count % 50 == 0:
+                    print(
+                        f"[train_subgoal_dit] WARN non-finite loss at gstep "
+                        f"{global_step} (total skipped: {nan_skip_count}); "
+                        f"zero-grad and continue"
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                continue
             loss.backward()
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in dit.parameters() if p.requires_grad], args.grad_clip
                 )
+                # Same defense for blown-up gradients: clip_grad_norm_ returns
+                # the pre-clipping norm; if it's non-finite, ``optimizer.step``
+                # would still propagate NaNs into weights even though the
+                # clip "succeeded" on individual elements. Skip.
+                if not torch.isfinite(grad_norm):
+                    nan_skip_count += 1
+                    if nan_skip_count <= 5 or nan_skip_count % 50 == 0:
+                        print(
+                            f"[train_subgoal_dit] WARN non-finite grad_norm at "
+                            f"gstep {global_step} (total skipped: "
+                            f"{nan_skip_count}); zero-grad and continue"
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             optimizer.step()
             global_step += 1
 

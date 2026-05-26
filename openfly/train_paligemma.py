@@ -215,31 +215,96 @@ def _subset_sample_labels(
     return labels
 
 
+def _subset_env_labels(
+    train_subset: "Subset | OpenFlyDataset",
+) -> tuple[np.ndarray, list[str]]:
+    """Per-sample env labels (int ids) for the train subset.
+
+    Returns ``(labels, env_names)`` where ``labels[i]`` indexes into
+    ``env_names``. Used to build the env-stratified sampler so each batch
+    sees a balanced mix of envs (counteracts e.g. env_ue_bigcity being
+    90% of the data on disk).
+    """
+    if isinstance(train_subset, Subset):
+        parent = train_subset.dataset
+        indices = train_subset.indices
+    else:
+        parent = train_subset
+        indices = range(len(parent))
+    episodes = parent._episodes  # noqa: SLF001
+    index = parent._index  # noqa: SLF001
+
+    # First pass: discover env names in this subset, assign stable ids.
+    env_to_id: dict[str, int] = {}
+    raw_envs: list[str] = []
+    for i in indices:
+        ep_i, _ = index[int(i)]
+        env_name = str(episodes[ep_i]["image_path"]).split("/", 1)[0]
+        if env_name not in env_to_id:
+            env_to_id[env_name] = len(env_to_id)
+        raw_envs.append(env_name)
+    labels = np.fromiter(
+        (env_to_id[e] for e in raw_envs), dtype=np.int64, count=len(raw_envs)
+    )
+    env_names = sorted(env_to_id, key=env_to_id.get)
+    return labels, env_names
+
+
 def _make_balanced_sampler(
     train_subset: "Subset | OpenFlyDataset",
     *,
-    num_classes: int,
-) -> tuple[WeightedRandomSampler, np.ndarray]:
-    """Action-stratified ``WeightedRandomSampler`` over the train split.
+    stratify_by: str = "action",
+    num_action_classes: int,
+) -> tuple[WeightedRandomSampler, dict[str, np.ndarray]]:
+    """``WeightedRandomSampler`` stratified by the chosen axis.
 
-    Per-sample sampling weight is ``1 / class_count(label)``, so each
-    class is drawn with equal expected frequency. ``num_samples`` is set
-    to ``len(train_subset)`` so each epoch sees the same volume as the
-    plain ``shuffle=True`` loader (with replacement — minority classes
-    get oversampled, ``fwd_9m`` undersampled). Returns the sampler and
-    the per-class count tensor (for logging).
+    ``stratify_by`` options:
+      * ``"action"`` — weight ∝ 1 / count(action_label). Balances OpenFly's
+        ~53%-fwd_9m action skew.
+      * ``"env"``   — weight ∝ 1 / count(env_label). Balances disk-state
+        env skew (e.g. env_ue_bigcity being 90% of on-disk data).
+      * ``"env_action"`` — weight ∝ 1 / (count(env) * count(action|env)).
+        Combines both; useful once env coverage is itself balanced.
+
+    Returns ``(sampler, info)`` where ``info`` is a small dict of arrays
+    suitable for logging.
     """
-    labels = _subset_sample_labels(train_subset)
-    counts = np.bincount(labels, minlength=num_classes).astype(np.int64)
-    safe = np.maximum(counts, 1).astype(np.float64)
-    class_w = 1.0 / safe
-    sample_w = class_w[labels]
+    info: dict[str, np.ndarray] = {}
+    if stratify_by == "action":
+        labels = _subset_sample_labels(train_subset)
+        counts = np.bincount(labels, minlength=num_action_classes).astype(np.int64)
+        safe = np.maximum(counts, 1).astype(np.float64)
+        sample_w = (1.0 / safe)[labels]
+        info["action_counts"] = counts
+    elif stratify_by == "env":
+        labels, env_names = _subset_env_labels(train_subset)
+        counts = np.bincount(labels, minlength=len(env_names)).astype(np.int64)
+        safe = np.maximum(counts, 1).astype(np.float64)
+        sample_w = (1.0 / safe)[labels]
+        info["env_counts"] = counts
+        info["env_names"] = np.asarray(env_names)
+    elif stratify_by == "env_action":
+        env_labels, env_names = _subset_env_labels(train_subset)
+        act_labels = _subset_sample_labels(train_subset)
+        env_n = len(env_names)
+        joint = env_labels * num_action_classes + act_labels
+        joint_counts = np.bincount(joint, minlength=env_n * num_action_classes).astype(np.int64)
+        safe = np.maximum(joint_counts, 1).astype(np.float64)
+        sample_w = (1.0 / safe)[joint]
+        info["env_counts"] = np.bincount(env_labels, minlength=env_n).astype(np.int64)
+        info["env_names"] = np.asarray(env_names)
+        info["action_counts"] = np.bincount(act_labels, minlength=num_action_classes).astype(np.int64)
+    else:
+        raise ValueError(
+            f"--stratify_by must be one of action/env/env_action, got {stratify_by!r}"
+        )
+
     sampler = WeightedRandomSampler(
         weights=torch.as_tensor(sample_w, dtype=torch.double),
-        num_samples=len(labels),
+        num_samples=len(sample_w),
         replacement=True,
     )
-    return sampler, counts
+    return sampler, info
 
 
 def _format_per_class(
@@ -512,11 +577,18 @@ def main(argv: list[str] | None = None) -> int:
         "--stratified_sampler",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use a ``WeightedRandomSampler`` over the train split so each "
-        "minibatch sees a roughly action-balanced mix (combats OpenFly's "
-        "~53%% fwd_9m dominance). When ON, --compute_class_weights is "
-        "usually redundant — the sampler already corrects imbalance — so "
-        "consider --no-compute_class_weights to avoid double-correction.",
+        help="Use a ``WeightedRandomSampler`` over the train split. See "
+        "--stratify_by for the axis. With --no-stratified_sampler the "
+        "loader falls back to plain shuffle=True.",
+    )
+    parser.add_argument(
+        "--stratify_by",
+        choices=("action", "env", "env_action"),
+        default="env",
+        help="Axis used by the stratified sampler. 'env' balances per-env "
+        "step counts (default — biggest current imbalance is env_ue_bigcity "
+        "≈ 90%% of disk data). 'action' balances OpenFly's action skew. "
+        "'env_action' balances both but needs broad env coverage first.",
     )
     parser.add_argument(
         "--use_progress",
@@ -598,23 +670,32 @@ def main(argv: list[str] | None = None) -> int:
 
     train_sampler: WeightedRandomSampler | None = None
     if args.stratified_sampler:
-        train_sampler, strat_counts = _make_balanced_sampler(
-            train_ds, num_classes=NUM_OPENFLY_ACTIONS
-        )
-        strat_counts_str = ", ".join(
-            f"{c}({TRAINABLE_ACTION_NAMES.get(c, str(c))})={int(strat_counts[c])}"
-            for c in range(NUM_OPENFLY_ACTIONS)
+        train_sampler, strat_info = _make_balanced_sampler(
+            train_ds,
+            stratify_by=args.stratify_by,
+            num_action_classes=NUM_OPENFLY_ACTIONS,
         )
         print(
-            f"[train_paligemma] stratified sampler ON — pre-sampling "
-            f"per-class counts: {strat_counts_str}"
+            f"[train_paligemma] stratified sampler ON (stratify_by={args.stratify_by!r})"
         )
-        if args.compute_class_weights:
+        if "env_counts" in strat_info:
+            env_str = ", ".join(
+                f"{n}={int(c)}"
+                for n, c in zip(strat_info["env_names"], strat_info["env_counts"])
+            )
+            print(f"[train_paligemma]   pre-sampling per-env steps: {env_str}")
+        if "action_counts" in strat_info:
+            counts = strat_info["action_counts"]
+            act_str = ", ".join(
+                f"{c}({TRAINABLE_ACTION_NAMES.get(c, str(c))})={int(counts[c])}"
+                for c in range(NUM_OPENFLY_ACTIONS)
+            )
+            print(f"[train_paligemma]   pre-sampling per-action steps: {act_str}")
+        if args.compute_class_weights and args.stratify_by in ("action", "env_action"):
             print(
-                "[train_paligemma] WARNING: both --stratified_sampler and "
-                "--compute_class_weights are ON. The sampler already "
-                "balances classes; the CE weights will re-amplify rare "
-                "classes (double-correction). Consider "
+                "[train_paligemma] WARNING: --compute_class_weights AND a "
+                "sampler that balances actions are both ON. The two "
+                "double-correct action imbalance. Consider "
                 "--no-compute_class_weights."
             )
 

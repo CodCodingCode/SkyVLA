@@ -356,6 +356,7 @@ class PaliGemmaVLNPolicy(nn.Module):
         with_grad: bool = True,
         subgoal_pose_delta: torch.Tensor | None = None,
         subgoal_horizon: torch.Tensor | None = None,
+        subgoal_tokens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute action logits (and optional goal regression) for one step.
 
@@ -392,14 +393,20 @@ class PaliGemmaVLNPolicy(nn.Module):
             with_grad=with_grad,
         )
 
-        # ---- optional subgoal-DiT pathway ---------------------------------
-        # Generate a predicted subgoal in PaliGemma's 2048-d feature space,
-        # project it into the cross-attention embed space with the dedicated
-        # "predicted subgoal" frame slot, and append to ``image_tokens``.
-        # The cross-attn block downstream is unchanged — it just sees an
-        # extra 256 tokens. With ``subgoal_dit=None`` this whole branch is
-        # a no-op and the policy is identical to the BC baseline.
-        if self.subgoal_dit is not None:
+        # ---- subgoal-token pathway ---------------------------------
+        # Three modes (priority order):
+        #   1. ``subgoal_tokens`` directly supplied → just project + append.
+        #      Used by P3 BC + subgoals (oracle path) and P3.5 joint refine.
+        #   2. ``subgoal_dit`` set on the policy → run DDIM internally to
+        #      generate subgoal tokens. Used at inference / rollout.
+        #   3. Neither → no subgoal pathway at all (identical to BC baseline).
+        # In all cases the cross-attn block downstream is unchanged; it just
+        # sees an extra 256 tokens with a dedicated frame-embedding slot.
+        pred_subgoal_raw: torch.Tensor | None = None
+        if subgoal_tokens is not None:
+            # Caller supplied tokens directly (already in 2048-d SigLIP space)
+            pred_subgoal_raw = subgoal_tokens
+        elif self.subgoal_dit is not None:
             B = image_tokens.shape[0]
             device = image_tokens.device
             if subgoal_pose_delta is None:
@@ -420,6 +427,8 @@ class PaliGemmaVLNPolicy(nn.Module):
                     horizon=horizon,
                     num_steps=self.subgoal_sample_steps,
                 )
+
+        if pred_subgoal_raw is not None:
             # Project into embed_dim and attach the dedicated frame embedding.
             pred_subgoal_emb = self.image_proj(pred_subgoal_raw.to(image_tokens.dtype))
             pred_subgoal_emb = (

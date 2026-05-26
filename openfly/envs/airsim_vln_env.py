@@ -81,6 +81,17 @@ class AirSimVLNEnvConfig:
     # for ``medium`` / ``hard`` so the two knobs stay consistent.
     reward_preset: str | None = None
 
+    # Point-cloud collision check (OpenFly paper §6.2). When True, after
+    # each pose teleport the new position is queried against the scene's
+    # voxelized point cloud; an "inside obstacle" result sets
+    # ``info["collided"]=True``, terminates the episode, and fires the
+    # collision penalty already wired into ``rewards.py``. Scenes
+    # without a published PCD (env_gs_*, env_game_gtav) fall through
+    # without penalty, with a one-time warning at load.
+    collision_check: bool = True
+    collision_voxel_size: float = 3.0   # ≈ smallest OpenFly forward macro
+    collision_expand: int = 0           # dilation radius in voxels (0 = point-drone)
+
     def __post_init__(self) -> None:
         if self.reward_preset is not None:
             self.reward_config = get_reward_preset(self.reward_preset)
@@ -172,6 +183,9 @@ class AirSimVLNEnv(gym.Env if _HAS_GYM else object):  # type: ignore[misc]
         self._eval_mod = eval_mod
         self._current_env_name: str | None = None
         self._pos_ratio: float = 1.0
+        # Per-scene occupancy grid for paper-faithful collision checks
+        # (cf. OpenFly §6.2). Loaded lazily on first reset into a scene.
+        self._occupancy: Any | None = None
 
         # Episode state (set in reset)
         self._episode: dict[str, Any] | None = None
@@ -349,6 +363,19 @@ class AirSimVLNEnv(gym.Env if _HAS_GYM else object):  # type: ignore[misc]
 
         env_name = episode["image_path"].split("/")[0]
         self._ensure_bridge(env_name)
+        # Lazy-load per-scene occupancy on first reset into this scene
+        # (and on scene switch). Subsequent resets to the same scene
+        # are free thanks to the process-global cache in
+        # ``scene_occupancy.get_scene_occupancy``.
+        if self.cfg.collision_check:
+            from openfly.envs.scene_occupancy import get_scene_occupancy
+            self._occupancy = get_scene_occupancy(
+                env_name,
+                voxel_size=self.cfg.collision_voxel_size,
+                expand=self.cfg.collision_expand,
+            )
+        else:
+            self._occupancy = None
         try:
             self._set_pose(self._pose)
             time.sleep(self.cfg.reset_sleep_s)
@@ -411,6 +438,21 @@ class AirSimVLNEnv(gym.Env if _HAS_GYM else object):  # type: ignore[misc]
             self._last_rgb = self._grab_rgb()
         except Exception as exc:
             print(f"[openfly.env] step error: {exc}", flush=True)
+            collided = True
+            terminated = True
+
+        # Point-cloud collision check (OpenFly §6.2). Runs after the sim
+        # teleport succeeded — i.e. AirSim itself ignored the collision
+        # via ``simSetVehiclePose(pose, True)``, but the scene's voxelized
+        # point cloud says "your new pose is inside an obstacle." Treat
+        # this as a terminal failure, same as a hard sim error. Skipped
+        # when ``collision_check=False`` or the scene has no published
+        # PCD (occupancy.available == False → is_occupied always False).
+        if (
+            not collided
+            and self._occupancy is not None
+            and self._occupancy.is_occupied(self._pose[:3])
+        ):
             collided = True
             terminated = True
 

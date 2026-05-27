@@ -594,11 +594,11 @@ def main(argv: list[str] | None = None) -> int:
         "--use_progress",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Feed the dataset's progress scalar into the action head "
-        "(and into the aux progress regression). With --no-use_progress, "
-        "the scalar is masked to None at the trainer boundary so "
-        "progress_proj sees zeros and the aux progress loss is skipped. "
-        "Use to compare baseline vs progress-conditioned model.",
+        help="Enable the aux progress regression head (model never takes "
+        "progress as an input feature — that path was removed to close "
+        "the stop-class shortcut). With --no-use_progress, the aux loss "
+        "is skipped and the progress target is not consumed. The action "
+        "head is unaffected either way.",
     )
     parser.add_argument(
         "--use_sub_instruction",

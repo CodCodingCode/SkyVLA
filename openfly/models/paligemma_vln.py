@@ -6,32 +6,38 @@ actually emits (``openfly.actions.TRAINABLE_ACTION_IDS``). Strafe actions
 logits only burns capacity. The simulator still speaks raw OpenFly ids;
 policy adapters remap argmax → raw id at the env boundary.
 
-Architecture (post-accuracy-fix; LSTM removed):
+Architecture (post-leakage-fix):
 
 * Single RGB stream: current frame keeps all 256 SigLIP tokens, each history
-  frame is pooled to one ``[CLS]`` token via cross-attention. This keeps the
-  scene context for the model's current decision while collapsing the
-  long-horizon temporal signal to a few tokens.
+  frame is pooled to one ``[CLS]`` token via cross-attention. History frames
+  are dropped out entirely with probability ``history_dropout_p`` during
+  training and replaced with a learned ``frame_drop_embed`` mask token —
+  forces the action head to derive context from the current frame +
+  subgoal pathway rather than leaning on temporal continuity.
 * Cross-attention from text tokens into the image-token stack produces a
   scene pool; we add a Gemma "last-text-token" summary (projected from the
   PaliGemma hidden state at the final non-pad text position of the *current*
   frame pass) so both spatial (SigLIP) and lingual (Gemma) context flow into
   the action head.
-* The previous LSTM is gone — we condition the action MLP on
-  ``[scene_summary, pose_feat, last_action_emb]`` directly. ``last_action``
-  is an integer in ``[0, NUM_OPENFLY_ACTIONS]`` (``NUM_OPENFLY_ACTIONS`` is
-  the START sentinel used at ``step == 0``).
+* Action head conditions on ``[scene_summary, pose_feat]`` only. The
+  previous shortcut features — ``progress`` scalar and ``last_action``
+  embedding — were removed: they saturated the floor metric and starved
+  the subgoal cross-attention pathway of gradient. ``last_action`` is
+  still accepted as a forward kwarg because the frozen subgoal DiT
+  consumes it as conditioning; it does not reach the action head.
+  ``progress`` is accepted but ignored.
 * Optional auxiliary head regresses a 3-d next-step body-frame delta from
-  the same fused vector. The model only produces ``goal_pred``; the trainer
-  derives the target from ``next_pose``.
+  the fused vector. A second aux head predicts trajectory progress from
+  the *same* head input (no input-side leakage) — the supervision pushes
+  scene+pose features to encode trajectory phase implicitly.
 
 Trainable components: PaliGemma LoRA adapters (q/k/v/o projections, rank 16
 by default) + image/text/gemma projections + per-frame [CLS] pool +
-cross-attention + pose encoder + last-action embedding + action head.
+frame-drop mask token + cross-attention + pose encoder + action head.
 
 This file intentionally breaks state-dict compatibility with previous
-checkpoints (the LSTM is gone, the action head shrank 10→8, and the
-last-action embedding shrank 11→9); train from scratch.
+checkpoints (last-action embedding and progress projection removed,
+frame-drop embed added); train from scratch.
 """
 
 from __future__ import annotations
@@ -47,9 +53,6 @@ from vla.vla_policy import PaliGemmaFeatureExtractor
 
 # Number of supervised action classes — see ``openfly.actions.TRAINABLE_ACTION_IDS``.
 NUM_OPENFLY_ACTIONS = 8
-# Sentinel value used for ``last_action`` at the first step of an episode.
-# Embedding table therefore has ``NUM_OPENFLY_ACTIONS + 1`` entries.
-LAST_ACTION_START_TOKEN = NUM_OPENFLY_ACTIONS
 
 
 class PaliGemmaVLNPolicy(nn.Module):
@@ -81,12 +84,14 @@ class PaliGemmaVLNPolicy(nn.Module):
         aux_progress_head: bool = True,
         subgoal_dit: SubgoalDiT | None = None,
         subgoal_sample_steps: int = 4,
+        history_dropout_p: float = 0.3,
     ) -> None:
         super().__init__()
         self.history_frames = int(history_frames)
         self.embed_dim = int(embed_dim)
         self.aux_goal_head = bool(aux_goal_head)
         self.aux_progress_head = bool(aux_progress_head)
+        self.history_dropout_p = float(history_dropout_p)
         # Optional generative subgoal world model. ``None`` disables the
         # whole pathway — the policy behaves identically to the BC
         # baseline. When set, its predicted next-keyframe SigLIP tokens
@@ -144,29 +149,26 @@ class PaliGemmaVLNPolicy(nn.Module):
             embed_dim=embed_dim, num_heads=4, batch_first=True
         )
 
-        # Pose features: 4-d pose (x, y, z, yaw).
+        # Learned "history frame dropped" mask token. During training a
+        # Bernoulli draw (prob ``history_dropout_p``) per history-frame
+        # per-sample replaces the pooled CLS with this token, forcing the
+        # action head to justify each prediction from the current frame +
+        # subgoal channel rather than temporal continuity from the past.
+        self.frame_drop_embed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+
+        # Pose features: 4-d pose (x, y, z, yaw) — current robot state.
+        # This is the *only* proprioceptive feature reaching the action
+        # head. ``last_action`` (previously embedded here) was removed:
+        # it correlated trivially with the next action in the
+        # forward_9m-dominated action distribution and saturated the loss
+        # before the subgoal cross-attention pathway could earn its keep.
         self.pose_proj = nn.Sequential(
             nn.Linear(4, 32),
             nn.ELU(),
             nn.Linear(32, 32),
         )
 
-        # Last-action embedding: discrete action id at step-1, with
-        # LAST_ACTION_START_TOKEN as the sentinel for step 0.
-        self.last_action_embed = nn.Embedding(NUM_OPENFLY_ACTIONS + 1, 32)
-
-        # Progress encoder: scalar in [0, 1] → 16-d feature. We pass the
-        # raw scalar through a small MLP; this gives the action head an
-        # explicit "how far through the trajectory am I" signal so the
-        # stop-class can be triggered more decisively as progress → 1.
-        # Targets the OSR–SR gap (flies near goal, never stops).
-        self.progress_proj = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.ELU(),
-            nn.Linear(16, 16),
-        )
-
-        head_in_dim = embed_dim + 32 + 32 + 16
+        head_in_dim = embed_dim + 32
         self.action_head = nn.Sequential(
             nn.Linear(head_in_dim, 512),
             nn.LayerNorm(512),
@@ -177,24 +179,14 @@ class PaliGemmaVLNPolicy(nn.Module):
             nn.Linear(256, NUM_OPENFLY_ACTIONS),
         )
 
-        # Width of the head input WITHOUT the progress feature. The aux
-        # progress head reads from this slice so the supervision target
-        # (the ground-truth progress scalar) can never leak through its
-        # own input feature — the model is forced to predict trajectory
-        # phase from scene + pose + last_action alone.
-        self._head_in_dim_no_progress = embed_dim + 32 + 32
-
         if self.aux_progress_head:
             # Predicts a scalar in [0, 1] = fraction of trajectory traversed
             # at the current step. Trained against the dataset's
-            # ``progress`` field with smooth-L1; output passed through a
-            # sigmoid so the prediction stays in [0, 1] even before the
-            # auxiliary loss converges. Reads from the no-progress slice
-            # to prevent input leakage. At inference time, this is also a
-            # cleaner "where am I in the trajectory" signal than the
-            # ``step_idx / max_steps`` proxy used by the rollout closure.
+            # ``progress`` field with smooth-L1. Supervision pushes
+            # scene+pose features to encode trajectory phase implicitly,
+            # without admitting progress as an input-side shortcut.
             self.progress_head = nn.Sequential(
-                nn.Linear(self._head_in_dim_no_progress, 64),
+                nn.Linear(head_in_dim, 64),
                 nn.ELU(),
                 nn.Linear(64, 1),
                 nn.Sigmoid(),
@@ -292,6 +284,19 @@ class PaliGemmaVLNPolicy(nn.Module):
                 pooled, _ = self.frame_pool(
                     query=cls_query, key=siglip_emb, value=siglip_emb
                 )
+                # History-frame dropout: with prob ``history_dropout_p`` per
+                # sample, replace the pooled CLS with the learned drop
+                # token so the model can't rely on temporal continuity
+                # from this slot. Only active in training mode.
+                if self.training and self.history_dropout_p > 0.0:
+                    drop_mask = (
+                        torch.rand(B, 1, 1, device=pooled.device)
+                        < self.history_dropout_p
+                    )
+                    drop_token = self.frame_drop_embed.to(pooled.dtype).expand(
+                        B, 1, self.embed_dim
+                    )
+                    pooled = torch.where(drop_mask, drop_token, pooled)
                 history_pooled.append(pooled)  # (B, 1, embed_dim)
             gemma_last = gemma_feats
 
@@ -367,7 +372,10 @@ class PaliGemmaVLNPolicy(nn.Module):
             rgb_history: (B, T, H, W, 3) uint8 — empty tensor allowed
             pose: (B, 4) float32 — [x, y, z, yaw]
             last_action: (B,) long — expert action at step-1, or
-                ``LAST_ACTION_START_TOKEN`` (10) for step 0.
+                ``NUM_OPENFLY_ACTIONS`` (= 8) as the START sentinel for
+                step 0. Not read by the action head; passed through to the
+                frozen subgoal DiT, whose embedding table sizes for
+                ``NUM_OPENFLY_ACTIONS + 1`` to accept this value.
             next_pose: (B, 4) float32 — [x, y, z, yaw] of the next step
                 (or current pose at terminal step). Accepted for inference
                 signature parity; the trainer uses it to build the
@@ -455,30 +463,22 @@ class PaliGemmaVLNPolicy(nn.Module):
             scene_summary = cross_attn_pool + gemma_summary
 
         pose_feat = self.pose_proj(pose.to(scene_summary.dtype))
-        last_action_emb = self.last_action_embed(last_action.long())
-        if progress is None:
-            progress_scalar = torch.zeros(
-                pose.shape[0], 1, device=pose.device, dtype=scene_summary.dtype
-            )
-        else:
-            progress_scalar = progress.to(scene_summary.dtype).reshape(-1, 1).clamp(0.0, 1.0)
-        progress_feat = self.progress_proj(progress_scalar)
-        # ``head_in_no_progress`` is the slice the aux progress head reads
-        # from so the supervision target can never leak through its own
-        # input. Action / goal heads see the full ``head_in`` including
-        # progress because that's the conditioning signal we want them
-        # to use.
-        head_in_no_progress = torch.cat(
-            [scene_summary, pose_feat, last_action_emb], dim=-1
-        )
-        head_in = torch.cat([head_in_no_progress, progress_feat], dim=-1)
+        # ``progress`` and ``last_action`` kwargs are accepted for caller
+        # compatibility but do not reach the action head — both were
+        # removed as input features after diagnosing shortcut leakage
+        # (progress directly encoded "time to stop"; last_action ≈
+        # next_action in the forward_9m-dominated distribution).
+        # ``last_action`` is still consumed by the frozen subgoal DiT
+        # above as its trained conditioning input.
+        del progress  # explicitly drop; supervision target lives in the trainer
+        head_in = torch.cat([scene_summary, pose_feat], dim=-1)
 
         action_logits = self.action_head(head_in)
         out: dict[str, torch.Tensor] = {"action_logits": action_logits}
         if self.aux_goal_head:
             out["goal_pred"] = self.goal_head(head_in)
         if self.aux_progress_head:
-            out["progress_pred"] = self.progress_head(head_in_no_progress).squeeze(-1)
+            out["progress_pred"] = self.progress_head(head_in).squeeze(-1)
         return out
 
     @torch.no_grad()
@@ -495,6 +495,7 @@ class PaliGemmaVLNPolicy(nn.Module):
         progress: torch.Tensor | None = None,
         subgoal_pose_delta: torch.Tensor | None = None,
         subgoal_horizon: torch.Tensor | None = None,
+        subgoal_tokens: torch.Tensor | None = None,
     ) -> int:
         out = self.forward(
             instruction_input_ids=instruction_input_ids,
@@ -508,6 +509,7 @@ class PaliGemmaVLNPolicy(nn.Module):
             with_grad=False,
             subgoal_pose_delta=subgoal_pose_delta,
             subgoal_horizon=subgoal_horizon,
+            subgoal_tokens=subgoal_tokens,
         )
         return int(out["action_logits"].argmax(dim=-1).item())
 

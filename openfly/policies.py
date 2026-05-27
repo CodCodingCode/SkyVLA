@@ -155,11 +155,32 @@ class PaliGemmaOpenFlyPolicy(OpenFlyPolicy):
         ).to(self.device)
         ckpt = torch.load(checkpoint, map_location=self.device)
         state = ckpt.get("model", ckpt)
-        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        # Filter out shape-mismatched keys so checkpoints trained under a
+        # prior architecture (e.g. with the old last_action_embed +
+        # progress_proj features feeding a wider action head) still load.
+        # Mirrors the loader pattern in ``train_paligemma_subgoal.py``.
+        own = self.model.state_dict()
+        filtered: dict[str, torch.Tensor] = {}
+        shape_mismatches: list[str] = []
+        for k, v in state.items():
+            if k in own and v.shape != own[k].shape:
+                shape_mismatches.append(
+                    f"{k}: ckpt={tuple(v.shape)} model={tuple(own[k].shape)}"
+                )
+                continue
+            filtered[k] = v
+        missing, unexpected = self.model.load_state_dict(filtered, strict=False)
         if missing:
             print(f"[paligemma] missing keys: {len(missing)} (likely PaliGemma frozen weights)")
         if unexpected:
             print(f"[paligemma] unexpected keys: {len(unexpected)}")
+        if shape_mismatches:
+            print(
+                f"[paligemma] dropped {len(shape_mismatches)} shape-mismatched key(s) "
+                f"(will use fresh init for these):"
+            )
+            for line in shape_mismatches[:10]:
+                print(f"  {line}")
         self.model.eval()
 
         self.processor = AutoProcessor.from_pretrained(paligemma_model)

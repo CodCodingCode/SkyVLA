@@ -2,12 +2,20 @@
 # Phase P2 — pretrain the feature-space SubgoalDiT world model on OpenFly
 # trajectories. PaliGemma is frozen; only the DiT trains.
 #
-# Quick smoke run (1 episode, debug):
+# --pretrained_path is REQUIRED. Random-init plateaus around val_cos≈0.6;
+# starting from PixArt-Σ reaches the same point in a fraction of the
+# steps and keeps climbing. The local snapshot lives at:
+#   ~/assets/pretrained/hf_cache/models--PixArt-alpha--PixArt-Sigma-XL-2-512-MS/snapshots/<hash>/transformer
+#
+# Quick smoke run (8 episodes, debug):
 #   bash openfly/run_train_subgoal_dit.sh \
+#     --pretrained_path <PIXART_DIR> \
 #     --max_episodes 8 --epochs 1 --batch_size 4 --log_every 1
 #
 # Full pretrain (single A100, ~hours per epoch on train.json):
-#   bash openfly/run_train_subgoal_dit.sh --epochs 5 --batch_size 8
+#   bash openfly/run_train_subgoal_dit.sh \
+#     --pretrained_path <PIXART_DIR> \
+#     --epochs 5 --batch_size 8
 set -euo pipefail
 
 DRONE_PROJECT="${DRONE_PROJECT:-$HOME/drone_project}"

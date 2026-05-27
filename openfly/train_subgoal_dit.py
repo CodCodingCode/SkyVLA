@@ -41,7 +41,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 from openfly.dataset import OpenFlyDataset, collate
 from openfly.models.subgoal_dit import SubgoalDiT
@@ -216,6 +216,66 @@ def _body_frame_pose_delta(pose: torch.Tensor, subgoal_pose: torch.Tensor) -> to
 
 
 # ---------------------------------------------------------------------------
+# EMA — exponential moving average of trainable parameters
+# ---------------------------------------------------------------------------
+
+class EMA:
+    """Slow-moving copy of the trainable parameters.
+
+    Standard diffusion-training hygiene. Random-t sampling makes the
+    per-step gradient noisy; the live weights wobble around the optimum
+    even after they've effectively converged. Evaluating and saving a
+    decay=0.9999 EMA copy averages out that wobble — effective window of
+    ~10k steps — and almost always lifts ``val_cos`` by a few points at
+    near-zero compute cost.
+
+    Memory cost: one extra copy of the trainable params on the model's
+    device. For PixArt-Σ-XL (~600M trainable in fp32 ≈ 2.4 GB) this is
+    noticeable but fits comfortably on an A100.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999) -> None:
+        self.decay = float(decay)
+        self.shadow: dict[str, torch.Tensor] = {
+            name: p.detach().clone()
+            for name, p in model.named_parameters()
+            if p.requires_grad
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    p.detach(), alpha=1.0 - self.decay
+                )
+
+    @torch.no_grad()
+    def swap_into(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        """Copy EMA weights into the live model. Returns a backup so the
+        live weights can be restored with :meth:`swap_back`."""
+        backup: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = p.data.clone()
+                p.data.copy_(self.shadow[name])
+        return backup
+
+    @torch.no_grad()
+    def swap_back(self, model: torch.nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        for name, p in model.named_parameters():
+            if name in backup:
+                p.data.copy_(backup[name])
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, sd: dict[str, Any]) -> None:
+        self.decay = float(sd["decay"])
+        self.shadow = {k: v.clone() for k, v in sd["shadow"].items()}
+
+
+# ---------------------------------------------------------------------------
 # Training step
 # ---------------------------------------------------------------------------
 
@@ -225,6 +285,7 @@ def _train_step(
     processor,
     batch: dict[str, Any],
     device: torch.device,
+    min_snr_gamma: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     rgb = batch["rgb"].to(device, non_blocking=True)
     subgoal_rgb = batch["subgoal_rgb"].to(device, non_blocking=True)
@@ -276,6 +337,17 @@ def _train_step(
 
     # Per-sample MSE, then mask out invalid (terminal) subgoals before reducing.
     per_sample = (eps_pred - noise).pow(2).mean(dim=[1, 2])  # (B,)
+
+    # Min-SNR-γ loss weighting (Hang et al. 2023). Vanilla ε-MSE puts large
+    # per-sample loss values on low-SNR (high-t) examples — they dominate the
+    # gradient, low-t precision suffers, cos-sim plateaus. weight = min(snr,γ)/snr
+    # caps the contribution from any one timestep so all t train more evenly.
+    if min_snr_gamma > 0.0:
+        ab_t = dit.alpha_bar[t.long()].to(per_sample.dtype)
+        snr = ab_t / (1.0 - ab_t).clamp(min=1e-8)
+        snr_weight = snr.clamp(max=min_snr_gamma) / snr.clamp(min=1e-8)
+        per_sample = per_sample * snr_weight
+
     mask = valid.to(per_sample.dtype)
     denom = mask.sum().clamp(min=1.0)
     loss = (per_sample * mask).sum() / denom
@@ -293,12 +365,21 @@ def _eval_step(
     processor,
     batch: dict[str, Any],
     device: torch.device,
+    *,
+    num_ddim_steps: int = 20,
 ) -> dict[str, float]:
-    """Validation metrics: MSE on eps + cosine similarity of x0 recovery.
+    """Validation metrics.
 
-    Cosine similarity is the more interpretable signal. We unroll one
-    DDIM step from a single random timestep, compute the implied ``x0``
-    from the predicted noise, and compare to the ground-truth target.
+    Two numbers:
+
+    * ``val_loss`` — single-step ε-MSE at a random timestep. Cheap,
+      directly comparable to the training loss curve; mainly a sanity
+      check that training is generalising.
+    * ``val_cos`` — cosine similarity between **full DDIM-sampled**
+      ``x0`` and the ground-truth subgoal tokens. This is the metric
+      that actually mirrors how the policy will consume the DiT at
+      inference time (the previous single-step recovery massively
+      under- and over-stated quality depending on the random ``t``).
     """
     rgb = batch["rgb"].to(device, non_blocking=True)
     subgoal_rgb = batch["subgoal_rgb"].to(device, non_blocking=True)
@@ -325,6 +406,8 @@ def _eval_step(
     pose_delta = _body_frame_pose_delta(pose, subgoal_pose).to(device)
 
     B = rgb.shape[0]
+
+    # ---- val_loss: single-step ε-MSE (cheap, comparable to train loss) ----
     t = torch.randint(0, dit.num_timesteps, (B,), device=device, dtype=torch.long)
     noise = torch.randn_like(tgt_tokens)
     x_t, noise = dit.q_sample(tgt_tokens, t, noise=noise)
@@ -335,18 +418,26 @@ def _eval_step(
     )
     per_sample_mse = (eps_pred - noise).pow(2).mean(dim=[1, 2])
 
-    ab = dit.alpha_bar[t].to(x_t.dtype).view(-1, 1, 1)
-    x0_pred = (x_t - (1 - ab).sqrt() * eps_pred) / ab.sqrt().clamp(min=1e-6)
-    # Cosine over (sequence × feature) per-sample
-    a = x0_pred.reshape(B, -1)
-    b = tgt_tokens.reshape(B, -1)
+    # ---- val_cos: full DDIM-sampled x0 vs ground-truth subgoal -----------
+    # This is ~20× the compute of the old single-step recovery, but is the
+    # only number that reflects what the policy will actually consume.
+    x0_sampled = dit.ddim_sample(
+        curr_tokens=curr_tokens,
+        text_embed=text_embed,
+        pose_delta=pose_delta,
+        last_action=last_action,
+        horizon=horizon,
+        num_steps=num_ddim_steps,
+    )
+    a = x0_sampled.reshape(B, -1).float()
+    b = tgt_tokens.reshape(B, -1).float()
     cos = F.cosine_similarity(a, b, dim=-1)
 
     mask = valid.to(per_sample_mse.dtype)
     denom = mask.sum().clamp(min=1.0)
     return {
         "val_loss": float((per_sample_mse * mask).sum().item() / denom.item()),
-        "val_cos": float((cos * mask).sum().item() / denom.item()),
+        "val_cos": float((cos * mask.to(cos.dtype)).sum().item() / denom.item()),
         "n_valid": int(mask.sum().item()),
     }
 
@@ -364,6 +455,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.9999,
+        help="Exponential-moving-average decay over trainable params. "
+        "0.9999 ≈ effective averaging window of ~10k steps; standard "
+        "diffusion-training hygiene. Validation runs and best.pt are "
+        "saved with EMA weights. 0 disables EMA entirely.",
+    )
+    parser.add_argument(
+        "--min_snr_gamma",
+        type=float,
+        default=5.0,
+        help="Min-SNR-γ loss weighting (Hang et al. 2023). 5.0 is the paper's "
+        "default; 0 disables. Caps per-timestep loss so high-t (low-SNR) "
+        "samples stop dominating the gradient — typically lifts val_cos by "
+        "5–15 points on ε-prediction DiTs.",
+    )
 
     # DiT hyperparams
     parser.add_argument("--hidden", type=int, default=1024)
@@ -373,12 +482,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--pretrained_path",
         type=str,
-        default=None,
-        help="Optional path to a PixArt-Σ HF snapshot directory. When set, "
-        "loads the pretrained transformer backbone (28 layers, hidden=1152, "
-        "with cross-attention to text) via ``PixArtSubgoalDiT`` instead of "
-        "the from-scratch ``SubgoalDiT``. ``--depth``/``--hidden``/"
-        "``--num_heads`` are ignored in that mode (PixArt config wins).",
+        required=True,
+        help="REQUIRED. Path to a PixArt-Σ HF snapshot directory. The "
+        "pretrained backbone (28 layers, hidden=1152, cross-attention to "
+        "text) is the single biggest training-quality lever for this DiT — "
+        "random init plateaus around val_cos≈0.6 even after long training, "
+        "PixArt init reaches the same point in a fraction of the steps and "
+        "keeps climbing. ``--depth``/``--hidden``/``--num_heads`` are "
+        "ignored (PixArt config wins). Typical path on this machine: "
+        "~/assets/pretrained/hf_cache/models--PixArt-alpha--PixArt-Sigma-XL-2-512-MS/"
+        "snapshots/<hash>/transformer",
     )
     parser.add_argument(
         "--freeze_backbone",
@@ -412,8 +525,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max_episodes", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--env_filter", type=str, default=None)
-    parser.add_argument("--val_frac", type=float, default=0.02)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument(
+        "--val_split",
+        type=str,
+        default="unseen",
+        help="OpenFly split to use for validation — defaults to 'unseen' "
+        "(held-out environments). The previous random_split-on-train setup "
+        "leaked at the per-step level (val step at episode E:47 shared "
+        "trajectory with train E:46/E:48) and inflated val_cos. Pass "
+        "'none' to disable validation entirely. Must differ from --split.",
+    )
+    parser.add_argument(
+        "--val_max_episodes", type=int, default=0,
+        help="Cap loaded episodes in the val split (debug). 0 = use all.",
+    )
+    parser.add_argument(
+        "--val_max_samples", type=int, default=0,
+        help="Cap unrolled steps in the val split (debug). 0 = use all.",
+    )
+    parser.add_argument(
+        "--val_ddim_steps", type=int, default=20,
+        help="DDIM sampling steps used for val_cos. Matches the inference "
+        "default in SubgoalDiT.ddim_sample. Lower = faster eval, less "
+        "faithful to inference quality; 20 is the standard.",
+    )
     parser.add_argument(
         "--require_images",
         action=argparse.BooleanOptionalAction,
@@ -470,7 +606,14 @@ def main(argv: list[str] | None = None) -> int:
     paligemma_dtype = dtype_map[args.paligemma_dtype]
 
     # ----- data ---------------------------------------------------------
-    full_ds = OpenFlyDataset(
+    # Train comes from the train split. Validation comes from a SEPARATE
+    # OpenFly split — by default ``unseen``, i.e. held-out environments
+    # the train split never touched. We deliberately do NOT carve val out
+    # of train with random_split: the previous setup did that at the
+    # per-step level, so a val step at episode E step 47 had train steps
+    # at E:46 and E:48 — visually near-identical frames, severe leak that
+    # inflated val_cos. Use ``--val_split none`` to disable val entirely.
+    train_ds = OpenFlyDataset(
         split=args.split,
         history_frames=args.history_frames,
         env_filter=args.env_filter,
@@ -487,21 +630,39 @@ def main(argv: list[str] | None = None) -> int:
         f"semantic_prob={args.subgoal_semantic_prob} "
         f"uniform_max={args.subgoal_uniform_max}"
     )
-    if len(full_ds) == 0:
+    if len(train_ds) == 0:
         raise RuntimeError("Empty dataset — check OPENFLY_ANNOTATION_DIR / split.")
 
-    val_size = max(1, int(len(full_ds) * args.val_frac)) if args.val_frac > 0 else 0
-    train_size = len(full_ds) - val_size
-    if val_size > 0:
-        train_ds, val_ds = random_split(
-            full_ds, [train_size, val_size],
-            generator=torch.Generator().manual_seed(0),
+    val_ds: OpenFlyDataset | None = None
+    if args.val_split and args.val_split.lower() not in {"none", ""}:
+        if args.val_split == args.split:
+            raise ValueError(
+                f"--val_split={args.val_split!r} matches --split={args.split!r}; "
+                "this would leak. Pick a different OpenFly split (unseen / seen / eval_test)."
+            )
+        val_ds = OpenFlyDataset(
+            split=args.val_split,
+            history_frames=args.history_frames,
+            env_filter=args.env_filter,
+            max_episodes=args.val_max_episodes,
+            max_samples=args.val_max_samples,
+            require_images=args.require_images,
+            oversample_stop=1.0,  # never oversample stops in val — biases the metric
+            subgoal_pairing=args.subgoal_pairing,
+            subgoal_semantic_prob=args.subgoal_semantic_prob,
+            subgoal_uniform_max=args.subgoal_uniform_max,
         )
-    else:
-        train_ds, val_ds = full_ds, None
+        if len(val_ds) == 0:
+            print(
+                f"[train_subgoal_dit] WARNING: val split {args.val_split!r} loaded 0 "
+                "samples — running without validation."
+            )
+            val_ds = None
     print(
-        f"[train_subgoal_dit] split: {train_size} train / {val_size} val "
-        f"(steps/epoch: {math.ceil(train_size / args.batch_size)})"
+        f"[train_subgoal_dit] split: {len(train_ds)} train ({args.split}) / "
+        f"{len(val_ds) if val_ds is not None else 0} val "
+        f"({args.val_split if val_ds is not None else 'disabled'}) "
+        f"(steps/epoch: {math.ceil(len(train_ds) / args.batch_size)})"
     )
 
     train_loader = DataLoader(
@@ -588,6 +749,15 @@ def main(argv: list[str] | None = None) -> int:
         for i, pg in enumerate(optimizer.param_groups)
     }
 
+    ema: EMA | None = None
+    if args.ema_decay > 0.0:
+        ema = EMA(dit, decay=args.ema_decay)
+        n_ema_params = sum(t.numel() for t in ema.shadow.values())
+        print(
+            f"[train_subgoal_dit] EMA enabled: decay={args.ema_decay} "
+            f"shadow_params={n_ema_params/1e6:.1f}M"
+        )
+
     start_epoch = 0
     global_step = 0
     best_val_cos = float("-inf")
@@ -597,6 +767,15 @@ def main(argv: list[str] | None = None) -> int:
         dit.load_state_dict(ckpt["dit"])
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
+        if ema is not None and "ema" in ckpt:
+            ema.load_state_dict(ckpt["ema"])
+            print(f"[train_subgoal_dit] loaded EMA shadow from {args.resume}")
+        elif ema is not None:
+            print(
+                f"[train_subgoal_dit] WARNING: --ema_decay set but checkpoint "
+                f"{args.resume} has no 'ema' key; reinitialising shadow from "
+                f"current weights (EMA history is lost)."
+            )
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         global_step = int(ckpt.get("global_step", 0))
         print(f"[train_subgoal_dit] resumed from {args.resume} @ epoch {start_epoch}")
@@ -621,7 +800,10 @@ def main(argv: list[str] | None = None) -> int:
         for step, batch in enumerate(train_loader):
             _apply_warmup(global_step)
             optimizer.zero_grad(set_to_none=True)
-            loss, metrics = _train_step(dit, paligemma, processor, batch, device)
+            loss, metrics = _train_step(
+                dit, paligemma, processor, batch, device,
+                min_snr_gamma=args.min_snr_gamma,
+            )
             if metrics["n_valid"] == 0:
                 continue
             # NaN guard: a single bad batch (numerically unlucky timestep
@@ -660,6 +842,8 @@ def main(argv: list[str] | None = None) -> int:
                     optimizer.zero_grad(set_to_none=True)
                     continue
             optimizer.step()
+            if ema is not None:
+                ema.update(dit)
             global_step += 1
 
             loss_sum += metrics["loss"] * metrics["n_valid"]
@@ -686,14 +870,25 @@ def main(argv: list[str] | None = None) -> int:
         # ----- val ------------------------------------------------------
         if val_loader is not None:
             dit.eval()
-            vl_sum, cos_sum, vn_sum = 0.0, 0.0, 0
-            for batch in val_loader:
-                m = _eval_step(dit, paligemma, processor, batch, device)
-                if m["n_valid"] == 0:
-                    continue
-                vl_sum += m["val_loss"] * m["n_valid"]
-                cos_sum += m["val_cos"] * m["n_valid"]
-                vn_sum += m["n_valid"]
+            # Evaluate with EMA weights (this is the whole point of EMA);
+            # restore live weights afterwards so training resumes against
+            # the optimizer state that goes with them.
+            ema_backup = ema.swap_into(dit) if ema is not None else None
+            try:
+                vl_sum, cos_sum, vn_sum = 0.0, 0.0, 0
+                for batch in val_loader:
+                    m = _eval_step(
+                        dit, paligemma, processor, batch, device,
+                        num_ddim_steps=args.val_ddim_steps,
+                    )
+                    if m["n_valid"] == 0:
+                        continue
+                    vl_sum += m["val_loss"] * m["n_valid"]
+                    cos_sum += m["val_cos"] * m["n_valid"]
+                    vn_sum += m["n_valid"]
+            finally:
+                if ema is not None and ema_backup is not None:
+                    ema.swap_back(dit, ema_backup)
             train_log["val_loss"] = vl_sum / max(vn_sum, 1)
             train_log["val_cos"] = cos_sum / max(vn_sum, 1)
             train_log["val_n_valid"] = vn_sum
@@ -708,6 +903,10 @@ def main(argv: list[str] | None = None) -> int:
             # mkdir and end-of-epoch save. Idempotent and cheap; cost is
             # one stat call.
             out_dir.mkdir(parents=True, exist_ok=True)
+            # ``last.pt`` is for resumption — carries raw (live) weights
+            # plus the EMA shadow as a separate key. ``best.pt`` is for
+            # inference — its ``dit`` key holds the EMA weights directly
+            # so downstream loaders (eval_p3_subgoals, etc.) work unchanged.
             ckpt_state = {
                 "dit": dit.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -716,6 +915,8 @@ def main(argv: list[str] | None = None) -> int:
                 "args": vars(args),
                 "val_cos": float(train_log.get("val_cos", float("nan"))),
             }
+            if ema is not None:
+                ckpt_state["ema"] = ema.state_dict()
             # 1) Always update ``last.pt`` (atomic).
             tmp_path = out_dir / "last.pt.tmp"
             ckpt_path = out_dir / "last.pt"
@@ -734,7 +935,20 @@ def main(argv: list[str] | None = None) -> int:
                 epochs_since_best = 0
                 best_tmp = out_dir / "best.pt.tmp"
                 best_path = out_dir / "best.pt"
-                torch.save(ckpt_state, best_tmp)
+                # Save EMA weights as the ``dit`` field of best.pt so
+                # inference code loads the EMA-averaged checkpoint without
+                # any change to its loader. The optimizer state is dropped
+                # (best.pt is inference-only).
+                if ema is not None:
+                    best_state = {
+                        **{k: v for k, v in ckpt_state.items()
+                           if k not in {"dit", "optimizer", "ema"}},
+                        "dit": ema.shadow,
+                        "ema_decay": ema.decay,
+                    }
+                else:
+                    best_state = ckpt_state
+                torch.save(best_state, best_tmp)
                 os.replace(best_tmp, best_path)
                 print(
                     f"[train_subgoal_dit] new best val_cos={best_val_cos:.4f}; "

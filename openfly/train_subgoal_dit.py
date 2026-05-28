@@ -286,6 +286,7 @@ def _train_step(
     batch: dict[str, Any],
     device: torch.device,
     min_snr_gamma: float = 0.0,
+    repa_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     rgb = batch["rgb"].to(device, non_blocking=True)
     subgoal_rgb = batch["subgoal_rgb"].to(device, non_blocking=True)
@@ -325,15 +326,31 @@ def _train_step(
     noise = torch.randn_like(tgt_tokens)
     x_t, noise = dit.q_sample(tgt_tokens, t, noise=noise)
 
-    eps_pred = dit(
-        curr_tokens=curr_tokens,
-        noisy_subgoal=x_t,
-        t=t,
-        text_embed=text_embed,
-        pose_delta=pose_delta,
-        last_action=last_action,
-        horizon=horizon,
-    )
+    use_repa = repa_weight > 0.0 and getattr(dit, "repa_proj", None) is not None
+    if use_repa:
+        out = dit(
+            curr_tokens=curr_tokens,
+            noisy_subgoal=x_t,
+            t=t,
+            text_embed=text_embed,
+            pose_delta=pose_delta,
+            last_action=last_action,
+            horizon=horizon,
+            return_repa=True,
+        )
+        eps_pred = out["eps"]
+        repa_hidden = out["repa_hidden"]
+    else:
+        eps_pred = dit(
+            curr_tokens=curr_tokens,
+            noisy_subgoal=x_t,
+            t=t,
+            text_embed=text_embed,
+            pose_delta=pose_delta,
+            last_action=last_action,
+            horizon=horizon,
+        )
+        repa_hidden = None
 
     # Per-sample MSE, then mask out invalid (terminal) subgoals before reducing.
     per_sample = (eps_pred - noise).pow(2).mean(dim=[1, 2])  # (B,)
@@ -352,10 +369,30 @@ def _train_step(
     denom = mask.sum().clamp(min=1.0)
     loss = (per_sample * mask).sum() / denom
 
-    return loss, {
+    metrics: dict[str, float] = {
         "loss": float(loss.item()),
         "n_valid": int(mask.sum().item()),
     }
+
+    # REPA cosine-alignment auxiliary loss.
+    # Encourages an intermediate PixArt block (subgoal half) to align
+    # with the CLEAN target SigLIP tokens, weighted per-token. Cosine
+    # similarity in token space (dim=-1) is the natural metric — same
+    # space as our val_cos. Loss = mean(1 - cos), masked by ``valid``.
+    if use_repa and repa_hidden is not None:
+        # repa_hidden: (B, S, token_dim); tgt_tokens: (B, S, token_dim)
+        repa_cos = F.cosine_similarity(
+            repa_hidden.to(tgt_tokens.dtype), tgt_tokens, dim=-1
+        )  # (B, S)
+        repa_loss_per_sample = (1.0 - repa_cos).mean(dim=-1)  # (B,)
+        repa_loss = (repa_loss_per_sample * mask).sum() / denom
+        loss = loss + repa_weight * repa_loss
+        metrics["repa_loss"] = float(repa_loss.item())
+        metrics["repa_cos"] = float(
+            ((repa_cos.mean(dim=-1)) * mask).sum().item() / float(denom.item())
+        )
+
+    return loss, metrics
 
 
 @torch.no_grad()
@@ -446,7 +483,87 @@ def _eval_step(
 # Main
 # ---------------------------------------------------------------------------
 
+def _install_diagnostics(stack_dump_interval_s: float = 120.0) -> None:
+    """Make silent-death debugging tractable.
+
+    Without these, a long run that's hanging (DataLoader stuck on a
+    corrupt frame, NCCL waiting, etc.) or being killed (timeout, OOM
+    reaper, manual SIGTERM) gives us nothing in the log because Python
+    stdout is block-buffered for non-TTY and frame state is lost on exit.
+
+    What we install:
+      * ``faulthandler.dump_traceback_later(N, repeat=True)`` — every N
+        seconds, dumps a stack trace of every thread to stderr. If the
+        process is stuck, you see WHERE it's stuck without needing
+        py-spy / strace. Repeat=True means it fires once per interval
+        until exit.
+      * ``faulthandler.register(SIGUSR1)`` — send ``kill -USR1 <pid>``
+        to dump a stack on demand without restarting.
+      * ``atexit`` callback that prints the exit reason (clean / signal
+        / unhandled exception) so the last line of the log is never
+        ambiguous.
+      * SIGTERM / SIGINT handlers that flush stdout/stderr before
+        exiting so partial logs survive.
+    """
+    import atexit
+    import faulthandler
+    import signal
+    import sys
+    import threading
+    import traceback
+
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(
+        float(stack_dump_interval_s), repeat=True, exit=False
+    )
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1)
+
+    exit_reason: list[str] = ["clean"]
+
+    def _atexit() -> None:
+        print(
+            f"[train_subgoal_dit] EXIT reason={exit_reason[0]}",
+            flush=True,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+    atexit.register(_atexit)
+
+    def _term_handler(signum, frame) -> None:  # noqa: ARG001
+        exit_reason[0] = f"signal({signum})"
+        # Dump stacks so we know exactly what was running when killed.
+        print(
+            f"[train_subgoal_dit] received signal {signum}; "
+            f"dumping live thread stacks before exit:",
+            file=sys.stderr,
+            flush=True,
+        )
+        for tid, frm in sys._current_frames().items():
+            print(f"--- thread {tid} ---", file=sys.stderr, flush=True)
+            traceback.print_stack(frm, file=sys.stderr)
+        sys.stderr.flush()
+        # Re-raise as SystemExit so atexit + finalizers still run.
+        raise SystemExit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, _term_handler)
+    signal.signal(signal.SIGINT, _term_handler)
+
+    # Mark exceptions in the reason so the EXIT line says "exception".
+    _orig_excepthook = sys.excepthook
+
+    def _excepthook(exc_type, exc_value, tb):
+        exit_reason[0] = f"exception({exc_type.__name__}: {exc_value})"
+        _orig_excepthook(exc_type, exc_value, tb)
+
+    sys.excepthook = _excepthook
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Install diagnostics FIRST so even early failures (arg parsing,
+    # config load, dataset construction) leave breadcrumbs.
+    _install_diagnostics()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--split", default="train")
     parser.add_argument("--epochs", type=int, default=5)
@@ -524,6 +641,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="DiT does not consume history; default 0 to skip extra disk reads.")
     parser.add_argument("--max_episodes", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=0)
+    parser.add_argument(
+        "--per_env_max_episodes",
+        type=int,
+        default=0,
+        help="Cap episodes-per-env when loading the training split. "
+        "Balances contribution across all envs in train.json — without "
+        "this, env_ue_bigcity dominates because it has the most "
+        "downloaded frames locally. 0 = no cap (legacy behaviour). "
+        "Typical value: 2000–3000 to match the smaller envs' available "
+        "data while still capping the large ones.",
+    )
     parser.add_argument("--env_filter", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument(
@@ -545,10 +673,80 @@ def main(argv: list[str] | None = None) -> int:
         help="Cap unrolled steps in the val split (debug). 0 = use all.",
     )
     parser.add_argument(
-        "--val_ddim_steps", type=int, default=20,
-        help="DDIM sampling steps used for val_cos. Matches the inference "
-        "default in SubgoalDiT.ddim_sample. Lower = faster eval, less "
-        "faithful to inference quality; 20 is the standard.",
+        "--val_ood_split",
+        type=str,
+        default="",
+        help="Optional SECOND validation split (e.g. 'seen' if --val_split=unseen "
+        "or vice versa). When set, an extra val pass runs each epoch and "
+        "writes val_ood_loss / val_ood_cos alongside the primary val. "
+        "Distinguishes in-distribution generalisation from OOD generalisation; "
+        "this is the diagnostic that catches DiT overfitting on train.json "
+        "scene textures while looking fine on the in-dist val.",
+    )
+    parser.add_argument("--val_ood_max_episodes", type=int, default=0)
+    parser.add_argument("--val_ood_max_samples", type=int, default=0)
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Adapter / I/O dropout probability fed to PixArtSubgoalDiT "
+        "(input + text + extra-cond paths) and to SubgoalDiT's transformer "
+        "blocks (residual attn + MLP). 0.0 preserves prior behaviour. "
+        "0.1–0.2 helps fight train-set overfit on smaller scene libraries.",
+    )
+    parser.add_argument(
+        "--augment_input",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply input-side image augmentation (brightness/contrast/colour "
+        "jitter/noise) to current + history frames during training. The "
+        "subgoal target frame stays clean. Training only — val datasets "
+        "never augment. Use to decorrelate scene texture from semantic "
+        "content when train.json scene library is narrow.",
+    )
+    # ---- CFG-style conditioning dropout (training only) -----------------
+    # GAIA-2 (arXiv 2503.20523) recipe: per-conditioner drop 50–80%, joint
+    # drop 10%. Direct fix for "Unconditional Priors Matter"
+    # (arXiv 2503.20240) — without this, the DiT memorises per-trajectory
+    # conditioning patterns and val_cos on held-out splits stays near 0
+    # (see docs/TRAIN.md gotcha #5+).
+    parser.add_argument(
+        "--cfg_drop_text", type=float, default=0.0,
+        help="Per-sample probability of dropping the Gemma text embedding "
+        "(replaced with the model's learned null embedding). GAIA-2 used 0.8.",
+    )
+    parser.add_argument("--cfg_drop_pose", type=float, default=0.0)
+    parser.add_argument("--cfg_drop_action", type=float, default=0.0)
+    parser.add_argument("--cfg_drop_horizon", type=float, default=0.0)
+    parser.add_argument(
+        "--cfg_drop_joint", type=float, default=0.0,
+        help="Per-sample probability of dropping ALL conditioners together. "
+        "Trains the pure unconditional branch. GAIA-2 used 0.1.",
+    )
+    # ---- REPA-style representation alignment ---------------------------
+    parser.add_argument(
+        "--repa_layer_idx", type=int, default=0,
+        help="1-indexed PixArt transformer block whose hidden state to "
+        "align (subgoal half) with the clean target SigLIP tokens via "
+        "cosine similarity. 0 disables REPA. PixArt-Σ has 28 blocks; "
+        "REPA paper (arXiv 2410.06940) suggests ~1/3 in, so 8–10. Only "
+        "applied when ``--pretrained_path`` is set (PixArtSubgoalDiT).",
+    )
+    parser.add_argument(
+        "--repa_weight", type=float, default=0.0,
+        help="Weight on the REPA cosine-alignment auxiliary loss. 0.1 is "
+        "a reasonable starting point per the REPA paper. Ignored when "
+        "``--repa_layer_idx 0``.",
+    )
+    parser.add_argument(
+        "--val_ddim_steps", type=int, default=4,
+        help="DDIM sampling steps used for val_cos. Default 4 matches the "
+        "POLICY's inference setting (paligemma_vln.PaliGemmaVLNPolicy "
+        "subgoal_sample_steps=4). Measuring val at higher step counts "
+        "inflates val_cos beyond what the policy actually gets at deploy "
+        "time — earlier baselines (e.g. val_cos=0.61) used 20 and were "
+        "over-optimistic. Bump to 20 only for an offline-only diagnostic "
+        "of the DiT's denoising ceiling.",
     )
     parser.add_argument(
         "--require_images",
@@ -598,6 +796,15 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = out_dir.resolve()
     print(f"[train_subgoal_dit] writing to {out_dir}")
 
+    # Persist args.json up front so we can diff run configs and so that a
+    # mid-training crash still leaves provenance behind. (The previous
+    # 20260528_011713 run lost its config entirely.)
+    try:
+        with open(out_dir / "args.json", "w", encoding="utf-8") as _f:
+            json.dump(vars(args), _f, indent=2, default=str)
+    except OSError as _exc:
+        print(f"[train_subgoal_dit] WARN failed to persist args.json: {_exc}")
+
     dtype_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -619,11 +826,13 @@ def main(argv: list[str] | None = None) -> int:
         env_filter=args.env_filter,
         max_episodes=args.max_episodes,
         max_samples=args.max_samples,
+        per_env_max_episodes=args.per_env_max_episodes,
         require_images=args.require_images,
         oversample_stop=1.0,  # don't oversample stops for the world model
         subgoal_pairing=args.subgoal_pairing,
         subgoal_semantic_prob=args.subgoal_semantic_prob,
         subgoal_uniform_max=args.subgoal_uniform_max,
+        augment_input=args.augment_input,
     )
     print(
         f"[train_subgoal_dit] pairing={args.subgoal_pairing} "
@@ -658,11 +867,44 @@ def main(argv: list[str] | None = None) -> int:
                 "samples — running without validation."
             )
             val_ds = None
+
+    # Optional second val split. Lets us compare in-dist (e.g. 'seen') vs
+    # OOD (e.g. 'unseen') cos sim per epoch — the only honest way to see
+    # whether the DiT is generalising or just memorising training scenes.
+    val_ood_ds: OpenFlyDataset | None = None
+    if args.val_ood_split and args.val_ood_split.lower() not in {"none", ""}:
+        if args.val_ood_split in (args.split, args.val_split):
+            raise ValueError(
+                f"--val_ood_split={args.val_ood_split!r} duplicates "
+                f"--split or --val_split; pick a third distinct OpenFly split."
+            )
+        val_ood_ds = OpenFlyDataset(
+            split=args.val_ood_split,
+            history_frames=args.history_frames,
+            env_filter=args.env_filter,
+            max_episodes=args.val_ood_max_episodes,
+            max_samples=args.val_ood_max_samples,
+            require_images=args.require_images,
+            oversample_stop=1.0,
+            subgoal_pairing=args.subgoal_pairing,
+            subgoal_semantic_prob=args.subgoal_semantic_prob,
+            subgoal_uniform_max=args.subgoal_uniform_max,
+        )
+        if len(val_ood_ds) == 0:
+            print(
+                f"[train_subgoal_dit] WARNING: val_ood split "
+                f"{args.val_ood_split!r} loaded 0 samples — disabling OOD val."
+            )
+            val_ood_ds = None
+
     print(
         f"[train_subgoal_dit] split: {len(train_ds)} train ({args.split}) / "
         f"{len(val_ds) if val_ds is not None else 0} val "
-        f"({args.val_split if val_ds is not None else 'disabled'}) "
-        f"(steps/epoch: {math.ceil(len(train_ds) / args.batch_size)})"
+        f"({args.val_split if val_ds is not None else 'disabled'}) / "
+        f"{len(val_ood_ds) if val_ood_ds is not None else 0} val_ood "
+        f"({args.val_ood_split if val_ood_ds is not None else 'disabled'})  "
+        f"steps/epoch: {math.ceil(len(train_ds) / args.batch_size)}  "
+        f"augment_input={args.augment_input}  dropout={args.dropout}"
     )
 
     train_loader = DataLoader(
@@ -677,6 +919,14 @@ def main(argv: list[str] | None = None) -> int:
             pin_memory=device.type == "cuda",
         )
         if val_ds is not None else None
+    )
+    val_ood_loader = (
+        DataLoader(
+            val_ood_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate,
+            pin_memory=device.type == "cuda",
+        )
+        if val_ood_ds is not None else None
     )
 
     # ----- models -------------------------------------------------------
@@ -699,10 +949,19 @@ def main(argv: list[str] | None = None) -> int:
             num_last_actions=9,
             num_timesteps=args.num_timesteps,
             freeze_backbone=args.freeze_backbone,
+            dropout=args.dropout,
+            cfg_drop_text=args.cfg_drop_text,
+            cfg_drop_pose=args.cfg_drop_pose,
+            cfg_drop_action=args.cfg_drop_action,
+            cfg_drop_horizon=args.cfg_drop_horizon,
+            cfg_drop_joint=args.cfg_drop_joint,
+            repa_layer_idx=args.repa_layer_idx,
         ).to(device)
         print(
             f"[train_subgoal_dit] using PixArt-Σ pretrained backbone "
-            f"from {args.pretrained_path} (freeze={args.freeze_backbone})"
+            f"from {args.pretrained_path} (freeze={args.freeze_backbone}, "
+            f"dropout={args.dropout}, repa_layer={args.repa_layer_idx}, "
+            f"repa_weight={args.repa_weight})"
         )
     else:
         dit = SubgoalDiT(
@@ -714,6 +973,7 @@ def main(argv: list[str] | None = None) -> int:
             pose_delta_dim=4,
             num_last_actions=9,
             num_timesteps=args.num_timesteps,
+            dropout=args.dropout,
         ).to(device)
 
     processor = _build_processor(args.paligemma_model)
@@ -803,6 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
             loss, metrics = _train_step(
                 dit, paligemma, processor, batch, device,
                 min_snr_gamma=args.min_snr_gamma,
+                repa_weight=args.repa_weight,
             )
             if metrics["n_valid"] == 0:
                 continue
@@ -868,15 +1129,14 @@ def main(argv: list[str] | None = None) -> int:
         }
 
         # ----- val ------------------------------------------------------
-        if val_loader is not None:
+        def _run_val_pass(loader, prefix: str) -> None:
+            if loader is None:
+                return
             dit.eval()
-            # Evaluate with EMA weights (this is the whole point of EMA);
-            # restore live weights afterwards so training resumes against
-            # the optimizer state that goes with them.
             ema_backup = ema.swap_into(dit) if ema is not None else None
             try:
                 vl_sum, cos_sum, vn_sum = 0.0, 0.0, 0
-                for batch in val_loader:
+                for batch in loader:
                     m = _eval_step(
                         dit, paligemma, processor, batch, device,
                         num_ddim_steps=args.val_ddim_steps,
@@ -889,9 +1149,15 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 if ema is not None and ema_backup is not None:
                     ema.swap_back(dit, ema_backup)
-            train_log["val_loss"] = vl_sum / max(vn_sum, 1)
-            train_log["val_cos"] = cos_sum / max(vn_sum, 1)
-            train_log["val_n_valid"] = vn_sum
+            train_log[f"{prefix}_loss"] = vl_sum / max(vn_sum, 1)
+            train_log[f"{prefix}_cos"] = cos_sum / max(vn_sum, 1)
+            train_log[f"{prefix}_n_valid"] = vn_sum
+
+        # Evaluate with EMA weights (this is the whole point of EMA);
+        # ``_run_val_pass`` handles the swap and restores live weights so
+        # training resumes against the optimizer state that goes with them.
+        _run_val_pass(val_loader, "val")
+        _run_val_pass(val_ood_loader, "val_ood")
 
         history.append(train_log)
         print(f"[train_subgoal_dit] epoch {epoch} → {train_log}")

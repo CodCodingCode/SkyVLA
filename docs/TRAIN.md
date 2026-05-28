@@ -85,14 +85,19 @@ weights provide image-domain priors; we override the T5 caption
 projection with a fresh `Linear(2048 → 1152)` for Gemma summaries (see
 [implementation.md](implementation.md) for the wrapper-bug history).
 
+**Recommended baseline command** (~10h on A100-40GB with current
+defaults; tune `--per_env_max_episodes` and `--epochs` to time-box):
+
 ```bash
 python -m openfly.train_subgoal_dit \
   --pretrained_path "$PIXART" \
-  --epochs 4 --batch_size 4 \
-  --lr 1e-4 --backbone_lr 1e-6 --adapter_lr 1e-4 \
-  --warmup_steps 1000 \
-  --subgoal_pairing mixed --subgoal_semantic_prob 0.25 --subgoal_uniform_max 4 \
-  --val_split unseen
+  --split train --val_split seen --val_ood_split unseen \
+  --per_env_max_episodes 10000 \
+  --val_max_episodes 100 --val_ood_max_episodes 100 \
+  --val_ddim_steps 4 \
+  --epochs 20 --batch_size 4 \
+  --dropout 0.10 \
+  --early_stop_patience 3
 ```
 
 Notable flags:
@@ -102,27 +107,101 @@ Notable flags:
 | `--backbone_lr` | 1e-6 | LR for the 610M pretrained PixArt-Σ weights. Tiny — heavy LoRA-style finetune. |
 | `--adapter_lr` | 1e-4 | LR for the new from-scratch heads (text_to_caption, extra_modulation, token_in/out). ~100× backbone_lr. |
 | `--subgoal_pairing` | mixed | π0.7 recipe: 25% semantic (end-of-segment) + 75% uniform 0-4s ahead. `--subgoal_semantic_prob` and `--subgoal_uniform_max` tune the mix. |
-| `--val_split` | unseen | Validates on held-out scenes. Random-split-on-train leaked at the per-step level so val_cos inflated; we now use unseen.json. |
-| `--val_ddim_steps` | 20 | DDIM steps for val_cos sampling. Matches inference. |
-| `--num_timesteps` | 1000 | Cosine schedule. |
-| `--ema_decay` | 0.9999 | EMA shadow weights (saved alongside live weights). |
-| `--resume` | None | Resume from a prior `last.pt` (loads weights + optimizer + EMA + epoch counter). |
+| `--per_env_max_episodes` | 0 (no cap) | Cap episodes-per-env when loading train.json. Without this, `env_ue_bigcity` + `env_airsim_sh` together dominate (~36% of episodes) and the model overfits to their visual styles. Recommended **10000** for full data with balance; 2000–3000 for quick diagnostics. |
+| `--val_split` | unseen | Primary held-out val split. Random-split-on-train leaked at the per-step level (adjacent frames in train + val); we now use a separate OpenFly split. |
+| `--val_ood_split` | (off) | Optional **second** val split. Runs a parallel val pass each epoch and logs `val_ood_loss` / `val_ood_cos`. Use to distinguish in-distribution (`val_split=seen`) from out-of-distribution (`val_ood_split=unseen`) generalization. |
+| `--val_max_episodes` / `--val_ood_max_episodes` | 0 (all) | Cap each val pass. **100 each is plenty** — val cost is dominated by DDIM sampling, not statistics. |
+| `--val_ddim_steps` | **4** | DDIM steps for val_cos. Matches the policy's deploy setting (`PaliGemmaVLNPolicy.subgoal_sample_steps=4`). Bumping to 20 measures the DiT's denoising *ceiling*, not deploy quality — see the [val_cos](#val_cos) note. |
+| `--dropout` | 0.0 | Dropout on adapter outputs (PixArt path: `token_in`, `text_to_caption`, `extra_cond`; random-init path: residual attn + MLP inside each DiTBlock). 0.10–0.15 is the useful range; the pretrained PixArt backbone itself is *not* retrofitted. |
+| `--augment_input` | False | Color jitter / brightness / contrast / noise on RGB inputs (current + history only; subgoal target stays clean). **Currently a net loss** — see [Gotchas](#gotchas--hard-won-lessons). |
+| `--ema_decay` | 0.9999 | EMA shadow weights. Best.pt + val both use EMA params. |
+| `--early_stop_patience` | 0 (off) | Stop if `val_cos` (primary) hasn't improved for N consecutive epochs. Pair with a generous `--epochs` ceiling. |
+| `--resume` | None | Resume from a prior `last.pt` (loads weights + optimizer + EMA + epoch counter). Use `--warmup_steps 0` when resuming so the LR schedule doesn't restart. |
 
 **Resume**: P2 takes a long time. Use `--resume <path>/last.pt` to pick
 up where a previous run stopped. Set `--warmup_steps 0` when resuming
 so the LR doesn't ramp down again.
 
-**val_cos**: Cosine similarity between sampled subgoal tokens (4-step
-DDIM at inference, 20-step during val) and the ground-truth future
-SigLIP tokens. Higher = the world model predicts the right
-representation. Random ≈ 0; current best ≈ 0.60. Anything above ~0.85
-would be very strong.
+### val_cos
 
-**Capping dataset for time-boxed runs**: `--max_samples N` truncates
-the train split. Each epoch costs ~(N / batch_size) gradient steps at
-~80 steps/min on an A100-40GB at batch_size=4. So for a 5-hour 3-epoch
-budget: `--max_samples 20000` ≈ 5,000 steps/epoch × 3 = ~3h training +
-~10 min validation.
+Cosine similarity between sampled subgoal tokens and the ground-truth
+future SigLIP tokens. Higher = the world model predicts the right
+representation. Random ≈ 0; current best ≈ 0.60 (measured at 20 DDIM
+steps).
+
+**Important caveat on past numbers**: every `val_cos ≈ 0.61` you'll see
+in older `history.json` files was measured with `--val_ddim_steps 20`,
+i.e. 5× the sampling fidelity the policy actually uses at inference.
+The trainer default is now **4**, matching the policy. So
+deploy-quality val_cos on the same checkpoint will be *lower* than the
+20-step number — that's not a regression, it's the honest measurement.
+Use 20 only as a one-off "denoising ceiling" diagnostic.
+
+**Capping dataset for time-boxed runs**: either `--max_samples N`
+(truncate global) or `--per_env_max_episodes K` (balanced per env). On
+this machine ~25% of train.json steps have local frames after the
+`require_images` filter, so the relationship between cap and usable
+steps roughly tracks:
+
+| `--per_env_max_episodes` | usable train steps | epoch wall time (B=4) |
+| --- | --- | --- |
+| 2000 | ~22k | ~15 min |
+| 3000 | ~30k | ~22 min |
+| 10000 | ~115k | ~45 min |
+| 0 (no cap) | ~180k | ~55 min (but unbalanced) |
+
+### Gotchas / hard-won lessons
+
+These are the failure modes that ate hours of compute before being
+diagnosed. Don't rediscover them.
+
+1. **Sample-level random val splits leak.** The previous trainer carved
+   val out of train via `random_split(full_ds, [train_size, val_size])`.
+   At the per-step level, frame `k` lands in train and frame `k+1`
+   lands in val of the *same* trajectory — visually near-identical,
+   ~100% val accuracy in epoch 1. **Fix**: validate on a separate
+   OpenFly split (`--val_split seen` or `unseen`), never on a random
+   slice of train.
+
+2. **Val cost is dominated by DDIM step count × episodes × number of
+   val splits.** A naive `--val_ddim_steps 20 --val_max_episodes 200`
+   on two val splits was ~30k PixArt forwards per epoch — about 4h of
+   the 5h epoch wall time was *just* val. **Fix**: `--val_ddim_steps 4`
+   (matches deploy) + `--val_max_episodes 100`. 10× faster val,
+   sub-statistic noise on 100 episodes.
+
+3. **`--val_ddim_steps` defaulted to 20 while the policy deploys at 4.**
+   That made every old val_cos number an inflated ceiling. The default
+   is now 4. See the [val_cos](#val_cos) note for what this means
+   for historical comparison.
+
+4. **Without `--per_env_max_episodes`, `env_ue_bigcity` + `env_airsim_sh`
+   dominate.** Together they account for ~36% of train.json episodes.
+   The DiT learns those two envs' textures and can't generalize. **Fix**:
+   `--per_env_max_episodes 10000` caps both at 10k, leaves the other 9
+   envs uncapped (their natural counts), and produces a ~88k-episode
+   balanced training set instead of a 100k unbalanced one.
+
+5. **Aggressive `--augment_input` hurt val_cos on both splits** (0.61 →
+   0.0004 in one run with dropout=0.15 + aug). The hypothesis: PaliGemma
+   was pretrained on a specific image-normalization regime; color jitter
+   / brightness / additive noise on RGB inputs produce SigLIP tokens
+   that don't match what the DiT is supposed to predict, and the
+   EMA-averaged weights track the perturbed-input regime instead of the
+   clean target. **Default it off** until we have a milder augmentation
+   that preserves SigLIP-feature stability.
+
+6. **`require_images` filters silently drop ~75% of train.json on this
+   machine.** Only ~400k of ~1.6M frame files are downloaded locally;
+   the dataset skips trajectories with missing frames. The reported
+   "train steps" in the trainer log are what's *actually* usable, not
+   what's in train.json.
+
+7. **Old PixArt runs' `args.json` was sometimes missing.** The trainer
+   now persists `args.json` to the run directory at startup, so every
+   run's config is recoverable. If you're comparing to a run before
+   that change, check the checkpoint's internal `args` dict (the
+   trainer also embeds args in `last.pt` / `best.pt`).
 
 ---
 

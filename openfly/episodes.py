@@ -41,7 +41,20 @@ def load_episodes(
     root: Path | None = None,
     max_episodes: int = 0,
     env_filter: str | None = None,
+    per_env_max_episodes: int = 0,
 ) -> list[dict[str, Any]]:
+    """Load OpenFly episodes for a split.
+
+    Filtering precedence (applied in this order):
+      1. ``env_filter``: substring match on ``image_path[0]`` (env name).
+      2. ``per_env_max_episodes``: cap episodes-per-env in the natural
+         json ordering. Use this to balance training across all envs
+         when total data is otherwise dominated by one env (e.g.
+         env_ue_bigcity is ~3x the next-largest env in the local image
+         dump). Same envs will still appear in the same relative order
+         as the source json — we just stop after N episodes of each.
+      3. ``max_episodes``: global cap, applied last.
+    """
     path = annotation_path(split, root)
     if not path.is_file():
         raise FileNotFoundError(
@@ -52,6 +65,15 @@ def load_episodes(
         data = json.load(f)
     if env_filter:
         data = [ep for ep in data if env_filter in ep.get("image_path", "")]
+    if per_env_max_episodes > 0:
+        counts: dict[str, int] = {}
+        filtered: list[dict[str, Any]] = []
+        for ep in data:
+            env = ep.get("image_path", "").split("/")[0]
+            if counts.get(env, 0) < per_env_max_episodes:
+                counts[env] = counts.get(env, 0) + 1
+                filtered.append(ep)
+        data = filtered
     if max_episodes > 0:
         data = data[:max_episodes]
     return data

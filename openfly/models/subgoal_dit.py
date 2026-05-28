@@ -109,7 +109,13 @@ class DiTBlock(nn.Module):
     residual) so the model starts as a no-op on the noisy half.
     """
 
-    def __init__(self, hidden: int, num_heads: int, mlp_ratio: float = 4.0) -> None:
+    def __init__(
+        self,
+        hidden: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden, elementwise_affine=False, eps=1e-6)
         self.attn = nn.MultiheadAttention(
@@ -130,6 +136,10 @@ class DiTBlock(nn.Module):
         # starts at zero — training is stable from step 0.
         nn.init.zeros_(self.ada_ln[-1].weight)
         nn.init.zeros_(self.ada_ln[-1].bias)
+        # Residual dropout on attention and MLP outputs (DiT-Zero variant of
+        # standard transformer dropout). 0 = identity, matching legacy behaviour.
+        self.attn_drop = nn.Dropout(float(dropout))
+        self.mlp_drop = nn.Dropout(float(dropout))
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -137,9 +147,9 @@ class DiTBlock(nn.Module):
         )
         h = _modulate(self.norm1(x), shift_msa, scale_msa)
         attn_out, _ = self.attn(query=h, key=h, value=h, need_weights=False)
-        x = x + gate_msa.unsqueeze(1) * attn_out
+        x = x + gate_msa.unsqueeze(1) * self.attn_drop(attn_out)
         h = _modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(h)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp_drop(self.mlp(h))
         return x
 
 
@@ -219,14 +229,17 @@ class SubgoalDiT(nn.Module):
         pose_delta_dim: int = 4,
         num_last_actions: int = 9,
         num_timesteps: int = 1000,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.token_dim = int(token_dim)
         self.hidden = int(hidden)
         self.num_timesteps = int(num_timesteps)
+        self.dropout_p = float(dropout)
 
         # Token I/O projections (shared between current and noisy subgoal halves)
         self.token_in = nn.Linear(token_dim, hidden)
+        self.input_drop = nn.Dropout(self.dropout_p)
         self.final = FinalLayer(hidden, token_dim)
 
         # Role embedding: 0 = current SigLIP, 1 = noisy subgoal SigLIP.
@@ -255,7 +268,10 @@ class SubgoalDiT(nn.Module):
 
         # DiT stack
         self.blocks = nn.ModuleList(
-            [DiTBlock(hidden, num_heads, mlp_ratio) for _ in range(depth)]
+            [
+                DiTBlock(hidden, num_heads, mlp_ratio, dropout=self.dropout_p)
+                for _ in range(depth)
+            ]
         )
 
         # Noise schedule (registered as a buffer so it follows ``.to(device)``)
@@ -310,8 +326,8 @@ class SubgoalDiT(nn.Module):
             f"shape mismatch: curr {curr_tokens.shape} vs noisy {noisy_subgoal.shape}"
         )
 
-        x_curr = self.token_in(curr_tokens)
-        x_sub = self.token_in(noisy_subgoal)
+        x_curr = self.input_drop(self.token_in(curr_tokens))
+        x_sub = self.input_drop(self.token_in(noisy_subgoal))
         # Add role embeddings (broadcast over the sequence axis)
         x_curr = x_curr + self.role_embed.weight[0]
         x_sub = x_sub + self.role_embed.weight[1]

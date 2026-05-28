@@ -124,6 +124,57 @@ def _resolve_frame(image_root: Path, image_path: str, index: str) -> Path | None
 _BAD_IMAGE_PATHS: set[str] = set()
 
 
+def _make_aug_params(rng: random.Random) -> dict[str, float] | None:
+    """Sample one set of input-image augmentation parameters.
+
+    Returns ``None`` half the time so roughly 50% of training samples see
+    the unaugmented frame — keeps the model anchored on the real visual
+    distribution.
+
+    The four knobs target the failure mode where the DiT memorises
+    scene-specific textures (a city in env_airsim_16) instead of learning
+    transferable spatial structure: color/brightness/contrast jitter
+    decorrelates pixel statistics from semantic content, and the noise
+    floor prevents memorising exact pixel patterns.
+    """
+    if rng.random() < 0.5:
+        return None
+    return {
+        "brightness": rng.uniform(0.85, 1.15),
+        "contrast": rng.uniform(0.85, 1.15),
+        "channel_shift_r": rng.uniform(-12.0, 12.0),
+        "channel_shift_g": rng.uniform(-12.0, 12.0),
+        "channel_shift_b": rng.uniform(-12.0, 12.0),
+        "noise_std": rng.uniform(0.0, 6.0),
+    }
+
+
+def _apply_aug(rgb_uint8: np.ndarray, params: dict[str, float] | None) -> np.ndarray:
+    """Apply a sampled aug-param dict to one RGB uint8 frame.
+
+    Same params used across the current frame and all history frames of a
+    sample (consistency over time so the model can't infer "this is the
+    current frame" from differing aug strength). Subgoal frame is *not*
+    augmented — it's the canonical target the DiT must reconstruct.
+    """
+    if params is None:
+        return rgb_uint8
+    arr = rgb_uint8.astype(np.float32)
+    # Brightness + contrast around the per-pixel mean.
+    mean = arr.mean(axis=(0, 1), keepdims=True)
+    arr = (arr - mean) * params["contrast"] + mean * params["brightness"]
+    # Per-channel color shift.
+    arr[..., 0] += params["channel_shift_r"]
+    arr[..., 1] += params["channel_shift_g"]
+    arr[..., 2] += params["channel_shift_b"]
+    # Gaussian noise on raw pixel scale.
+    if params["noise_std"] > 0.0:
+        arr = arr + np.random.normal(0.0, params["noise_std"], size=arr.shape).astype(
+            np.float32
+        )
+    return np.clip(arr, 0.0, 255.0).astype(np.uint8)
+
+
 def _load_rgb(path: Path | None, image_size: int = 224) -> np.ndarray:
     """Load an RGB image to (H, W, 3) uint8.
 
@@ -277,17 +328,28 @@ class OpenFlyDataset(Dataset):
         env_filter: str | None = None,
         max_episodes: int = 0,
         max_samples: int = 0,
+        per_env_max_episodes: int = 0,
         require_images: bool = False,
         oversample_stop: float = 2.0,
         subgoal_pairing: str = "mixed",
         subgoal_semantic_prob: float = 0.25,
         subgoal_uniform_max: int = 4,
+        augment_input: bool = False,
     ) -> None:
         self.image_root = Path(image_root) if image_root else default_image_root()
         self.history_frames = max(0, int(history_frames))
         self.image_size = int(image_size)
         self.require_images = require_images
         self.oversample_stop = float(oversample_stop)
+        # Input-image augmentation (color jitter, brightness/contrast,
+        # gaussian noise). Applied only to ``rgb`` and ``history`` —
+        # ``subgoal_rgb`` is the supervision target and stays clean.
+        # Use to fight scene-texture overfit in the DiT / policy when
+        # train.json scenes don't cover the test distribution.
+        self.augment_input = bool(augment_input)
+        # Per-instance RNG so workers see different augmentation streams
+        # without affecting Python's global random state.
+        self._aug_rng = random.Random(0)
         valid_modes = {"semantic_only", "uniform_only", "mixed"}
         if subgoal_pairing not in valid_modes:
             raise ValueError(
@@ -301,7 +363,24 @@ class OpenFlyDataset(Dataset):
             split,
             max_episodes=max_episodes,
             env_filter=env_filter,
+            per_env_max_episodes=per_env_max_episodes,
         )
+        # Surface the per-env breakdown of what actually loaded so the
+        # training log shows whether the cap balanced the data the way
+        # we expected. Helpful when ``per_env_max_episodes`` interacts
+        # with envs that have only a few hundred episodes available.
+        if per_env_max_episodes > 0 or env_filter:
+            from collections import Counter
+            env_counts = Counter(
+                ep.get("image_path", "").split("/")[0] for ep in episodes
+            )
+            print(
+                f"[openfly.dataset] {split}: episodes per env (cap="
+                f"{per_env_max_episodes or 'none'}): "
+                + ", ".join(
+                    f"{e}={n}" for e, n in sorted(env_counts.items(), key=lambda x: -x[1])
+                )
+            )
 
         # Flatten to per-step records: (episode_idx, step_idx)
         index: list[tuple[int, int]] = []
@@ -447,6 +526,20 @@ class OpenFlyDataset(Dataset):
             history = np.zeros((0, self.image_size, self.image_size, 3), dtype=np.uint8)
         else:
             history = np.stack(history_imgs, axis=0)
+
+        # Apply input-side augmentation (consistent params across the
+        # current frame and all history frames of this sample). The
+        # subgoal frame downstream is NOT augmented — that's the clean
+        # reconstruction target.
+        if self.augment_input:
+            aug = _make_aug_params(self._aug_rng)
+            if aug is not None:
+                rgb = _apply_aug(rgb, aug)
+                if history.shape[0] > 0:
+                    history = np.stack(
+                        [_apply_aug(history[k], aug) for k in range(history.shape[0])],
+                        axis=0,
+                    )
 
         traj_len = min(len(actions), len(indices))
         progress = float(step) / float(max(1, traj_len - 1))

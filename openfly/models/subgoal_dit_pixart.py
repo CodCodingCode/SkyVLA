@@ -71,10 +71,53 @@ class PixArtSubgoalDiT(nn.Module):
         num_last_actions: int = 9,
         num_timesteps: int = 1000,
         freeze_backbone: bool = False,
+        dropout: float = 0.0,
+        # ---- CFG-style conditioning dropout (training only) -------------
+        # Independent per-conditioner drop probabilities. Matches the
+        # GAIA-2 recipe (arXiv 2503.20523 §3.3): high per-conditioner
+        # drop rates (~50–80%) prevent the unconditional branch from
+        # collapsing and force the model to actually use each
+        # conditioning signal rather than memorise per-trajectory
+        # patterns. ``cfg_drop_joint`` additionally drops ALL
+        # conditioners together so the model sees pure noise → ε mapping.
+        # See "Unconditional Priors Matter" (arXiv 2503.20240) for the
+        # explicit diagnosis this counters.
+        cfg_drop_text: float = 0.0,
+        cfg_drop_pose: float = 0.0,
+        cfg_drop_action: float = 0.0,
+        cfg_drop_horizon: float = 0.0,
+        cfg_drop_joint: float = 0.0,
+        # ---- REPA-style representation alignment (training only) -------
+        # Auxiliary cosine-similarity loss between an intermediate PixArt
+        # block's hidden state (subgoal half, projected back to SigLIP
+        # space) and the clean target SigLIP tokens. Forces semantic
+        # alignment with the target representation early in the network
+        # — typically gives ~10× convergence speedup and fights
+        # per-trajectory memorisation. See REPA (arXiv 2410.06940).
+        # ``repa_layer_idx`` of 0 disables the hook entirely (no
+        # projection layer is built either).
+        repa_layer_idx: int = 0,
     ) -> None:
         super().__init__()
         self.token_dim = int(token_dim)
         self.num_timesteps = int(num_timesteps)
+        # Dropout applied to the *adapter* outputs (token_in, text_to_caption,
+        # extra_cond). The pretrained PixArt blocks themselves aren't
+        # retrofitted with dropout — their internal distributions are
+        # tuned to the pretraining regime and adding dropout there would
+        # destabilise the priors we're trying to preserve.
+        self.dropout_p = float(dropout)
+        self.input_drop = nn.Dropout(self.dropout_p)
+        self.text_drop = nn.Dropout(self.dropout_p)
+        self.extra_drop = nn.Dropout(self.dropout_p)
+        # CFG-style conditioning dropout knobs.
+        self.cfg_drop_text = float(cfg_drop_text)
+        self.cfg_drop_pose = float(cfg_drop_pose)
+        self.cfg_drop_action = float(cfg_drop_action)
+        self.cfg_drop_horizon = float(cfg_drop_horizon)
+        self.cfg_drop_joint = float(cfg_drop_joint)
+        # REPA hook config.
+        self.repa_layer_idx = int(repa_layer_idx)
 
         from diffusers import PixArtTransformer2DModel
         backbone = PixArtTransformer2DModel.from_pretrained(
@@ -153,6 +196,28 @@ class PixArtSubgoalDiT(nn.Module):
         nn.init.zeros_(self.extra_modulation[-1].weight)
         nn.init.zeros_(self.extra_modulation[-1].bias)
 
+        # ---- Learned null embedding for CFG text dropout --------------
+        # When ``cfg_drop_text`` (or joint drop) fires, replace the
+        # batch element's text_embed with this learned vector before the
+        # text_to_caption adapter. Small-std init so the initial
+        # unconditional pass behaves like a near-zero text condition;
+        # the model can then learn what "no caption" should look like.
+        self.null_text_embed = nn.Parameter(torch.zeros(1, text_dim))
+        nn.init.normal_(self.null_text_embed, std=0.02)
+
+        # ---- REPA-style projection head -------------------------------
+        # Maps the captured intermediate PixArt hidden (1152-d) back into
+        # the SigLIP token space (token_dim, default 2048) so we can
+        # compute cos sim against the clean subgoal target. Only
+        # instantiated when REPA is enabled to avoid extra param count
+        # in disabled configs.
+        if self.repa_layer_idx > 0:
+            self.repa_proj = nn.Linear(self.HIDDEN_DIM, token_dim)
+            nn.init.normal_(self.repa_proj.weight, std=0.02)
+            nn.init.zeros_(self.repa_proj.bias)
+        else:
+            self.repa_proj = None
+
         # ---- Diffusion schedule (buffer follows .to(device)) ---------
         alpha_bar = cosine_alpha_bar(self.num_timesteps)
         self.register_buffer("alpha_bar", alpha_bar, persistent=False)
@@ -167,7 +232,13 @@ class PixArtSubgoalDiT(nn.Module):
         n_total = sum(p.numel() for p in self.parameters())
         print(
             f"[pixart_subgoal_dit] backbone={'frozen' if freeze_backbone else 'trainable'} "
-            f"params trainable={n_train:,} total={n_total:,}"
+            f"params trainable={n_train:,} total={n_total:,} "
+            f"adapter_dropout={self.dropout_p:.2f} "
+            f"cfg_drop[text/pose/action/horizon/joint]="
+            f"{self.cfg_drop_text:.2f}/{self.cfg_drop_pose:.2f}/"
+            f"{self.cfg_drop_action:.2f}/{self.cfg_drop_horizon:.2f}/"
+            f"{self.cfg_drop_joint:.2f} "
+            f"repa_layer={self.repa_layer_idx}"
         )
 
     # ---- Optimizer parameter groups -------------------------------
@@ -231,15 +302,46 @@ class PixArtSubgoalDiT(nn.Module):
         pose_delta: torch.Tensor,       # (B, pose_delta_dim)
         last_action: torch.Tensor,      # (B,) long
         horizon: torch.Tensor,          # (B,) long
-    ) -> torch.Tensor:
-        """Return ε-prediction on the noisy subgoal half: (B, 256, token_dim)."""
+        return_repa: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Return ε-prediction on the noisy subgoal half: (B, 256, token_dim).
+
+        With ``return_repa=True``, returns a dict
+        ``{"eps": eps_pred, "repa_hidden": projected_intermediate}`` so
+        the trainer can compute an auxiliary REPA cosine loss. The
+        ``repa_hidden`` is the subgoal-half hidden state at block index
+        ``repa_layer_idx``, projected through ``repa_proj`` back into
+        SigLIP space (B, 256, token_dim).
+        """
         B, S, _ = curr_tokens.shape
         assert noisy_subgoal.shape == curr_tokens.shape
         device = curr_tokens.device
 
+        # ---- CFG-style conditioning dropout (training only) ----------
+        # Per-sample masks (True = drop this conditioner on this sample).
+        # ``cfg_drop_joint`` ORs into every other mask so joint-drop
+        # samples see no conditioning at all — that batch element trains
+        # the unconditional ε prediction.
+        if self.training and (
+            self.cfg_drop_text > 0
+            or self.cfg_drop_pose > 0
+            or self.cfg_drop_action > 0
+            or self.cfg_drop_horizon > 0
+            or self.cfg_drop_joint > 0
+        ):
+            joint = torch.rand(B, device=device) < self.cfg_drop_joint
+            text_mask = (torch.rand(B, device=device) < self.cfg_drop_text) | joint
+            pose_mask = (torch.rand(B, device=device) < self.cfg_drop_pose) | joint
+            action_mask = (torch.rand(B, device=device) < self.cfg_drop_action) | joint
+            horizon_mask = (torch.rand(B, device=device) < self.cfg_drop_horizon) | joint
+        else:
+            zero_b = torch.zeros(B, dtype=torch.bool, device=device)
+            text_mask = pose_mask = action_mask = horizon_mask = zero_b
+
         # 1) Project to backbone hidden dim, add role + position embeddings.
-        x_curr = self.token_in(curr_tokens) + self.role_embed.weight[0]
-        x_sub = self.token_in(noisy_subgoal) + self.role_embed.weight[1]
+        # Dropout on adapter outputs only — pretrained backbone left alone.
+        x_curr = self.input_drop(self.token_in(curr_tokens)) + self.role_embed.weight[0]
+        x_sub = self.input_drop(self.token_in(noisy_subgoal)) + self.role_embed.weight[1]
         hidden = torch.cat([x_curr, x_sub], dim=1) + self.pos_embed[:, : 2 * S]
 
         # Cast to the backbone's expected dtype.
@@ -253,13 +355,24 @@ class PixArtSubgoalDiT(nn.Module):
             t, None, batch_size=B, hidden_dtype=hidden.dtype
         )
 
+        # ---- Apply CFG masks to conditioners ----
+        # pose_delta: zero out the per-sample delta (the pose_proj output
+        # of zeros is well-defined since pose_proj is a Linear).
+        pose_delta_in = pose_delta.to(hidden.dtype)
+        pose_delta_in = pose_delta_in * (~pose_mask).to(pose_delta_in.dtype).unsqueeze(-1)
+        # action / horizon: zero the embedding output per-sample.
+        la_emb = self.last_action_emb(last_action.long())
+        la_emb = la_emb * (~action_mask).to(la_emb.dtype).unsqueeze(-1)
+        hz_emb = self.horizon_embed(horizon.clamp(min=0, max=32).long())
+        hz_emb = hz_emb * (~horizon_mask).to(hz_emb.dtype).unsqueeze(-1)
+        # text: replace with learned null embedding per-sample.
+        null_te = self.null_text_embed.to(text_embed.dtype).expand_as(text_embed)
+        text_embed = torch.where(text_mask.unsqueeze(-1), null_te, text_embed)
+
         # Build the extra conditioning vector (pose + last_action + horizon).
         # Will only contribute non-trivially once ``extra_modulation`` learns.
-        extra_cond = (
-            self.pose_proj(pose_delta.to(hidden.dtype))
-            + self.last_action_emb(last_action.long())
-            + self.horizon_embed(horizon.clamp(min=0, max=32).long())
-        )
+        extra_cond = self.pose_proj(pose_delta_in) + la_emb + hz_emb
+        extra_cond = self.extra_drop(extra_cond)
 
         # 3) Text → encoder_hidden_states. FIX: bypass the pretrained
         #    ``caption_projection`` (trained for T5-XXL) and feed our
@@ -269,6 +382,7 @@ class PixArtSubgoalDiT(nn.Module):
         #    lot more stable than feeding them garbage and expecting them
         #    to compensate.
         caption = self.text_to_caption(text_embed.to(hidden.dtype))      # (B, HIDDEN_DIM)
+        caption = self.text_drop(caption)
         caption = caption.unsqueeze(1)                                    # (B, 1, HIDDEN_DIM)
 
         # PixArt-style cross-attention mask (same shape construction as
@@ -278,7 +392,10 @@ class PixArtSubgoalDiT(nn.Module):
         encoder_attention_mask = encoder_attention_mask.unsqueeze(1)      # (B, 1, 1)
 
         # 4) Run through the 28 pretrained transformer blocks.
-        for block in self.backbone.transformer_blocks:
+        # If REPA is enabled, capture the subgoal half right AFTER block
+        # ``repa_layer_idx - 1`` (1-indexed for naturalness; idx=0 disables).
+        repa_hidden: torch.Tensor | None = None
+        for i, block in enumerate(self.backbone.transformer_blocks):
             hidden = block(
                 hidden,
                 attention_mask=None,
@@ -288,6 +405,16 @@ class PixArtSubgoalDiT(nn.Module):
                 cross_attention_kwargs=None,
                 class_labels=None,
             )
+            if (
+                return_repa
+                and self.repa_proj is not None
+                and (i + 1) == self.repa_layer_idx
+            ):
+                # subgoal half only; project to SigLIP token dim.
+                sub_half = hidden[:, S:]
+                repa_hidden = self.repa_proj(
+                    sub_half.to(self.repa_proj.weight.dtype)
+                )
 
         # 5) Final PixArt-style modulation. ``shift``/``scale`` come from
         #    the pretrained ``scale_shift_table`` + the PURE
@@ -308,6 +435,8 @@ class PixArtSubgoalDiT(nn.Module):
         # Keep only the subgoal half and project back to SigLIP space.
         subgoal_hidden = hidden[:, S:]                                     # (B, 256, 1152)
         eps_pred = self.token_out(subgoal_hidden.to(self.token_out.weight.dtype))
+        if return_repa:
+            return {"eps": eps_pred, "repa_hidden": repa_hidden}
         return eps_pred
 
     # ---- DDIM sampling (inference) --------------------------------

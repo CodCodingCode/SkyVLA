@@ -23,4 +23,17 @@ DRONE_PROJECT="${DRONE_PROJECT:-$HOME/drone_project}"
 source "$DRONE_PROJECT/openfly/activate.sh"
 
 cd "$DRONE_PROJECT"
-python -m openfly.train_subgoal_dit "$@"
+
+# PYTHONUNBUFFERED=1 (== ``python -u``) forces stdout/stderr to be
+# line-buffered instead of the default block-buffered when not attached
+# to a TTY. Without this, progress prints accumulate in memory and only
+# appear in log files when the process exits cleanly — so any SIGTERM
+# (timeout, OOM, manual kill) leaves the log looking like the script
+# died silently before printing anything.
+export PYTHONUNBUFFERED=1
+# PYTHONFAULTHANDLER=1 prints a Python stack trace to stderr on segfault
+# or fatal Python error — cheap to enable, free debugging when a CUDA
+# extension or pretrained model crashes the interpreter.
+export PYTHONFAULTHANDLER=1
+
+python -u -m openfly.train_subgoal_dit "$@"

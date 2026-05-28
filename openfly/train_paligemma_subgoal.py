@@ -44,7 +44,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader
 
 from openfly.dataset import NUM_OPENFLY_ACTIONS, OpenFlyDataset, collate
 from openfly.models.paligemma_vln import (
@@ -348,13 +348,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--max_episodes", type=int, default=0)
     parser.add_argument("--env_filter", type=str, default=None)
-    parser.add_argument("--val_frac", type=float, default=0.02)
+    parser.add_argument(
+        "--val_split",
+        type=str,
+        default="seen",
+        help="Held-out split for validation. 'seen' uses seen.json "
+        "(trajectory holdout in training scenes); 'unseen' uses unseen.json "
+        "(scene holdout). Replaces the previous sample-level random_split, "
+        "which was leaking adjacent frames from the same trajectory into val.",
+    )
+    parser.add_argument(
+        "--val_max_episodes",
+        type=int,
+        default=200,
+        help="Cap on val episodes. 0 = use the whole held-out split.",
+    )
     parser.add_argument("--num_workers", type=int, default=2)
 
     # Checkpoints
-    parser.add_argument("--bc_init_ckpt", type=str, required=True,
-                        help="Path to P1 BC checkpoint (last.pt). Initializes "
-                        "the PaliGemma LoRA + heads.")
+    parser.add_argument(
+        "--bc_init_ckpt",
+        type=str,
+        default="",
+        help="Optional path to a P1 BC checkpoint to initialize the policy. "
+        "Empty (default) = train from scratch (recommended after the "
+        "architecture change that removed last_action_embed + progress_proj; "
+        "older checkpoints' action_head weights are shape-incompatible).",
+    )
     parser.add_argument("--dit_path", type=str, required=True,
                         help="Path to P2 SubgoalDiT checkpoint (best.pt). Frozen.")
     parser.add_argument("--pretrained_path", type=str, default=None,
@@ -391,7 +411,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[train_paligemma_subgoal] writing to {out_dir}")
 
     # ----- data ---------------------------------------------------------
-    full_ds = OpenFlyDataset(
+    # Training data comes from --split (e.g. 'train'). Validation comes from
+    # a SEPARATE held-out split (--val_split, default 'seen') so adjacent
+    # frames of the same trajectory can never appear on both sides. The
+    # previous random_split over a single dataset was producing val_acc=1.0
+    # in epoch 1 because frame k landed in train and frame k+1 in val.
+    train_ds = OpenFlyDataset(
         split=args.split,
         history_frames=args.history_frames,
         env_filter=args.env_filter,
@@ -400,16 +425,22 @@ def main(argv: list[str] | None = None) -> int:
         require_images=True,
         oversample_stop=2.0,
     )
-    val_size = max(1, int(len(full_ds) * args.val_frac)) if args.val_frac > 0 else 0
-    train_size = len(full_ds) - val_size
-    if val_size > 0:
-        train_ds, val_ds = random_split(
-            full_ds, [train_size, val_size],
-            generator=torch.Generator().manual_seed(0),
+    if args.val_split and args.val_split.lower() != "none":
+        val_ds = OpenFlyDataset(
+            split=args.val_split,
+            history_frames=args.history_frames,
+            env_filter=args.env_filter,
+            max_episodes=args.val_max_episodes,
+            require_images=True,
+            oversample_stop=1.0,  # honest distribution at eval time
         )
     else:
-        train_ds, val_ds = full_ds, None
-    print(f"[train_paligemma_subgoal] split: {train_size} train / {val_size} val")
+        val_ds = None
+    print(
+        f"[train_paligemma_subgoal] data: train_split={args.split} "
+        f"n={len(train_ds)}  /  val_split={args.val_split} "
+        f"n={len(val_ds) if val_ds is not None else 0}"
+    )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, collate_fn=collate,
@@ -432,36 +463,43 @@ def main(argv: list[str] | None = None) -> int:
         paligemma_model_name=args.paligemma_model,
         lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
     ).to(device)
-    bc_state = torch.load(args.bc_init_ckpt, map_location=device, weights_only=False)
-    # ``strict=False`` ignores missing/unexpected keys but still raises on
-    # SHAPE mismatches. Older BC checkpoints predate the subgoal slot in
-    # ``frame_embed`` (3 → 4 entries) and use a smaller ``progress_head``,
-    # so we filter shape-mismatched keys explicitly and let them stay at
-    # the current architecture's fresh init (they're tiny, learn fast).
-    own = model.state_dict()
-    filtered: dict[str, torch.Tensor] = {}
-    shape_mismatches: list[str] = []
-    for k, v in bc_state["model"].items():
-        if k not in own:
-            continue
-        if tuple(own[k].shape) != tuple(v.shape):
-            shape_mismatches.append(
-                f"{k} ({tuple(v.shape)} → {tuple(own[k].shape)})"
-            )
-            continue
-        filtered[k] = v
-    missing, unexpected = model.load_state_dict(filtered, strict=False)
-    print(
-        f"[train_paligemma_subgoal] BC init — loaded={len(filtered)} "
-        f"missing={len(missing)} unexpected={len(unexpected)} "
-        f"shape_mismatch={len(shape_mismatches)}"
-    )
-    if shape_mismatches:
+    if args.bc_init_ckpt:
+        bc_state = torch.load(args.bc_init_ckpt, map_location=device, weights_only=False)
+        # ``strict=False`` ignores missing/unexpected keys but still raises on
+        # SHAPE mismatches. Older BC checkpoints predate the subgoal slot in
+        # ``frame_embed`` and used a wider action head (336d → 288d after the
+        # last_action_embed + progress_proj removal), so we filter
+        # shape-mismatched keys explicitly and let them stay at fresh init.
+        own = model.state_dict()
+        filtered: dict[str, torch.Tensor] = {}
+        shape_mismatches: list[str] = []
+        for k, v in bc_state["model"].items():
+            if k not in own:
+                continue
+            if tuple(own[k].shape) != tuple(v.shape):
+                shape_mismatches.append(
+                    f"{k} ({tuple(v.shape)} → {tuple(own[k].shape)})"
+                )
+                continue
+            filtered[k] = v
+        missing, unexpected = model.load_state_dict(filtered, strict=False)
         print(
-            f"[train_paligemma_subgoal]   shape mismatches (using fresh init):"
+            f"[train_paligemma_subgoal] BC init from {args.bc_init_ckpt} — "
+            f"loaded={len(filtered)} missing={len(missing)} "
+            f"unexpected={len(unexpected)} shape_mismatch={len(shape_mismatches)}"
         )
-        for m in shape_mismatches:
-            print(f"     {m}")
+        if shape_mismatches:
+            print(
+                "[train_paligemma_subgoal]   shape mismatches (using fresh init):"
+            )
+            for m in shape_mismatches:
+                print(f"     {m}")
+    else:
+        print(
+            "[train_paligemma_subgoal] no --bc_init_ckpt provided — training "
+            "policy from scratch (PaliGemma backbone weights are frozen and "
+            "loaded from HF regardless)."
+        )
     processor = _build_processor(args.paligemma_model)
 
     optimizer = torch.optim.AdamW(

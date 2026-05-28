@@ -216,6 +216,8 @@ class OpenFlySample:
     subgoal_horizon: int        # # steps between ``step`` and subgoal (0 if invalid)
     subgoal_valid: bool         # False at terminal-run steps
     subgoal_pose: np.ndarray    # (4,) float32 pose at subgoal step
+    rgb_path: str = ""          # resolved on-disk path to ``rgb`` (empty if unresolved)
+    subgoal_rgb_path: str = ""  # resolved on-disk path to ``subgoal_rgb``
 
 
 class OpenFlyDataset(Dataset):
@@ -489,6 +491,7 @@ class OpenFlyDataset(Dataset):
         subgoal_valid = sg_step > step
         subgoal_horizon = max(0, sg_step - step)
 
+        sg_path: Path | None = None
         if subgoal_valid:
             sg_path = _resolve_frame(self.image_root, ep["image_path"], indices[sg_step])
             subgoal_rgb = _load_rgb(sg_path, self.image_size)
@@ -500,6 +503,7 @@ class OpenFlyDataset(Dataset):
                 subgoal_horizon = 0
                 subgoal_rgb = rgb.copy()
                 subgoal_pose = pose.copy()
+                sg_path = cur_path
             else:
                 sg_xyz = positions[sg_step] if sg_step < len(positions) else positions[-1]
                 sg_yaw = float(yaws[sg_step]) if sg_step < len(yaws) else yaw
@@ -509,6 +513,7 @@ class OpenFlyDataset(Dataset):
         else:
             subgoal_rgb = rgb.copy()
             subgoal_pose = pose.copy()
+            sg_path = cur_path
 
         return OpenFlySample(
             rgb=rgb,
@@ -525,6 +530,8 @@ class OpenFlyDataset(Dataset):
             subgoal_horizon=subgoal_horizon,
             subgoal_valid=subgoal_valid,
             subgoal_pose=subgoal_pose,
+            rgb_path=str(cur_path) if cur_path is not None else "",
+            subgoal_rgb_path=str(sg_path) if sg_path is not None else "",
         )
 
 
@@ -585,4 +592,6 @@ def collate(samples: Sequence[OpenFlySample]) -> dict[str, Any]:
         "subgoal_horizon": subgoal_horizon,
         "subgoal_valid": subgoal_valid,
         "subgoal_pose": subgoal_pose,
+        "rgb_path": [s.rgb_path for s in samples],
+        "subgoal_rgb_path": [s.subgoal_rgb_path for s in samples],
     }

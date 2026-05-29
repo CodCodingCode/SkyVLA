@@ -287,6 +287,7 @@ def _train_step(
     device: torch.device,
     min_snr_gamma: float = 0.0,
     repa_weight: float = 0.0,
+    cos_loss_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     rgb = batch["rgb"].to(device, non_blocking=True)
     subgoal_rgb = batch["subgoal_rgb"].to(device, non_blocking=True)
@@ -373,6 +374,34 @@ def _train_step(
         "loss": float(loss.item()),
         "n_valid": int(mask.sum().item()),
     }
+
+    # Explicit cos-sim loss on reconstructed x0.
+    # The diagnosis: ε-MSE alone has a degenerate minimum at "predict
+    # mean ε" that gives val_cos≈0. After ruling out data scale, CFG
+    # dropout, REPA aux, and DDIM step count, the only remaining
+    # bottleneck is the objective itself: nothing in the loss explicitly
+    # optimizes for *directional* match with the target. This term fixes
+    # that: reconstruct x0 from (x_t, eps_pred, alpha_bar_t) via the
+    # standard DDPM closed form, compute cosine similarity with the
+    # ground-truth target (same metric & flattening as val_cos), add
+    # (1 - cos) to the loss. Differentiates through eps_pred via the
+    # affine reconstruction, so the model gets a gradient pointed at
+    # *correct direction* rather than just *correct magnitude*.
+    if cos_loss_weight > 0.0:
+        ab_t = dit.alpha_bar[t.long()].to(eps_pred.dtype).view(-1, 1, 1)
+        sqrt_ab = ab_t.sqrt()
+        sqrt_1m_ab = (1.0 - ab_t).sqrt()
+        x0_pred = (x_t - sqrt_1m_ab * eps_pred) / sqrt_ab.clamp(min=1e-6)
+        a = x0_pred.reshape(B, -1).float()
+        b = tgt_tokens.reshape(B, -1).float()
+        train_cos = F.cosine_similarity(a, b, dim=-1)  # (B,)
+        cos_loss_per_sample = 1.0 - train_cos
+        cos_loss = (cos_loss_per_sample * mask.to(cos_loss_per_sample.dtype)).sum() / denom
+        loss = loss + cos_loss_weight * cos_loss
+        metrics["cos_loss"] = float(cos_loss.item())
+        metrics["train_cos"] = float(
+            (train_cos.detach() * mask.to(train_cos.dtype)).sum().item() / float(denom.item())
+        )
 
     # REPA cosine-alignment auxiliary loss.
     # Encourages an intermediate PixArt block (subgoal half) to align
@@ -483,7 +512,10 @@ def _eval_step(
 # Main
 # ---------------------------------------------------------------------------
 
-def _install_diagnostics(stack_dump_interval_s: float = 120.0) -> None:
+def _install_diagnostics(
+    stack_dump_interval_s: float = 120.0,
+    diag_file: "TextIO | None" = None,
+) -> None:
     """Make silent-death debugging tractable.
 
     Without these, a long run that's hanging (DataLoader stuck on a
@@ -491,12 +523,17 @@ def _install_diagnostics(stack_dump_interval_s: float = 120.0) -> None:
     reaper, manual SIGTERM) gives us nothing in the log because Python
     stdout is block-buffered for non-TTY and frame state is lost on exit.
 
+    ``diag_file`` (optional) routes the periodic ``faulthandler`` dumps
+    to a separate file instead of stderr — keeps the main training log
+    free of the every-120s thread-dump noise. The ``EXIT reason=`` line
+    and signal-handler dumps still go to stdout/stderr because those
+    are end-of-run summaries you actually want in the main log.
+
     What we install:
       * ``faulthandler.dump_traceback_later(N, repeat=True)`` — every N
-        seconds, dumps a stack trace of every thread to stderr. If the
-        process is stuck, you see WHERE it's stuck without needing
-        py-spy / strace. Repeat=True means it fires once per interval
-        until exit.
+        seconds, dumps a stack trace of every thread (to ``diag_file``
+        if set, else stderr). If the process is stuck, you see WHERE
+        it's stuck without needing py-spy / strace.
       * ``faulthandler.register(SIGUSR1)`` — send ``kill -USR1 <pid>``
         to dump a stack on demand without restarting.
       * ``atexit`` callback that prints the exit reason (clean / signal
@@ -513,8 +550,9 @@ def _install_diagnostics(stack_dump_interval_s: float = 120.0) -> None:
     import traceback
 
     faulthandler.enable()
+    dump_target = diag_file if diag_file is not None else sys.stderr
     faulthandler.dump_traceback_later(
-        float(stack_dump_interval_s), repeat=True, exit=False
+        float(stack_dump_interval_s), repeat=True, exit=False, file=dump_target
     )
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1)
@@ -560,10 +598,47 @@ def _install_diagnostics(stack_dump_interval_s: float = 120.0) -> None:
     sys.excepthook = _excepthook
 
 
+def _build_ckpt_state(
+    dit, optimizer, ema, epoch: int, global_step: int, args,
+    *, step_in_epoch: int = 0, val_cos: float | None = None,
+) -> dict:
+    """Bundle full training state for resumption.
+
+    ``step_in_epoch=0`` is the sentinel for "saved at a clean epoch
+    boundary" — on resume that means "start next epoch from step 0".
+    ``step_in_epoch>0`` means the save happened mid-epoch — on resume
+    the current epoch is REPLAYED from step 0 (we lose at most one
+    period of training, but optimizer + EMA state is fully preserved
+    so we don't undo learning, just redo data already seen).
+    """
+    state = {
+        "dit": dit.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "step_in_epoch": int(step_in_epoch),
+        "args": vars(args),
+    }
+    if val_cos is not None:
+        state["val_cos"] = float(val_cos)
+    if ema is not None:
+        state["ema"] = ema.state_dict()
+    return state
+
+
+def _atomic_save(path: "Path", state: dict) -> None:
+    """Save via tmp + rename so a crash mid-write never corrupts the file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
 def main(argv: list[str] | None = None) -> int:
-    # Install diagnostics FIRST so even early failures (arg parsing,
-    # config load, dataset construction) leave breadcrumbs.
-    _install_diagnostics()
+    # NOTE: ``_install_diagnostics()`` is now called LATER, after we
+    # resolve ``out_dir`` — so the periodic faulthandler dumps go to
+    # ``out_dir/diagnostics.log`` instead of polluting the main log.
+    # Until that point we get the standard Python excepthook, which
+    # already prints any arg-parsing or import error to stderr.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--split", default="train")
     parser.add_argument("--epochs", type=int, default=5)
@@ -645,12 +720,23 @@ def main(argv: list[str] | None = None) -> int:
         "--per_env_max_episodes",
         type=int,
         default=0,
-        help="Cap episodes-per-env when loading the training split. "
-        "Balances contribution across all envs in train.json — without "
-        "this, env_ue_bigcity dominates because it has the most "
-        "downloaded frames locally. 0 = no cap (legacy behaviour). "
-        "Typical value: 2000–3000 to match the smaller envs' available "
-        "data while still capping the large ones.",
+        help="Cap episodes-per-env BEFORE the image-existence filter. "
+        "Does NOT actually balance usable samples — because envs have "
+        "wildly different image-coverage ratios (bigcity ~91%%, others "
+        "0-13%%), an episode cap of 2000 still yields ~95%% bigcity in "
+        "the final dataset. Use this only to bound load time. For real "
+        "balancing use --per_env_max_index_samples.",
+    )
+    parser.add_argument(
+        "--per_env_max_index_samples",
+        type=int,
+        default=0,
+        help="Cap USABLE step-pairs per env AFTER image filtering. This "
+        "is the only knob that actually balances training samples across "
+        "envs in our partial-data setup. With cap=10000 the dataset "
+        "lands at ~50k step-pairs with bigcity ≈ 20%% (vs 95%% without "
+        "this cap). Deterministic sampling (seed=0) so configs are "
+        "reproducible.",
     )
     parser.add_argument("--env_filter", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=2)
@@ -733,6 +819,16 @@ def main(argv: list[str] | None = None) -> int:
         "applied when ``--pretrained_path`` is set (PixArtSubgoalDiT).",
     )
     parser.add_argument(
+        "--cos_loss_weight", type=float, default=0.0,
+        help="Weight on the explicit cos-sim loss term (added to ε-MSE). "
+        "Reconstructs x0 from (x_t, ε_pred, α_bar_t) and adds (1 - "
+        "cos(x0_pred, target)) to the loss. Directly attacks the mean-"
+        "prediction collapse — ε-MSE alone leaves val_cos at 0 because "
+        "the L2 minimum is direction-agnostic. Recommended starting "
+        "value: 0.3-0.5 (initial cos_loss ≈ 1.0, ε-MSE ≈ 0.7, so weight=0.3 "
+        "puts cos at ~30%% of total). 0 disables.",
+    )
+    parser.add_argument(
         "--repa_weight", type=float, default=0.0,
         help="Weight on the REPA cosine-alignment auxiliary loss. 0.1 is "
         "a reasonable starting point per the REPA paper. Ignored when "
@@ -775,6 +871,25 @@ def main(argv: list[str] | None = None) -> int:
                     / "logs" / "openfly" / "subgoal_dit"),
     )
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--run_dir", type=str, default=None,
+        help="Pin the run directory to an exact path (no timestamp suffix). "
+        "Required for --auto_resume to work across crashes. If unset, the "
+        "usual <out_dir>/<timestamp> behavior applies.",
+    )
+    parser.add_argument(
+        "--auto_resume", action="store_true",
+        help="If <run_dir>/last.pt exists, resume from it automatically. "
+        "Requires --run_dir. Designed for crash recovery: relaunch the same "
+        "command after a Xid 43 / OOM / SIGSEGV and training picks up where "
+        "the last periodic save landed. --resume <path> takes priority.",
+    )
+    parser.add_argument(
+        "--ckpt_every_steps", type=int, default=0,
+        help="If >0, save last.pt every N global steps (in addition to the "
+        "epoch-end save). Bounds crash-loss to ~N*(seconds/step) of training. "
+        "On a ~3 step/s trainer, --ckpt_every_steps 500 caps loss at ~3 min.",
+    )
     parser.add_argument("--save_every", type=int, default=1,
                         help="Save checkpoint every N epochs.")
     parser.add_argument("--early_stop_patience", type=int, default=0,
@@ -786,8 +901,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     device = torch.device(args.device)
-    base_out = Path(args.out_dir)
-    out_dir = base_out / time.strftime("%Y%m%d_%H%M%S")
+    if args.run_dir:
+        # Pinned run directory — used for crash-recovery launches so the
+        # same path is reused across restarts and last.pt lands in a
+        # predictable place that --auto_resume can find.
+        out_dir = Path(args.run_dir)
+    else:
+        base_out = Path(args.out_dir)
+        out_dir = base_out / time.strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
     # Resolve symlinks now so subsequent saves don't depend on a path that
     # could disappear mid-training (we hit this once already — a 20-minute
@@ -795,6 +916,35 @@ def main(argv: list[str] | None = None) -> int:
     # removed between startup mkdir and end-of-epoch save).
     out_dir = out_dir.resolve()
     print(f"[train_subgoal_dit] writing to {out_dir}")
+
+    # Auto-resume: if --auto_resume and <out_dir>/last.pt exists, point
+    # --resume at it. Explicit --resume always wins (the user typed it).
+    if args.auto_resume:
+        candidate = out_dir / "last.pt"
+        if args.resume:
+            print(
+                f"[train_subgoal_dit] --resume {args.resume} given; ignoring "
+                f"--auto_resume (which would have used {candidate})"
+            )
+        elif candidate.exists():
+            args.resume = str(candidate)
+            print(f"[train_subgoal_dit] auto-resuming from {candidate}")
+        else:
+            print(
+                f"[train_subgoal_dit] --auto_resume set but {candidate} missing"
+                f"; starting fresh"
+            )
+
+    # Install diagnostics now that out_dir is known. Routes the periodic
+    # faulthandler thread-dumps to <out_dir>/diagnostics.log so the main
+    # training log stays readable; signal handlers + EXIT line still go
+    # to stdout/stderr.
+    _diag_file = open(out_dir / "diagnostics.log", "a", buffering=1)
+    print(
+        f"[train_subgoal_dit] diagnostics → {out_dir / 'diagnostics.log'} "
+        f"(faulthandler dumps every 120s land there, not here)"
+    )
+    _install_diagnostics(diag_file=_diag_file)
 
     # Persist args.json up front so we can diff run configs and so that a
     # mid-training crash still leaves provenance behind. (The previous
@@ -827,6 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         max_episodes=args.max_episodes,
         max_samples=args.max_samples,
         per_env_max_episodes=args.per_env_max_episodes,
+        per_env_max_index_samples=args.per_env_max_index_samples,
         require_images=args.require_images,
         oversample_stop=1.0,  # don't oversample stops for the world model
         subgoal_pairing=args.subgoal_pairing,
@@ -1036,9 +1187,41 @@ def main(argv: list[str] | None = None) -> int:
                 f"{args.resume} has no 'ema' key; reinitialising shadow from "
                 f"current weights (EMA history is lost)."
             )
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        ckpt_epoch = int(ckpt.get("epoch", 0))
+        ckpt_step_in_epoch = int(ckpt.get("step_in_epoch", 0))
         global_step = int(ckpt.get("global_step", 0))
-        print(f"[train_subgoal_dit] resumed from {args.resume} @ epoch {start_epoch}")
+        if ckpt_step_in_epoch > 0:
+            # Mid-epoch save: REPLAY current epoch from step 0. We lose
+            # the in-epoch batches that were already seen, but optimizer
+            # + EMA state is exactly where it left off, so the LR
+            # schedule and accumulated knowledge are intact. This is much
+            # simpler than rewinding/skipping the DataLoader, and on
+            # ε-MSE diffusion the redo is essentially free.
+            start_epoch = ckpt_epoch
+            print(
+                f"[train_subgoal_dit] resumed from {args.resume} mid-epoch "
+                f"(was at step {ckpt_step_in_epoch} of epoch {ckpt_epoch}); "
+                f"REPLAYING epoch {ckpt_epoch} from step 0, gstep={global_step}"
+            )
+        else:
+            start_epoch = ckpt_epoch + 1
+            print(
+                f"[train_subgoal_dit] resumed from {args.resume} @ epoch "
+                f"{start_epoch} (clean boundary), gstep={global_step}"
+            )
+        # Restore best-so-far so a resumed run doesn't overwrite a better
+        # best.pt with a worse one from the first post-resume epoch.
+        if "val_cos" in ckpt and ckpt["val_cos"] is not None:
+            try:
+                _prev_best = float(ckpt["val_cos"])
+                if _prev_best > best_val_cos:
+                    best_val_cos = _prev_best
+                    print(
+                        f"[train_subgoal_dit] restored best_val_cos="
+                        f"{best_val_cos:.4f} from checkpoint"
+                    )
+            except (TypeError, ValueError):
+                pass
 
     def _apply_warmup(step_idx: int) -> None:
         if args.warmup_steps <= 0:
@@ -1051,7 +1234,30 @@ def main(argv: list[str] | None = None) -> int:
             pg["lr"] = _base_lrs[name] * frac
 
     # ----- train --------------------------------------------------------
+    # When resuming, load any prior history.json so we don't overwrite
+    # epoch summaries from earlier launches. Bug we hit: 4ep run #1
+    # logged epochs 0-2 then Xid-43'd; launch #2 resumed at epoch 3 but
+    # init'd ``history = []``, so history.json lost epochs 0-2 entirely.
     history: list[dict[str, Any]] = []
+    history_path = out_dir / "history.json"
+    if args.resume and history_path.exists():
+        try:
+            with open(history_path) as _hf:
+                prior = json.load(_hf)
+            if isinstance(prior, list):
+                # Only keep epochs strictly before start_epoch — anything ≥
+                # will be re-trained (e.g. when resuming mid-epoch via
+                # step_in_epoch>0) and re-appended below.
+                history = [e for e in prior if int(e.get("epoch", -1)) < start_epoch]
+                print(
+                    f"[train_subgoal_dit] loaded {len(history)} prior epoch(s) "
+                    f"from {history_path}"
+                )
+        except (OSError, json.JSONDecodeError) as _exc:
+            print(
+                f"[train_subgoal_dit] WARN failed to load prior history.json "
+                f"({_exc}); starting fresh history list"
+            )
     for epoch in range(start_epoch, args.epochs):
         dit.train()
         t0 = time.time()
@@ -1064,6 +1270,7 @@ def main(argv: list[str] | None = None) -> int:
                 dit, paligemma, processor, batch, device,
                 min_snr_gamma=args.min_snr_gamma,
                 repa_weight=args.repa_weight,
+                cos_loss_weight=args.cos_loss_weight,
             )
             if metrics["n_valid"] == 0:
                 continue
@@ -1113,10 +1320,39 @@ def main(argv: list[str] | None = None) -> int:
 
             if step % args.log_every == 0:
                 cur_lr = optimizer.param_groups[0]["lr"]
+                extras = ""
+                if "train_cos" in metrics:
+                    extras += f" train_cos={metrics['train_cos']:+.4f}"
+                if "repa_cos" in metrics:
+                    extras += f" repa_cos={metrics['repa_cos']:+.4f}"
                 print(
                     f"epoch {epoch:02d} step {step:05d} gstep {global_step:06d} "
                     f"loss={metrics['loss']:.4f} n_valid={metrics['n_valid']} "
-                    f"lr={cur_lr:.2e}",
+                    f"lr={cur_lr:.2e}{extras}",
+                    flush=True,
+                )
+
+            # Periodic mid-epoch checkpoint. Saves ``last.pt`` only —
+            # ``best.pt`` is gated on a full val pass which doesn't
+            # happen mid-epoch. Bounded crash-loss = ~ckpt_every_steps *
+            # (seconds per step). Atomic via tmp+rename so a SIGSEGV
+            # mid-write can never half-corrupt ``last.pt``.
+            if (
+                args.ckpt_every_steps > 0
+                and global_step > 0
+                and global_step % args.ckpt_every_steps == 0
+            ):
+                out_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_save(
+                    out_dir / "last.pt",
+                    _build_ckpt_state(
+                        dit, optimizer, ema, epoch, global_step, args,
+                        step_in_epoch=step + 1,
+                    ),
+                )
+                print(
+                    f"[train_subgoal_dit] periodic save at gstep "
+                    f"{global_step} (epoch {epoch} step {step+1}) → last.pt",
                     flush=True,
                 )
 
@@ -1173,21 +1409,15 @@ def main(argv: list[str] | None = None) -> int:
             # plus the EMA shadow as a separate key. ``best.pt`` is for
             # inference — its ``dit`` key holds the EMA weights directly
             # so downstream loaders (eval_p3_subgoals, etc.) work unchanged.
-            ckpt_state = {
-                "dit": dit.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-                "global_step": global_step,
-                "args": vars(args),
-                "val_cos": float(train_log.get("val_cos", float("nan"))),
-            }
-            if ema is not None:
-                ckpt_state["ema"] = ema.state_dict()
-            # 1) Always update ``last.pt`` (atomic).
-            tmp_path = out_dir / "last.pt.tmp"
+            # ``step_in_epoch=0`` marks this as a clean epoch boundary so
+            # on resume we advance to ``epoch+1`` instead of replaying.
+            ckpt_state = _build_ckpt_state(
+                dit, optimizer, ema, epoch, global_step, args,
+                step_in_epoch=0,
+                val_cos=train_log.get("val_cos"),
+            )
             ckpt_path = out_dir / "last.pt"
-            torch.save(ckpt_state, tmp_path)
-            os.replace(tmp_path, ckpt_path)
+            _atomic_save(ckpt_path, ckpt_state)
             print(f"[train_subgoal_dit] saved {ckpt_path}")
 
             with open(out_dir / "history.json", "w") as f:

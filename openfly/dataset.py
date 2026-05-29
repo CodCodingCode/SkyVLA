@@ -329,6 +329,7 @@ class OpenFlyDataset(Dataset):
         max_episodes: int = 0,
         max_samples: int = 0,
         per_env_max_episodes: int = 0,
+        per_env_max_index_samples: int = 0,
         require_images: bool = False,
         oversample_stop: float = 2.0,
         subgoal_pairing: str = "mixed",
@@ -404,6 +405,44 @@ class OpenFlyDataset(Dataset):
             print(
                 f"[openfly.dataset] require_images: indexed {len(index)} steps "
                 f"(skipped {skipped_steps} without frames under {self.image_root})"
+            )
+        # Per-env step-pair cap — applied AFTER image filtering, so it
+        # actually balances usable samples (not raw train.json entries,
+        # which can have wildly different image-coverage ratios across
+        # envs). With this dataset (env_ue_bigcity ~91% coverage vs
+        # other envs at 0-13%), ``per_env_max_episodes`` alone produces
+        # ~95% bigcity samples even at small caps. This step-pair cap
+        # is the only knob that actually balances. Deterministic
+        # sampling so a given config is reproducible across runs.
+        if per_env_max_index_samples > 0:
+            from collections import defaultdict, Counter
+            import random as _balrng
+            groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
+            for ep_i, s in index:
+                env = episodes[ep_i].get("image_path", "").split("/")[0]
+                groups[env].append((ep_i, s))
+            rng = _balrng.Random(0)
+            capped: list[tuple[int, int]] = []
+            for env, entries in sorted(groups.items()):
+                if len(entries) > per_env_max_index_samples:
+                    entries = rng.sample(entries, per_env_max_index_samples)
+                capped.extend(entries)
+            pre = len(index)
+            index = capped
+            env_after = Counter(
+                episodes[ep_i].get("image_path", "").split("/")[0]
+                for ep_i, _ in index
+            )
+            print(
+                f"[openfly.dataset] per_env_max_index_samples="
+                f"{per_env_max_index_samples}: {pre} -> {len(index)} step-pairs"
+            )
+            print(
+                "[openfly.dataset] post-cap step-pairs per env: "
+                + ", ".join(
+                    f"{e}={n}"
+                    for e, n in sorted(env_after.items(), key=lambda x: -x[1])
+                )
             )
         if max_samples > 0:
             index = index[:max_samples]

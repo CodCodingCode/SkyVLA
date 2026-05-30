@@ -36,4 +36,11 @@ export PYTHONUNBUFFERED=1
 # extension or pretrained model crashes the interpreter.
 export PYTHONFAULTHANDLER=1
 
+# Auto-load W&B API key from the project-local secrets file if present
+# and not already set in the env. The trainer also has its own fallback
+# for the same file, but exporting here means `wandb` CLI works too.
+if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -r "$DRONE_PROJECT/.wandb_key" ]]; then
+  export WANDB_API_KEY="$(cat "$DRONE_PROJECT/.wandb_key")"
+fi
+
 python -u -m openfly.train_subgoal_dit "$@"

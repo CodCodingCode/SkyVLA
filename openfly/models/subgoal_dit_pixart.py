@@ -97,10 +97,32 @@ class PixArtSubgoalDiT(nn.Module):
         # ``repa_layer_idx`` of 0 disables the hook entirely (no
         # projection layer is built either).
         repa_layer_idx: int = 0,
+        # ---- Subgoal pooling: compress the prediction target to 1 token --
+        # Architectural observation: the downstream policy
+        # (paligemma_vln.py) projects the DiT's 256-token subgoal output
+        # via image_proj, concatenates it onto image_tokens, runs
+        # cross_attn, and IMMEDIATELY pools the result to a single
+        # scene_summary vector before the action head. So all 256-token
+        # spatial structure of the subgoal is collapsed to one vector
+        # downstream regardless. Mean-pooling the subgoal target here
+        # cuts diffusion target dimension by 256× (294,912 → 1,152),
+        # which is the only way to get a healthy data-to-dim ratio at
+        # our 50k sample scale. "none" = legacy 256-token subgoal,
+        # "mean" = pool the target to (B, 1, token_dim) before noising.
+        subgoal_pool: str = "none",
     ) -> None:
         super().__init__()
         self.token_dim = int(token_dim)
         self.num_timesteps = int(num_timesteps)
+        if subgoal_pool not in {"none", "mean"}:
+            raise ValueError(
+                f"subgoal_pool must be 'none' or 'mean'; got {subgoal_pool!r}"
+            )
+        self.subgoal_pool = subgoal_pool
+        # Subgoal sequence length the model operates on. With pooling
+        # the model produces a single-token output; without, 256 (matches
+        # SigLIP per-frame token count).
+        self.subgoal_len = 1 if subgoal_pool == "mean" else 256
         # Dropout applied to the *adapter* outputs (token_in, text_to_caption,
         # extra_cond). The pretrained PixArt blocks themselves aren't
         # retrofitted with dropout — their internal distributions are
@@ -313,8 +335,12 @@ class PixArtSubgoalDiT(nn.Module):
         ``repa_layer_idx``, projected through ``repa_proj`` back into
         SigLIP space (B, 256, token_dim).
         """
-        B, S, _ = curr_tokens.shape
-        assert noisy_subgoal.shape == curr_tokens.shape
+        B, S_curr, _ = curr_tokens.shape
+        S_sub = noisy_subgoal.shape[1]
+        # Current frame is always 256 tokens; subgoal half can be 1 (pooled
+        # target) or 256 (legacy full-grid target). Both batch and token-dim
+        # must match.
+        assert noisy_subgoal.shape[0] == B and noisy_subgoal.shape[2] == curr_tokens.shape[2]
         device = curr_tokens.device
 
         # ---- CFG-style conditioning dropout (training only) ----------
@@ -342,7 +368,10 @@ class PixArtSubgoalDiT(nn.Module):
         # Dropout on adapter outputs only — pretrained backbone left alone.
         x_curr = self.input_drop(self.token_in(curr_tokens)) + self.role_embed.weight[0]
         x_sub = self.input_drop(self.token_in(noisy_subgoal)) + self.role_embed.weight[1]
-        hidden = torch.cat([x_curr, x_sub], dim=1) + self.pos_embed[:, : 2 * S]
+        # pos_embed is sized for the max-length case (512 = 256 curr + 256 sub).
+        # When subgoal is pooled to 1 token, we slice the first 257 positions.
+        # The curr-half uses positions [0:256], the sub-half uses [256:256+S_sub].
+        hidden = torch.cat([x_curr, x_sub], dim=1) + self.pos_embed[:, : S_curr + S_sub]
 
         # Cast to the backbone's expected dtype.
         backbone_dtype = next(self.backbone.parameters()).dtype
@@ -411,7 +440,7 @@ class PixArtSubgoalDiT(nn.Module):
                 and (i + 1) == self.repa_layer_idx
             ):
                 # subgoal half only; project to SigLIP token dim.
-                sub_half = hidden[:, S:]
+                sub_half = hidden[:, S_curr:]
                 repa_hidden = self.repa_proj(
                     sub_half.to(self.repa_proj.weight.dtype)
                 )
@@ -433,7 +462,8 @@ class PixArtSubgoalDiT(nn.Module):
         hidden = hidden * (1 + scale + extra_scale) + shift + extra_shift
 
         # Keep only the subgoal half and project back to SigLIP space.
-        subgoal_hidden = hidden[:, S:]                                     # (B, 256, 1152)
+        # Shape is (B, S_sub, token_dim) — S_sub is 1 when subgoal_pool='mean'.
+        subgoal_hidden = hidden[:, S_curr:]
         eps_pred = self.token_out(subgoal_hidden.to(self.token_out.weight.dtype))
         if return_repa:
             return {"eps": eps_pred, "repa_hidden": repa_hidden}
@@ -452,16 +482,24 @@ class PixArtSubgoalDiT(nn.Module):
         num_steps: int = 20,
         eta: float = 0.0,
         generator: torch.Generator | None = None,
+        subgoal_len: int | None = None,
     ) -> torch.Tensor:
+        """DDIM sampling. Output shape is (B, subgoal_len, token_dim).
+
+        ``subgoal_len`` defaults to ``self.subgoal_len`` (which is 1 when
+        the model was constructed with ``subgoal_pool='mean'``, else 256).
+        Callers can override it explicitly if they need to.
+        """
         device = curr_tokens.device
-        B, S, D = curr_tokens.shape
+        B, _, D = curr_tokens.shape
+        S_sub = int(subgoal_len) if subgoal_len is not None else self.subgoal_len
         ts = (
             torch.linspace(self.num_timesteps - 1, 0, num_steps + 1, device=device)
             .round()
             .long()
         )
         x = torch.randn(
-            (B, S, D), device=device, dtype=curr_tokens.dtype, generator=generator
+            (B, S_sub, D), device=device, dtype=curr_tokens.dtype, generator=generator
         )
         for i in range(num_steps):
             t_cur, t_next = ts[i], ts[i + 1]

@@ -317,6 +317,12 @@ def _train_step(
     curr_tokens, tgt_tokens, text_embed = _encode_frame_pair(
         paligemma, rgb, subgoal_rgb, input_ids, attention_mask
     )
+    # Apply subgoal pooling if the model was constructed with it.
+    # tgt_tokens enters as (B, 256, token_dim) from the encoder; the
+    # pooled mode reduces to (B, 1, token_dim) which then drives the
+    # diffusion target shape end-to-end (noise + DiT output + loss + cos).
+    if getattr(dit, "subgoal_len", 256) == 1:
+        tgt_tokens = tgt_tokens.mean(dim=1, keepdim=True)
     pose_delta = _body_frame_pose_delta(pose, subgoal_pose).to(device)
 
     # Sample a uniform timestep for each example, build the noised target.
@@ -469,6 +475,11 @@ def _eval_step(
     curr_tokens, tgt_tokens, text_embed = _encode_frame_pair(
         paligemma, rgb, subgoal_rgb, input_ids, attention_mask
     )
+    # Pool subgoal target if the model was constructed in pooled mode.
+    # Must match _train_step exactly so val and train losses are computed
+    # in the same target space.
+    if getattr(dit, "subgoal_len", 256) == 1:
+        tgt_tokens = tgt_tokens.mean(dim=1, keepdim=True)
     pose_delta = _body_frame_pose_delta(pose, subgoal_pose).to(device)
 
     B = rgb.shape[0]
@@ -819,6 +830,18 @@ def main(argv: list[str] | None = None) -> int:
         "applied when ``--pretrained_path`` is set (PixArtSubgoalDiT).",
     )
     parser.add_argument(
+        "--subgoal_pool", type=str, default="none",
+        choices=["none", "mean"],
+        help="If 'mean', mean-pool the target SigLIP tokens to a single "
+        "(token_dim,) vector before diffusion. Cuts target dim 256× "
+        "(294,912 → 1,152) which is the only way to get a healthy "
+        "data-to-dim ratio at our ~50k sample scale. Justified by the "
+        "downstream policy already pooling the subgoal tokens through a "
+        "softmax cross-attn to a single scene_summary vector — the "
+        "256-token spatial structure was wasted capacity. 'none' = legacy "
+        "256-token target.",
+    )
+    parser.add_argument(
         "--cos_loss_weight", type=float, default=0.0,
         help="Weight on the explicit cos-sim loss term (added to ε-MSE). "
         "Reconstructs x0 from (x_t, ε_pred, α_bar_t) and adds (1 - "
@@ -898,6 +921,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
+    parser.add_argument("--wandb_project", type=str, default="skyvla-subgoal-dit",
+                        help="W&B project name. Empty string disables wandb.")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="W&B entity (team/user). Default = personal.")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="W&B run name. Defaults to basename(out_dir).")
+    parser.add_argument("--wandb_mode", type=str, default="online",
+                        choices=["online", "offline", "disabled"])
+
     args = parser.parse_args(argv)
 
     device = torch.device(args.device)
@@ -954,6 +986,40 @@ def main(argv: list[str] | None = None) -> int:
             json.dump(vars(args), _f, indent=2, default=str)
     except OSError as _exc:
         print(f"[train_subgoal_dit] WARN failed to persist args.json: {_exc}")
+
+    # ----- wandb -------------------------------------------------------
+    # Best-effort: wandb failures (offline, no key, network) must never
+    # kill training. Resumed runs use id = basename(out_dir) so per-step
+    # series stitch together across crash-loop relaunches.
+    wandb_run = None
+    if args.wandb_project and args.wandb_mode != "disabled":
+        key_file = Path("/home/ubuntu/SkyVLA/.wandb_key")
+        if "WANDB_API_KEY" not in os.environ and key_file.exists():
+            try:
+                os.environ["WANDB_API_KEY"] = key_file.read_text().strip()
+            except OSError as _exc:
+                print(f"[train_subgoal_dit] WARN read .wandb_key: {_exc}")
+        try:
+            import wandb as _wandb
+            run_name = args.wandb_run_name or out_dir.name
+            wandb_run = _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=run_name,
+                id=run_name,
+                resume="allow",
+                mode=args.wandb_mode,
+                config=vars(args),
+                dir=str(out_dir),
+            )
+            print(
+                f"[train_subgoal_dit] wandb: project={args.wandb_project} "
+                f"run={run_name} mode={args.wandb_mode} "
+                f"url={getattr(wandb_run, 'url', '?')}"
+            )
+        except Exception as _exc:
+            print(f"[train_subgoal_dit] WARN wandb init failed: {_exc!r}")
+            wandb_run = None
 
     dtype_map = {
         "float16": torch.float16,
@@ -1107,6 +1173,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg_drop_horizon=args.cfg_drop_horizon,
             cfg_drop_joint=args.cfg_drop_joint,
             repa_layer_idx=args.repa_layer_idx,
+            subgoal_pool=args.subgoal_pool,
         ).to(device)
         print(
             f"[train_subgoal_dit] using PixArt-Σ pretrained backbone "
@@ -1258,10 +1325,27 @@ def main(argv: list[str] | None = None) -> int:
                 f"[train_subgoal_dit] WARN failed to load prior history.json "
                 f"({_exc}); starting fresh history list"
             )
+    # EMA smoothers for noisy per-step metrics so the wandb chart shows
+    # actual training progress instead of batch-level jitter (per-batch
+    # train_cos swings ±0.5; the trend is what matters). Global across
+    # epochs so the chart is continuous through epoch boundaries.
+    _ema_alpha = 0.02  # ~50-step half-life; ~99% mass in last 250 steps
+    _ema_state: dict[str, float] = {}
+    def _ema_update(key: str, val: float) -> float:
+        prev = _ema_state.get(key)
+        new = val if prev is None else (1 - _ema_alpha) * prev + _ema_alpha * val
+        _ema_state[key] = new
+        return new
+
+    nan_skip_cum = 0  # cumulative across epochs — for "instability rate"
+    best_val_cos_logged = -1.0  # for wandb val/best_cos running max
+
     for epoch in range(start_epoch, args.epochs):
         dit.train()
         t0 = time.time()
         loss_sum, n_valid_sum, n_steps = 0.0, 0, 0
+        train_cos_epoch_sum = 0.0
+        train_cos_epoch_n = 0
         nan_skip_count = 0
         for step, batch in enumerate(train_loader):
             _apply_warmup(global_step)
@@ -1317,6 +1401,25 @@ def main(argv: list[str] | None = None) -> int:
             loss_sum += metrics["loss"] * metrics["n_valid"]
             n_valid_sum += metrics["n_valid"]
             n_steps += 1
+            if "train_cos" in metrics:
+                train_cos_epoch_sum += float(metrics["train_cos"]) * metrics["n_valid"]
+                train_cos_epoch_n += metrics["n_valid"]
+
+            # Update EMAs every step (cheap; chart smoothness depends on
+            # this even if we only log every N steps).
+            _ema_loss = _ema_update("loss", float(metrics["loss"]))
+            _ema_train_cos = (
+                _ema_update("train_cos", float(metrics["train_cos"]))
+                if "train_cos" in metrics else None
+            )
+            _ema_repa_cos = (
+                _ema_update("repa_cos", float(metrics["repa_cos"]))
+                if "repa_cos" in metrics else None
+            )
+            _ema_cos_loss = (
+                _ema_update("cos_loss", float(metrics["cos_loss"]))
+                if "cos_loss" in metrics else None
+            )
 
             if step % args.log_every == 0:
                 cur_lr = optimizer.param_groups[0]["lr"]
@@ -1331,6 +1434,24 @@ def main(argv: list[str] | None = None) -> int:
                     f"lr={cur_lr:.2e}{extras}",
                     flush=True,
                 )
+                # W&B: only smoothed progress signals — raw per-batch
+                # numbers swing too wildly to be measurable. Drop
+                # lr/epoch/step_in_epoch (already encoded in the gstep
+                # x-axis) and n_valid (debug noise).
+                if wandb_run is not None:
+                    try:
+                        log_payload: dict[str, float] = {
+                            "train/loss_ema": _ema_loss,
+                        }
+                        if _ema_train_cos is not None:
+                            log_payload["train/train_cos_ema"] = _ema_train_cos
+                        if _ema_cos_loss is not None:
+                            log_payload["train/cos_loss_ema"] = _ema_cos_loss
+                        if _ema_repa_cos is not None:
+                            log_payload["train/repa_loss_ema"] = 1.0 - _ema_repa_cos
+                        wandb_run.log(log_payload, step=global_step)
+                    except Exception as _exc:
+                        print(f"[train_subgoal_dit] WARN wandb.log step: {_exc!r}")
 
             # Periodic mid-epoch checkpoint. Saves ``last.pt`` only —
             # ``best.pt`` is gated on a full val pass which doesn't
@@ -1397,6 +1518,44 @@ def main(argv: list[str] | None = None) -> int:
 
         history.append(train_log)
         print(f"[train_subgoal_dit] epoch {epoch} → {train_log}")
+        nan_skip_cum += nan_skip_count
+        if wandb_run is not None:
+            try:
+                # The ONLY metrics that matter for "is training getting
+                # better?" — val_cos curves (seen, ood, gap), best so
+                # far, mean train_cos for the epoch, and an instability
+                # ratio. Everything else lives in the trainer log.
+                val_cos = train_log.get("val_cos")
+                val_ood_cos = train_log.get("val_ood_cos")
+                if val_cos is not None and val_cos > best_val_cos_logged:
+                    best_val_cos_logged = float(val_cos)
+                payload: dict[str, float] = {
+                    "val/cos_seen": float(val_cos) if val_cos is not None else float("nan"),
+                    "val/cos_ood": float(val_ood_cos) if val_ood_cos is not None else float("nan"),
+                    "val/best_cos": best_val_cos_logged,
+                    "epoch/train_loss": float(train_log["train_loss"]),
+                    "epoch/time_s": float(train_log["time_s"]),
+                    "epoch/idx": float(epoch),
+                    # Health: nan-skip ratio across the epoch — > 5% means
+                    # the optimization is fighting numerical instability
+                    # and any val_cos number is fragile.
+                    "epoch/nan_skip_ratio": (
+                        nan_skip_count / max(n_steps + nan_skip_count, 1)
+                    ),
+                }
+                if val_cos is not None and val_ood_cos is not None:
+                    payload["val/cos_gap_seen_ood"] = float(val_cos) - float(val_ood_cos)
+                if "val_loss" in train_log:
+                    payload["val/loss_seen"] = float(train_log["val_loss"])
+                if "val_ood_loss" in train_log:
+                    payload["val/loss_ood"] = float(train_log["val_ood_loss"])
+                if train_cos_epoch_n > 0:
+                    payload["epoch/train_cos_mean"] = (
+                        train_cos_epoch_sum / train_cos_epoch_n
+                    )
+                wandb_run.log(payload, step=global_step)
+            except Exception as _exc:
+                print(f"[train_subgoal_dit] WARN wandb.log epoch: {_exc!r}")
 
         if (epoch + 1) % max(1, args.save_every) == 0 or epoch == args.epochs - 1:
             # Re-ensure the parent directory exists right before save. We
@@ -1471,6 +1630,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 break
 
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception as _exc:
+            print(f"[train_subgoal_dit] WARN wandb finish: {_exc!r}")
     return 0
 
 

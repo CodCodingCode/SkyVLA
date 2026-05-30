@@ -2,6 +2,65 @@
 
 Rules for me (the agent) when working in this repo. Short and rule-focused.
 
+## W&B is on by default — don't disable it
+
+The DiT trainer (`openfly/train_subgoal_dit.py`) auto-initializes a W&B run on every launch. The API key lives at `/home/ubuntu/SkyVLA/.wandb_key` (mode 600, gitignored); the shell wrapper exports it as `WANDB_API_KEY` before invoking Python, and the trainer falls back to reading the same file if the env var is missing.
+
+Defaults:
+- project: `skyvla-subgoal-dit`
+- run name / id: `basename(out_dir)` — same run dir → same W&B run (auto-resumes via `resume="allow"`), so crash-loop relaunches stitch into one continuous series.
+- mode: `online`
+
+**Log only measurable training progress to W&B, nothing else.** No per-step jitter, no operational counters, no constants. The dashboard exists to answer one question: "is training getting better?" Every metric you add must move the needle on that question. Specifically:
+
+DO log:
+- **`val/cos_seen`, `val/cos_ood`** — THE metric. The whole reason we train. Per-epoch.
+- **`val/cos_gap_seen_ood`** — generalization gap (seen − ood). Near zero = generalizing. Going up = overfit.
+- **`val/best_cos`** — running max of `val/cos_seen`. Easy visual ceiling.
+- **`val/loss_seen`, `val/loss_ood`** — secondary, but worth tracking the trend.
+- **`epoch/train_cos_mean`** — denoised in-training direction quality (a leading indicator of what val_cos will be).
+- **`epoch/train_loss`** — the headline objective.
+- **`epoch/nan_skip_ratio`** — health check. > 5% means the run is fighting numerical instability and val numbers are fragile; investigate before drawing conclusions.
+- **`train/*_ema`** (per step, EMA-smoothed) — `train/loss_ema`, `train/train_cos_ema`, `train/cos_loss_ema`, `train/repa_loss_ema`. EMA half-life ~50 steps. These are how you watch training "live" — raw per-batch numbers swing too wildly (`train_cos` jitters ±0.5 batch-to-batch).
+
+DO NOT log:
+- Raw per-step metrics (use EMA instead).
+- `lr` (constant after warmup; not progress).
+- `epoch_idx`, `step_in_epoch` (already encoded in gstep on the x-axis).
+- `n_valid` per batch (debug noise).
+- Operational counters that don't move with training quality (`nan_skip_count` cumulative is debug, `nan_skip_ratio` per epoch is signal).
+- Anything with no monotonic / interpretable shape.
+
+If you're tempted to add a new metric, ask: "would this on a chart change what I'd do next?" If the answer is no, it goes to stdout, not W&B.
+
+To turn it off for a one-shot smoke run: `--wandb_mode disabled` (or `--wandb_project ""`). Don't disable on long runs — we want the dashboard.
+
+The .wandb_key file must never be committed. .gitignore already covers `.wandb_key` and `.env.local`. If a new credential file is needed, add it to .gitignore first.
+
+## After launching ANY training or eval run — ALWAYS give tail commands
+
+**Hard rule, no exceptions.** Whenever you launch a training run, eval, ablation, or any background process that writes to a log file, immediately follow the launch confirmation with the user-runnable tail commands. The user has explicitly asked for this — they want to be able to watch progress without having to ask me where the log is.
+
+Default set to surface (adapt grep filters to whatever metrics the run produces):
+
+```bash
+# Live training-step lines
+tail -f <LOG> | grep -E "epoch [0-9]+ step"
+
+# Clean tail (warnings filtered)
+tail -f <LOG> | grep -vE "UserWarning|tensor_numpy|ascontiguous|FutureWarning"
+
+# Epoch summaries + saves + restarts only (the moments that matter)
+tail -f <LOG> | grep -E "epoch [0-9]+ →|saved best|periodic save|==== launch|EXIT reason"
+
+# Attach to live tmux (interactive view; Ctrl-B D to detach)
+tmux attach -t <SESS>
+```
+
+For eval scripts that don't emit per-step lines, default to a simpler set — just the clean tail + a one-shot "show results so far" pattern.
+
+Phrasing: surface them in a small code block right after the "tmux session: X / log: Y" lines. Don't bury them later in the message; the user reads top-down.
+
 ## Long-running training runs
 
 **Always launch long training runs (>15 min) inside a tmux session.** Never use bare `nohup ... &` for SFT / DiT / RL training — tmux is interactively attachable, has cleaner process management, and the user explicitly asked for it so that closing their laptop never matters.

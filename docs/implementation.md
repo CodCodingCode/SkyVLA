@@ -124,6 +124,89 @@ deterministically given the action sequence.
 For the motivation see the [whitepaper](whitepaper) and the
 [research plan](research-plan).
 
+## 4½. Breaking the modal collapse — what training the WM actually took
+
+For two weeks the WM val cosine similarity sat at the noise floor
+(`val_cos ≈ 0`) despite training loss dropping cleanly. We tracked it to
+a degenerate ε-MSE minimum: the model was learning to predict
+near-mean noise, which minimises MSE while contributing nothing to
+direction. The investigation ruled out, in order, hardware (no ECC,
+GPU was fine), data scarcity (a balanced 50 k step-pair set didn't fix
+it), regularisation (CFG + REPA marginal), and sampling quality (DDIM
+ablation flat at 0). The objective itself was the problem.
+
+Three changes broke the collapse together:
+
+| Change | Why | CLI |
+|---|---|---|
+| **Mean-pool the subgoal target to 1 × 2048** | Predicting all 256 SigLIP tokens dilutes the directional signal across a 524 288-dim flatten. PaliGemma's cross-attention pools tokens to a single scene summary anyway, so pooling at the WM target costs nothing downstream and concentrates supervision on the direction the policy uses. | `--subgoal_pool mean` |
+| **Direct cos-loss on `x0`** | Reconstruct the predicted `x0` from ε every step (`x0 = (x_t − √(1−ᾱ_t) · ε) / √ᾱ_t`), take cosine sim with target, add `(1 − cos)` to loss. ε-MSE has the degenerate mean-prediction minimum; cos-on-`x0` does not. | `--cos_loss_weight 0.3` |
+| **Keep [REPA](https://arxiv.org/abs/2410.06940)** | Saturated near +0.99 throughout, so its own gradient is tiny — but it works as a representation prior that keeps intermediate features aligned with the target while cos-loss pulls the output head. | `--repa_layer_idx 8 --repa_weight 0.1` |
+
+Numbers across two epochs of the balanced training set:
+
+| Epoch | train_loss | val_loss | **val_cos (seen)** | **val_cos (unseen)** |
+|------:|-----------:|---------:|-------------------:|---------------------:|
+| 0 | 0.838 | 1.007 | **+0.086** | **+0.085** |
+| 1 | 0.811 | 1.019 | **+0.107** | **+0.108** |
+
+First time clearing the noise floor. The unseen split tracking — and
+at epoch 1 beating — the seen split is the generalisation signal we
+were missing. A multi-epoch resume run is in flight; live curves on
+[W&B](https://wandb.ai/nathanyan2008p-personal/skyvla-subgoal-dit).
+
+### Loss-flow diagram
+
+```mermaid
+flowchart TB
+    A[Current frame RGB] --> B[PaliGemma SigLIP encoder<br/>256 × 2048, frozen]
+    T[Instruction + sub-instruction] --> TT[PaliGemma text encoder]
+    P[Body-frame pose delta<br/>last action, horizon] --> PE[Pose / action / horizon embeddings]
+    B --> C[curr SigLIP tokens]
+    C --> DIT[SubgoalDiT denoiser<br/>~150M params, hidden=1152]
+    TT --> DIT
+    PE --> DIT
+    DIT -- intermediate layer 8 --> REPA[REPA proj head]
+    DIT --> EPS[ε prediction]
+    EPS -- x0 reconstruction --> X0[predicted x0<br/>mean-pooled to 1 × 2048]
+    F[Next-keyframe SigLIP<br/>mean-pooled to 1 × 2048] --> CMP[cos x0, target]
+    F --> EPSMSE[ε-MSE  with min-SNR-γ]
+    EPS --> EPSMSE
+    F --> REPACMP[REPA aux cos]
+    REPA --> REPACMP
+    X0 --> CMP
+    EPSMSE --> L[Total loss]
+    CMP --> L
+    REPACMP --> L
+    L --> OPT[AdamW + warmup + grad clip<br/>+ NaN-skip + EMA]
+```
+
+### Per-env data balancing — a subtle gotcha
+
+The OpenFly download is incomplete: only ~14 % of `train.json` steps
+have local frames, and coverage is wildly uneven across envs
+(`env_ue_bigcity` 91 %, `env_gs_ecust` 0 %). A naïve `--per_env_max_episodes`
+cap fires *before* the image-existence filter, so any cap large enough
+to produce a usable training set is still ~95 % bigcity. The new
+`--per_env_max_index_samples N` caps step-pairs *after* the image
+filter — N=10000 produces a ~50 k step-pair set with bigcity at ~20 %.
+This is what "balanced" means in the result table above. Details in
+[CLAUDE.md](https://github.com/CodCodingCode/SkyVLA/blob/main/CLAUDE.md)
+under "Image data caveat".
+
+### Crash-resilient training
+
+Xid 43 ("GPU stopped processing") fires on this A100 at roughly ~50 % /
+hour of sustained training. The trainer ships with `--auto_resume` +
+`--ckpt_every_steps 500` + a tmux crash-loop wrapper that restarts on
+non-clean exit, so a mid-run segfault drops at most ~3 min and resumes
+with optimizer / EMA / history intact. Diagnostics
+(`faulthandler.dump_traceback_later(120)`) are routed to
+`<run_dir>/diagnostics.log` so they don't pollute the main training
+log. Pattern documented in
+[CLAUDE.md](https://github.com/CodCodingCode/SkyVLA/blob/main/CLAUDE.md)
+under "Long-running training runs".
+
 ## 5. Training tracks
 
 | Track | Trains | Notes |

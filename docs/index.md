@@ -15,6 +15,21 @@ Aerial vision-language navigation on the [OpenFly](https://arxiv.org/abs/2502.18
 
 Do generative visual subgoals + a reward-sparsity curriculum during online RL improve navigation on **genuinely new scenes** — and which type of domain shift does each piece actually close?
 
+## Live demo
+
+P3 policy (PaliGemma BC + SubgoalDiT) navigating the unseen `env_ue_smallcity` Unreal scene. 1920×1080 FPV with HUD; a companion top-down view tracks position vs goal.
+
+<video controls preload="metadata" width="100%" style="max-width: 880px; border-radius: 6px;">
+  <source src="https://github.com/CodCodingCode/SkyVLA/raw/main/videos/p3_realsim.mp4" type="video/mp4">
+  <a href="https://github.com/CodCodingCode/SkyVLA/raw/main/videos/p3_realsim.mp4">Watch the demo (mp4)</a>
+</video>
+
+Reproducer: [`docs/RECORDING_DEMOS.md`](https://github.com/CodCodingCode/SkyVLA/blob/main/docs/RECORDING_DEMOS.md). Top-down companion: [`videos/p3_realsim_topdown.mp4`](https://github.com/CodCodingCode/SkyVLA/blob/main/videos/p3_realsim_topdown.mp4).
+
+## What's new — May 2026 WM breakthrough
+
+The `SubgoalDiT` val cosine similarity sat at the noise floor for two weeks despite training loss dropping cleanly. Diagnosis: a degenerate ε-MSE minimum. Fix: mean-pool the subgoal target to 1 × 2048, add a direct cos-loss on the reconstructed `x0`, keep REPA on as a representation regulariser. First time clearing the noise floor — `val_cos: 0 → 0.107` across two epochs with the **unseen split matching the seen split** (the generalisation signal we were missing). Full writeup: [Implementation §4½](implementation/#4-breaking-the-modal-collapse--what-training-the-wm-actually-took) · Live training: [W&B dashboard](https://wandb.ai/nathanyan2008p-personal/skyvla-subgoal-dit).
+
 ## The stack
 
 ```

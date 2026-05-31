@@ -45,10 +45,10 @@ indoor_uav/
   covered 0.96 — 5/5 PASS.
 - `smoke_pipeline`: synthetic room -> GS map (18k Gaussians) -> coverage ->
   NBV correctly picks the unvisited view (0.601 > 0.280) — 5/5 PASS.
-- **Real scenes**: Habitat-Sim 0.3.3 + git-lfs meshes (apartment_1 /
+- **Real scenes**: Habitat-Sim 0.3.3 + git-lfs meshes (apartment_1 50MB /
   van-gogh-room / skokloster-castle). 12 real RGB-D frames from apartment_1 ->
-  197k-Gaussian map -> coverage rises monotonically 0.045 -> 0.546 across the
-  patrol. Full real-scene sim -> GS -> reward path confirmed.
+  41,338-Gaussian map -> per-view coverage 0.2-1.0 (well-seen views reach 1.0).
+  Full real-scene sim -> GS -> coverage-reward path confirmed end-to-end.
 
 ## Quickstart
 

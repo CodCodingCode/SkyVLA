@@ -67,7 +67,7 @@ def fisher_view_info(gmap: GaussianMap, pose_c2w, K, width, height, obs_count=No
     d = gmap.device
     viewmat = torch.linalg.inv(pose_c2w.to(d).float())[None]
     _, _, meta = gsplat.rasterization(
-        gmap.means, gmap.quats, gmap.scales, gmap.colors, gmap.opacities,
+        gmap.means, gmap.quats, gmap.scales, gmap.opacities, gmap.colors,
         viewmat, K.to(d).float()[None], width, height,
     )
     radii = meta.get("radii", None)

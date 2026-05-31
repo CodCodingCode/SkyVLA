@@ -160,7 +160,7 @@ class GaussianMap:
             )
         viewmat = self._viewmat(pose_c2w.to(d).float())[None]
         out, alpha, _ = gsplat.rasterization(
-            self.means, self.quats, self.scales, self.colors, self.opacities,
+            self.means, self.quats, self.scales, self.opacities, self.colors,
             viewmat, K.to(d).float()[None], width, height,
         )
         return out[0], alpha[0]

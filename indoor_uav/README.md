@@ -40,11 +40,15 @@ indoor_uav/
 
 ## Verified on this box (1× A100 40GB, cu130)
 
-- gsplat 1.5.3 builds + rasterizes against cu130 (sm_80).
-- `smoke_gs`: coverage facing geometry 0.976 vs away 0.000; exploration gain
-  empty 1.0 vs covered 0.025 — ALL PASS.
-- `smoke_pipeline`: synthetic room -> GS map -> accumulating coverage -> NBV —
-  5/5 PASS.
+- gsplat 1.5.3 builds + rasterizes against cu130 (sm_80); JIT backend cached.
+- `smoke_gs`: coverage facing geometry > away; exploration gain empty 1.0 vs
+  covered 0.96 — 5/5 PASS.
+- `smoke_pipeline`: synthetic room -> GS map (18k Gaussians) -> coverage ->
+  NBV correctly picks the unvisited view (0.601 > 0.280) — 5/5 PASS.
+- **Real scenes**: Habitat-Sim 0.3.3 + git-lfs meshes (apartment_1 /
+  van-gogh-room / skokloster-castle). 12 real RGB-D frames from apartment_1 ->
+  197k-Gaussian map -> coverage rises monotonically 0.045 -> 0.546 across the
+  patrol. Full real-scene sim -> GS -> reward path confirmed.
 
 ## Quickstart
 

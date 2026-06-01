@@ -22,7 +22,11 @@ import numpy as np
 
 def _build_sim(scene, res, hfov):
     import habitat_sim
-    bk = habitat_sim.SimulatorConfiguration(); bk.scene_id = scene; bk.enable_physics = False
+    # enable_physics=True is REQUIRED: without it cast_ray hits nothing (0/100
+    # rays register), so every collision/segment check silently passes and the
+    # camera flies through walls. With Bullet on, raycasts hit the collision
+    # mesh reliably (100/100, floor detected) — this is the real clipping fix.
+    bk = habitat_sim.SimulatorConfiguration(); bk.scene_id = scene; bk.enable_physics = True
     rgb = habitat_sim.CameraSensorSpec()
     rgb.uuid = "rgb"; rgb.sensor_type = habitat_sim.SensorType.COLOR
     rgb.resolution = [res, res]; rgb.hfov = hfov
@@ -215,10 +219,22 @@ def main() -> int:
         return out
 
     def verify(path):
-        """Judge the path by what the camera RENDERS (depth), at the actual film
-        headings. Returns the count of bad frames (wall-in-face / void / too
-        close). This is the viewer's notion of clipping — the raycast version
-        flew through scan holes and falsely passed."""
+        """Two independent gates (physics now ON, so raycasts actually hit):
+          1. SEGMENT crossings — raycast each consecutive pair; a hit before the
+             next point means the straight move passed THROUGH a wall (the
+             'phasing through walls' bug). With physics on this is real.
+          2. DEPTH per-frame — what the camera renders (wall-in-face / void).
+        Returns (segment_crossings, bad_frames)."""
+        cross = 0
+        for i in range(len(path) - 1):
+            a, b = path[i], path[i + 1]
+            v = b - a; L = float(np.linalg.norm(v))
+            if L < 1e-5:
+                continue
+            d = (v / L).astype(np.float32)
+            h = sim.cast_ray(habitat_sim.geo.Ray(a.astype(np.float32), d), L)
+            if h.has_hits and len(h.hits) > 0 and h.hits[0].ray_distance < L - 0.03:
+                cross += 1
         bad = 0
         for i in range(len(path)):
             j = min(i + 3, len(path) - 1)
@@ -227,7 +243,7 @@ def main() -> int:
                 fwd = path[i] - path[max(i - 1, 0)]
             isbad, _ = frame_is_bad(sim, path[i], fwd, look_at_habitat)
             bad += int(isbad)
-        return bad
+        return cross, bad
 
     # ---- plan -> verify -> REPLAN until the actual rendered path is clean ----
     path = None
@@ -256,13 +272,14 @@ def main() -> int:
         cand_path = resample(route)
         if cand_path is None:
             continue
-        bad = verify(cand_path)
+        cross, bad = verify(cand_path)
         frac_bad = bad / max(len(cand_path), 1)
         print(f"  plan attempt {attempt}: legs={legs} verts={len(route)} "
-              f"bad_frames={bad}/{len(cand_path)} ({frac_bad:.0%})")
-        if frac_bad <= args.max_bad_frac:
+              f"wall_crossings={cross} bad_frames={bad}/{len(cand_path)} ({frac_bad:.0%})")
+        # HARD gate: zero segment wall-crossings (the phasing bug) AND few bad frames
+        if cross == 0 and frac_bad <= args.max_bad_frac:
             path = cand_path
-            print(f"ACCEPTED path on attempt {attempt} ({frac_bad:.0%} bad frames)")
+            print(f"ACCEPTED on attempt {attempt}: 0 wall-crossings, {frac_bad:.0%} bad frames")
             break
     if path is None:
         print("could not find a clean path; aborting (will not render a clipping clip).")

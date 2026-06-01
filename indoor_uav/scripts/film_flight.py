@@ -44,6 +44,30 @@ def clearance_3d(sim, p, radius):
     return True
 
 
+def segment_clear(sim, a, b, radius):
+    """True if the straight path a->b clears geometry.
+
+    Two free waypoints can still have a wall BETWEEN them, so we (1) raycast
+    a->b and require the first hit to be beyond the segment, and (2) sample
+    clearance spheres densely along it. This is the edge check the previous
+    version was missing (it only validated the endpoints).
+    """
+    import habitat_sim
+    a = np.asarray(a, np.float32); b = np.asarray(b, np.float32)
+    seg = b - a; L = float(np.linalg.norm(seg))
+    if L < 1e-4:
+        return True
+    d = seg / L
+    hit = sim.cast_ray(habitat_sim.geo.Ray(a, d), max_distance=L)
+    if hit.has_hits and len(hit.hits) > 0 and hit.hits[0].ray_distance < L:
+        return False  # a wall sits directly on the line of travel
+    n = max(2, int(L / (radius * 0.75)))  # dense sphere samples along the edge
+    for t in np.linspace(0.0, 1.0, n):
+        if not clearance_3d(sim, a + seg * t, radius):
+            return False
+    return True
+
+
 def catmull_rom(pts, samples_per_seg):
     """Smooth spline through control points (clamped ends)."""
     P = np.asarray(pts, np.float32)
@@ -104,25 +128,43 @@ def main() -> int:
     start[1] += 1.0
     if clearance_3d(sim, start, args.drone_radius):
         wps.append(start)
-    while len(wps) < args.waypoints and tries < 8000:
+    while len(wps) < args.waypoints and tries < 20000:
         tries += 1
         p = lo + rng.random(3).astype(np.float32) * ext
-        p[1] = lo[1] + rng.uniform(0.15, 0.85) * ext[1]  # stay in the interior band
-        if clearance_3d(sim, p, args.drone_radius):
-            # avoid teleport-jumps: prefer points within 40% of room diagonal of last
-            if not wps or np.linalg.norm(p - wps[-1]) < 0.5 * np.linalg.norm(ext):
-                wps.append(p)
+        p[1] = lo[1] + rng.uniform(0.15, 0.85) * ext[1]  # interior height band
+        if not clearance_3d(sim, p, args.drone_radius):
+            continue
+        # the connecting SEGMENT to the last waypoint must be clear, and not a
+        # teleport jump — this is what stops the path cutting through a wall.
+        if wps:
+            if np.linalg.norm(p - wps[-1]) > 0.4 * np.linalg.norm(ext):
+                continue
+            if not segment_clear(sim, wps[-1], p, args.drone_radius):
+                continue
+        wps.append(p)
     if len(wps) < 3:
-        print(f"only found {len(wps)} free waypoints; scene may be tight. aborting.")
+        print(f"only found {len(wps)} connectable free waypoints; scene may be tight.")
         sim.close(); return 1
-    print(f"planned {len(wps)} collision-free 3D waypoints")
+    print(f"planned {len(wps)} waypoints with collision-free connecting segments")
 
-    # ---- smooth spline + frame count ----
+    # ---- smooth spline ----
     n_frames = int(args.seconds * args.fps)
     sps = max(2, n_frames // (len(wps)))
     path = catmull_rom(wps, sps)[:n_frames]
-    if len(path) < n_frames:  # pad tail
+    if len(path) < n_frames:
         path = np.vstack([path] + [path[-1]] * (n_frames - len(path)))
+
+    # ---- VALIDATE the actual spline: the curve can still bow into geometry
+    #      between control points. Clamp any unsafe frame to the last safe one
+    #      so the rendered camera never sits inside a wall. ----
+    safe = path.copy()
+    bad = 0
+    for i in range(len(safe)):
+        if not clearance_3d(sim, safe[i], args.drone_radius * 0.9):
+            safe[i] = safe[i - 1] if i > 0 else safe[i]
+            bad += 1
+    path = safe
+    print(f"spline validated: {bad}/{len(path)} frames clamped (were inside geometry)")
 
     tmpdir = tempfile.mkdtemp(prefix="flight_")
     print(f"rendering {len(path)} frames @ {args.res}px ...")

@@ -31,10 +31,29 @@ from indoor_uav.policy import ActorCritic
 _TAG = "[train_ppo_coverage]"
 
 
+def _resolve_scene(args):
+    """Pick a scene path. If --manifest given, sample from the balanced set."""
+    if args.manifest:
+        import glob
+        import json
+        man = json.load(open(args.manifest))
+        ids = man.get("scene_ids", [])
+        sid = ids[args.scene_idx % len(ids)] if ids else None
+        root = "/home/ubuntu/assets/indoor_scenes/versioned_data/hm3d-0.2/hm3d"
+        hits = glob.glob(f"{root}/*/*{sid}*/*.basis.glb") if sid else []
+        if hits:
+            return hits[0]
+        print(f"{_TAG} WARN manifest scene {sid} not found; falling back to --scene")
+    return args.scene
+
+
 def _make_env(args, device):
     if args.backend == "habitat":
         from indoor_uav.sim.habitat_room import HabitatRoom
-        sim = HabitatRoom(args.scene, width=args.sim_res, height=args.sim_res, device=device)
+        scene = _resolve_scene(args)
+        sim = HabitatRoom(scene, width=args.sim_res, height=args.sim_res, device=device,
+                          free_space=args.free_space, drone_radius=args.drone_radius)
+        print(f"{_TAG} scene={scene} free_space={args.free_space}")
     else:
         from indoor_uav.sim import SyntheticRoom
         sim = SyntheticRoom(width=args.sim_res, height=args.sim_res, device=device, seed=args.seed)
@@ -65,6 +84,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=["synthetic", "habitat"], default="synthetic")
     ap.add_argument("--scene", default=None)
+    ap.add_argument("--manifest", default=None,
+                    help="balanced scene manifest (scenes_balanced_train.json); sample from it")
+    ap.add_argument("--scene_idx", type=int, default=0, help="index into manifest scene_ids")
+    ap.add_argument("--free_space", choices=["clearance3d", "navmesh"], default="clearance3d")
+    ap.add_argument("--drone_radius", type=float, default=0.18)
     ap.add_argument("--run_dir", required=True)
     ap.add_argument("--total_steps", type=int, default=20000)
     ap.add_argument("--rollout", type=int, default=1024)

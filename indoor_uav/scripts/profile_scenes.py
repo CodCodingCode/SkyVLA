@@ -53,7 +53,7 @@ def _semantic_counts(txt_path: str):
 def profile_split(scene_root: str, split: str) -> list[dict]:
     import habitat_sim
 
-    pat = os.path.join(scene_root, "*", split, "*", "*.basis.glb")
+    pat = os.path.join(scene_root, split, "*", "*.basis.glb")
     scenes = sorted(glob.glob(pat))
     out = []
     for sc in scenes:

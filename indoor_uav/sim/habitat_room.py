@@ -39,6 +39,8 @@ class HabitatRoom(IndoorSim):
         hfov_deg: float = 90.0,
         sensor_height: float = 0.0,
         device: torch.device | None = None,
+        free_space: str = "clearance3d",   # "clearance3d" (true free-flight) | "navmesh" (2.5D floor)
+        drone_radius: float = 0.18,
     ) -> None:
         try:
             import habitat_sim  # noqa: F401
@@ -50,6 +52,8 @@ class HabitatRoom(IndoorSim):
             ) from exc
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.width, self.height = width, height
+        self.free_space = free_space
+        self.drone_radius = float(drone_radius)
         self._sim = self._make_sim(scene_path, width, height, hfov_deg, sensor_height)
         f = 0.5 * width / torch.tan(torch.tensor(hfov_deg * 3.14159265 / 360.0))
         self._K = torch.tensor(
@@ -87,9 +91,33 @@ class HabitatRoom(IndoorSim):
         return (torch.tensor(lo, device=d).float(), torch.tensor(hi, device=d).float())
 
     def is_free(self, xyz: torch.Tensor) -> bool:
+        """Free-space test for a drone.
+
+        ``clearance3d`` (default): a true 3D test — a drone-radius sphere at the
+        point must clear geometry in all directions (rays cast around it). Works
+        mid-air and across floors, the right model for a tiny flyer in a
+        multi-floor house. ``navmesh``: the 2.5D walkable surface (floor-confined;
+        kept for speed / comparison).
+        """
         p = xyz.detach().cpu().float().reshape(3).tolist()
         hab = [p[0], -p[1], -p[2]]  # OpenCV world -> habitat
-        return bool(self._sim.pathfinder.is_navigable(hab))
+        if self.free_space == "navmesh":
+            return bool(self._sim.pathfinder.is_navigable(hab))
+        return self._clearance_3d(hab, self.drone_radius)
+
+    def _clearance_3d(self, p_hab, radius: float) -> bool:
+        import numpy as np
+        import habitat_sim
+
+        for v in np.linspace(-1, 1, 5):
+            h = float(np.sqrt(max(0.0, 1 - v * v)))
+            for a in np.linspace(0, 2 * np.pi, 6, endpoint=False):
+                d = np.array([h * np.cos(a), v, h * np.sin(a)], dtype=np.float32)
+                ray = habitat_sim.geo.Ray(np.array(p_hab, dtype=np.float32), d)
+                hit = self._sim.cast_ray(ray, max_distance=radius * 1.6)
+                if hit.has_hits and len(hit.hits) > 0 and hit.hits[0].ray_distance < radius:
+                    return False
+        return True
 
     @torch.no_grad()
     def render(self, pose_c2w: torch.Tensor) -> Frame:

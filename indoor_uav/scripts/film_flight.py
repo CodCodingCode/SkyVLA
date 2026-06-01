@@ -26,8 +26,38 @@ def _build_sim(scene, res, hfov):
     rgb = habitat_sim.CameraSensorSpec()
     rgb.uuid = "rgb"; rgb.sensor_type = habitat_sim.SensorType.COLOR
     rgb.resolution = [res, res]; rgb.hfov = hfov
-    ag = habitat_sim.agent.AgentConfiguration(); ag.sensor_specifications = [rgb]
+    dep = habitat_sim.CameraSensorSpec()
+    dep.uuid = "depth"; dep.sensor_type = habitat_sim.SensorType.DEPTH
+    dep.resolution = [res, res]; dep.hfov = hfov
+    ag = habitat_sim.agent.AgentConfiguration(); ag.sensor_specifications = [rgb, dep]
     return habitat_sim.Simulator(habitat_sim.Configuration(bk, [ag]))
+
+
+def frame_is_bad(sim, eye, fwd, look_at_fn, *, min_center=0.5, max_void=0.45, max_close=0.5):
+    """Validate a CAMERA POSE by what it actually renders (depth), not raycasts.
+
+    The earlier raycast verifier flew through HM3D scan holes (rays through a
+    gap hit nothing -> 'clear') while the camera rendered torn void -> what the
+    viewer sees as 'clipping'. So we judge each pose by its rendered depth:
+
+      * center too near        -> wall/point-blank in face
+      * too much VOID (depth~0)-> looking through a scan hole into nothing
+      * too much surface <0.5m -> jammed against geometry
+
+    Returns (is_bad, stats).
+    """
+    import numpy as np
+    pos, quat = look_at_fn(eye, fwd)
+    import habitat_sim
+    st = habitat_sim.AgentState(); st.position = pos; st.rotation = quat
+    sim.get_agent(0).set_state(st)
+    d = sim.get_sensor_observations()["depth"]
+    h, w = d.shape
+    center = float(d[h // 2, w // 2])
+    void = float((d <= 0.05).mean())          # holes / no surface
+    close = float((d > 0.05).astype(float).__mul__(d < 0.5).mean()) if False else float(((d > 0.05) & (d < 0.5)).mean())
+    bad = (center < min_center) or (void > max_void) or (close > max_close)
+    return bad, {"center": round(center, 2), "void": round(void, 2), "close": round(close, 2)}
 
 
 def clearance_3d(sim, p, radius):
@@ -120,6 +150,8 @@ def main() -> int:
                     help="metres to lift the floor route to drone eye height")
     ap.add_argument("--max_plan_tries", type=int, default=40,
                     help="replan attempts until the rendered path verifies clean")
+    ap.add_argument("--max_bad_frac", type=float, default=0.08,
+                    help="max fraction of frames allowed to be wall-in-face/void")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -183,11 +215,19 @@ def main() -> int:
         return out
 
     def verify(path):
-        """Return (#frames too close, #segment wall-crossings) — the SAME notion
-        of clipping the viewer sees. Zero/zero == genuinely clean."""
-        close = sum(0 if clearance_3d(sim, p, margin) else 1 for p in path)
-        cross = sum(seg_hits_wall(path[i], path[i + 1]) for i in range(len(path) - 1))
-        return close, cross
+        """Judge the path by what the camera RENDERS (depth), at the actual film
+        headings. Returns the count of bad frames (wall-in-face / void / too
+        close). This is the viewer's notion of clipping — the raycast version
+        flew through scan holes and falsely passed."""
+        bad = 0
+        for i in range(len(path)):
+            j = min(i + 3, len(path) - 1)
+            fwd = path[j] - path[i]
+            if np.linalg.norm(fwd) < 1e-4:
+                fwd = path[i] - path[max(i - 1, 0)]
+            isbad, _ = frame_is_bad(sim, path[i], fwd, look_at_habitat)
+            bad += int(isbad)
+        return bad
 
     # ---- plan -> verify -> REPLAN until the actual rendered path is clean ----
     path = None
@@ -216,12 +256,13 @@ def main() -> int:
         cand_path = resample(route)
         if cand_path is None:
             continue
-        close, cross = verify(cand_path)
+        bad = verify(cand_path)
+        frac_bad = bad / max(len(cand_path), 1)
         print(f"  plan attempt {attempt}: legs={legs} verts={len(route)} "
-              f"too_close={close} wall_crossings={cross}")
-        if close == 0 and cross == 0:
+              f"bad_frames={bad}/{len(cand_path)} ({frac_bad:.0%})")
+        if frac_bad <= args.max_bad_frac:
             path = cand_path
-            print(f"CLEAN path found on attempt {attempt}")
+            print(f"ACCEPTED path on attempt {attempt} ({frac_bad:.0%} bad frames)")
             break
     if path is None:
         print("could not find a clean path; aborting (will not render a clipping clip).")

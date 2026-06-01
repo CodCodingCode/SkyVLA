@@ -85,18 +85,25 @@ def catmull_rom(pts, samples_per_seg):
 
 
 def look_at_habitat(eye, fwd):
-    """Return (position, quaternion) for habitat agent looking along `fwd` from `eye`."""
+    """Return (position, quaternion) for a LEVEL drone camera at `eye` heading `fwd`.
+
+    Crucial: this is YAW-ONLY — a pure rotation about the world-up (+Y) axis. A
+    full look-at basis flips upside-down whenever the travel direction tilts
+    vertically (cross(fwd, up) degenerates). Real drone footage holds the
+    horizon level, so we use only the heading's horizontal component and build
+    the rotation as a single spin about +Y, which can never roll or flip.
+
+    Habitat's camera looks along -Z at zero yaw. We want it to look toward the
+    horizontal heading (fwd.x, fwd.z), so yaw = atan2(fwd.x, -fwd.z).
+    """
     import quaternion
-    fwd = fwd / (np.linalg.norm(fwd) + 1e-8)
-    # OpenCV cam basis (z fwd, y down), then convert to habitat (y up, z back)
-    up = np.array([0, -1, 0], np.float32)
-    right = np.cross(fwd, up); right /= (np.linalg.norm(right) + 1e-8)
-    up = np.cross(fwd, right)
-    Rcv = np.stack([right, up, fwd], axis=1)
-    Rhab = Rcv @ np.diag([1, -1, -1]).astype(np.float32)
-    pos_hab = np.array([eye[0], eye[1], eye[2]], np.float32) * np.array([1, 1, 1], np.float32)
-    # eye is already in habitat world coords (we plan in habitat coords below)
-    return pos_hab, quaternion.from_rotation_matrix(Rhab)
+    fx, _, fz = float(fwd[0]), float(fwd[1]), float(fwd[2])
+    if abs(fx) < 1e-6 and abs(fz) < 1e-6:
+        fz = -1.0  # degenerate (pure vertical move): keep last sensible heading
+    yaw = np.arctan2(fx, -fz)
+    q = quaternion.from_rotation_vector(np.array([0.0, yaw, 0.0], np.float32))
+    pos_hab = np.array([eye[0], eye[1], eye[2]], np.float32)
+    return pos_hab, q
 
 
 def main() -> int:
@@ -109,62 +116,116 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=20.0)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--drone_radius", type=float, default=0.18, help="clearance margin (m)")
+    ap.add_argument("--fly_height", type=float, default=0.8,
+                    help="metres to lift the floor route to drone eye height")
+    ap.add_argument("--max_plan_tries", type=int, default=40,
+                    help="replan attempts until the rendered path verifies clean")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    import habitat_sim  # noqa: F401
+    import habitat_sim
     import imageio.v2 as imageio
 
     sim = _build_sim(args.scene, args.res, args.hfov)
-    lo, hi = sim.pathfinder.get_bounds(); lo = np.array(lo); hi = np.array(hi)
-    ext = hi - lo
+    pf = sim.pathfinder
     rng = np.random.default_rng(args.seed)
 
-    # ---- plan collision-free 3D waypoints, biased to interior heights ----
-    wps = []
-    tries = 0
-    # start from a navigable floor point lifted up (a believable take-off spot)
-    start = np.array(sim.pathfinder.get_random_navigable_point(), np.float32)
-    start[1] += 1.0
-    if clearance_3d(sim, start, args.drone_radius):
-        wps.append(start)
-    while len(wps) < args.waypoints and tries < 20000:
-        tries += 1
-        p = lo + rng.random(3).astype(np.float32) * ext
-        p[1] = lo[1] + rng.uniform(0.15, 0.85) * ext[1]  # interior height band
-        if not clearance_3d(sim, p, args.drone_radius):
-            continue
-        # the connecting SEGMENT to the last waypoint must be clear, and not a
-        # teleport jump — this is what stops the path cutting through a wall.
-        if wps:
-            if np.linalg.norm(p - wps[-1]) > 0.4 * np.linalg.norm(ext):
-                continue
-            if not segment_clear(sim, wps[-1], p, args.drone_radius):
-                continue
-        wps.append(p)
-    if len(wps) < 3:
-        print(f"only found {len(wps)} connectable free waypoints; scene may be tight.")
+    # ---- recompute a DRONE navmesh so we have a connectivity graph to route on.
+    #      The fix for wall-clipping is NOT "check random points" — it's planning
+    #      on the navmesh, whose ShortestPath only traverses connected free space
+    #      (through real doorways), so a path can never cross a wall. ----
+    ns = habitat_sim.NavMeshSettings(); ns.set_defaults()
+    ns.agent_radius = max(0.15, args.drone_radius)
+    ns.agent_height = 0.30
+    ns.agent_max_climb = 2.0
+    ns.cell_size = 0.07
+    if not sim.recompute_navmesh(pf, ns) or not pf.is_loaded:
+        print("could not build a drone navmesh for this scene; aborting.")
         sim.close(); return 1
-    print(f"planned {len(wps)} waypoints with collision-free connecting segments")
+    print(f"drone navmesh area={pf.navigable_area:.1f} m^2")
 
-    # ---- smooth spline ----
+    def navpt():
+        return np.array(pf.get_random_navigable_point(), np.float32)
+
+    # ---- pick the DOMINANT floor by histogramming navigable-point heights, so
+    #      we don't accidentally anchor to a tiny landing/stairwell. ----
+    ys = np.array([float(navpt()[1]) for _ in range(400)], np.float32)
+    h, edges = np.histogram(ys, bins=40)
+    lo_e = edges[int(h.argmax())]; hi_e = lo_e + (edges[1] - edges[0])
+    floor_y = float(np.median(ys[(ys >= lo_e) & (ys < hi_e)]))
+    floor_band = 0.5
     n_frames = int(args.seconds * args.fps)
-    sps = max(2, n_frames // (len(wps)))
-    path = catmull_rom(wps, sps)[:n_frames]
-    if len(path) < n_frames:
-        path = np.vstack([path] + [path[-1]] * (n_frames - len(path)))
+    margin = args.drone_radius              # required wall clearance for EVERY frame
+    print(f"dominant floor_y={floor_y:.2f}  Y range {ys.min():.1f}..{ys.max():.1f}")
 
-    # ---- VALIDATE the actual spline: the curve can still bow into geometry
-    #      between control points. Clamp any unsafe frame to the last safe one
-    #      so the rendered camera never sits inside a wall. ----
-    safe = path.copy()
-    bad = 0
-    for i in range(len(safe)):
-        if not clearance_3d(sim, safe[i], args.drone_radius * 0.9):
-            safe[i] = safe[i - 1] if i > 0 else safe[i]
-            bad += 1
-    path = safe
-    print(f"spline validated: {bad}/{len(path)} frames clamped (were inside geometry)")
+    def seg_hits_wall(a, b):
+        """True if the straight a->b crosses a surface (swept ray, both directions)."""
+        v = b - a; L = float(np.linalg.norm(v))
+        if L < 1e-5:
+            return False
+        d = (v / L).astype(np.float32)
+        for o, dd in ((a, d), (b, -d)):
+            hit = sim.cast_ray(habitat_sim.geo.Ray(o.astype(np.float32), dd), max_distance=L)
+            if hit.has_hits and len(hit.hits) > 0 and hit.hits[0].ray_distance < L - 1e-3:
+                return True
+        return False
+
+    def resample(route):
+        seg = np.linalg.norm(np.diff(route, axis=0), axis=1)
+        cum = np.concatenate([[0], np.cumsum(seg)]); total = float(cum[-1])
+        if total < 1e-3:
+            return None
+        out = np.empty((n_frames, 3), np.float32)
+        for k, dpos in enumerate(np.linspace(0, total, n_frames)):
+            j = min(max(int(np.searchsorted(cum, dpos, "right") - 1), 0), len(route) - 2)
+            f = (dpos - cum[j]) / max(seg[j], 1e-6)
+            out[k] = route[j] * (1 - f) + route[j + 1] * f
+        return out
+
+    def verify(path):
+        """Return (#frames too close, #segment wall-crossings) — the SAME notion
+        of clipping the viewer sees. Zero/zero == genuinely clean."""
+        close = sum(0 if clearance_3d(sim, p, margin) else 1 for p in path)
+        cross = sum(seg_hits_wall(path[i], path[i + 1]) for i in range(len(path) - 1))
+        return close, cross
+
+    # ---- plan -> verify -> REPLAN until the actual rendered path is clean ----
+    path = None
+    for attempt in range(1, args.max_plan_tries + 1):
+        route, cur, legs = [], None, 0
+        for _ in range(args.waypoints * 60):
+            if legs >= args.waypoints:
+                break
+            cand = navpt()
+            if abs(float(cand[1]) - floor_y) > floor_band:
+                continue
+            if cur is None:
+                cur = cand; continue
+            sp = habitat_sim.ShortestPath()
+            sp.requested_start = cur; sp.requested_end = cand
+            if not pf.find_path(sp) or len(sp.points) < 2 or sp.geodesic_distance < 1.0:
+                continue
+            pts = [np.array(p, np.float32) for p in sp.points]
+            if any(abs(float(p[1]) - floor_y) > floor_band for p in pts):
+                continue
+            route.extend(pts if not route else pts[1:]); cur = cand; legs += 1
+        if len(route) < 3:
+            continue
+        route = np.asarray(route, np.float32)
+        route[:, 1] = floor_y + args.fly_height          # constant cruise altitude
+        cand_path = resample(route)
+        if cand_path is None:
+            continue
+        close, cross = verify(cand_path)
+        print(f"  plan attempt {attempt}: legs={legs} verts={len(route)} "
+              f"too_close={close} wall_crossings={cross}")
+        if close == 0 and cross == 0:
+            path = cand_path
+            print(f"CLEAN path found on attempt {attempt}")
+            break
+    if path is None:
+        print("could not find a clean path; aborting (will not render a clipping clip).")
+        sim.close(); return 1
 
     tmpdir = tempfile.mkdtemp(prefix="flight_")
     print(f"rendering {len(path)} frames @ {args.res}px ...")

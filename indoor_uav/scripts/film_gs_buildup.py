@@ -47,9 +47,25 @@ def _pose_c2w(pos, yaw, device, torch):
     return T
 
 
+def _overhead_pose_c2w(center, height, device, torch):
+    """FIXED top-down camera: hovers `height` ABOVE center, looking straight down.
+    Stationary for the whole clip so you watch the GS reconstruction fill in from
+    a constant overhead view. World is y-down, so 'above' = center.y - height."""
+    import numpy as _np
+    eye = _np.array([center[0], center[1] - height, center[2]], _np.float32)
+    fwd = _np.array([0, 1, 0], _np.float32)            # look down (+y is down)
+    up = _np.array([0, 0, -1], _np.float32)            # image-up = -z (north)
+    right = _np.cross(fwd, up); right /= (_np.linalg.norm(right) + 1e-8)
+    up = _np.cross(fwd, right)
+    T = torch.eye(4, device=device)
+    Rm = _np.stack([right, up, fwd], axis=1)
+    T[:3, :3] = torch.tensor(Rm, device=device).float()
+    T[:3, 3] = torch.tensor(eye, device=device).float()
+    return T
+
+
 def _orbit_pose_c2w(center, radius, theta, elev, device, torch):
-    """External camera on an orbit, LOOKING AT `center`. Lets us watch the whole
-    GS reconstruction from outside (not the drone's nose-cam). OpenCV cam: +z fwd."""
+    """External camera on an orbit, LOOKING AT `center`. (unused; kept for ref)"""
     import numpy as _np
     eye = _np.array([
         center[0] + radius * _np.cos(elev) * _np.sin(theta),
@@ -125,7 +141,9 @@ def main() -> int:
     # so the orbit frames the part actually being reconstructed.
     center = goals.mean(axis=0).astype(np.float32)
     spread = float(np.linalg.norm(goals.max(0) - goals.min(0)))
-    orbit_r = max(3.0, 0.9 * spread)
+    # fixed overhead height: pulled far back so the whole working area fits in
+    # the top-down frame with margin.
+    overhead_h = max(16.0, 3.0 * spread)
 
     n_frames = int(args.seconds * args.fps); dt = 1.0 / args.fps
     tmp = tempfile.mkdtemp(prefix="gsbuild_")
@@ -157,9 +175,8 @@ def main() -> int:
         # render the WHOLE reconstruction from an EXTERNAL orbiting camera (not the
         # drone's nose-cam) so you watch the full 3D splat fill in. The camera
         # slowly rotates around the scene as the map grows.
-        theta = 2 * math.pi * (i / max(n_frames - 1, 1))
-        orbit = _orbit_pose_c2w(center, orbit_r, theta, elev=0.35, device=dev, torch=torch)
-        splat_rgb, _ = gmap.render(orbit, K, args.res, args.res)
+        overhead = _overhead_pose_c2w(center, overhead_h, device=dev, torch=torch)
+        splat_rgb, _ = gmap.render(overhead, K, args.res, args.res)
         splat = (splat_rgb.clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
 
         gap = np.zeros((args.res, 4, 3), np.uint8); gap[:] = 255

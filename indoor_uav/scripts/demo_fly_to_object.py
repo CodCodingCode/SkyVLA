@@ -193,6 +193,10 @@ def main() -> int:
     tmp = tempfile.mkdtemp(prefix="flydemo_")
     traj = []; goal = None; state = "SEARCH"; dt = 1.0 / args.fps
     last_box = None
+    # lock-on: confirm the object across 2 agreeing detections, COMMIT the 3D
+    # point, then stop detecting and fly to it. Without this the goal teleports
+    # every time the VLM re-boxes a different object and the drone never settles.
+    pending = None; pending_n = 0; locked = False
     print(f"[demo] start={start}  target={target}  dist={d_far:.1f}m")
 
     for i in range(args.max_steps):
@@ -202,32 +206,44 @@ def main() -> int:
         pose = _pose_c2w(drone.position, drone.yaw, dev, torch).cpu().numpy()
         traj.append(np.asarray(drone.position, np.float32))
 
-        if i % args.detect_every == 0:
+        # DETECT — only until the goal is locked (then the goal can't teleport).
+        if not locked and i % args.detect_every == 0:
             try:
                 last_box = det.detect(rgb, args.query, pose, K_np)
             except Exception as ex:
                 print(f"  [detect] error: {ex}"); last_box = None
+            if last_box is not None:
+                res = bbox_to_world(last_box, depth, pose, K_np,
+                                    max_depth=10.0, standoff=args.standoff)
+                if res["kind"] == "point":
+                    g = res["goal"]
+                    if pending is not None and np.linalg.norm(g - pending) < 2.0:
+                        pending_n += 1                 # consistent -> more confident
+                    else:
+                        pending_n = 1                  # new candidate
+                    pending = g; state = "CONFIRM"
+                    if pending_n >= 2:                 # two agreeing views -> commit
+                        goal = pending; locked = True; state = "LOCKED"
+                        print(f"  LOCKED goal at step {i}: {goal}")
+                else:                                  # beyond depth range: bearing servo
+                    goal = drone.position + res["dir"] * 4.0; state = "SERVO"
 
-        if last_box is not None and state != "ARRIVED":
-            res = bbox_to_world(last_box, depth, pose, K_np,
-                                max_depth=10.0, standoff=args.standoff)
-            if res["kind"] == "point":
-                goal = res["goal"]; state = "PURSUE"
-            else:                                  # beyond depth range: servo on bearing
-                goal = drone.position + res["dir"] * 4.0; state = "SERVO"
-
-        if goal is not None and state in ("PURSUE", "SERVO"):
+        # CONTROL
+        if (locked or state == "SERVO") and goal is not None:
             to = goal - drone.position; dist = float(np.linalg.norm(to))
-            if state == "PURSUE" and dist < 0.5:
+            if locked and dist < 0.5:
                 state = "ARRIVED"
-            des_yaw = float(np.arctan2(to[0], to[2]))
-            yaw_err = (des_yaw - drone.yaw + np.pi) % (2 * np.pi) - np.pi
-            fwd = args.max_speed if abs(yaw_err) < 0.5 else 0.2
-            drone.step(0.0, fwd, float(np.clip(to[1], -1.0, 1.0)),
-                       float(np.clip(yaw_err * 3.0, -2.0, 2.0)), dt=dt)
-        elif state == "ARRIVED":
+            if state != "ARRIVED":
+                des_yaw = float(np.arctan2(to[0], to[2]))
+                yaw_err = (des_yaw - drone.yaw + np.pi) % (2 * np.pi) - np.pi
+                fwd = args.max_speed if abs(yaw_err) < 0.5 else 0.2
+                drone.step(0.0, fwd, float(np.clip(to[1], -1.0, 1.0)),
+                           float(np.clip(yaw_err * 3.0, -2.0, 2.0)), dt=dt)
+            else:
+                drone.step(0.0, 0.0, 0.0, 0.0, dt=dt)
+        elif pending is not None:                      # CONFIRM: hold, look again
             drone.step(0.0, 0.0, 0.0, 0.0, dt=dt)
-        else:                                      # SEARCH: rotate in place to find it
+        else:                                          # SEARCH: rotate to find it
             drone.step(0.0, 0.0, 0.0, 1.2, dt=dt)
 
         status = state + (f"  d={np.linalg.norm(goal - drone.position):.1f}m"

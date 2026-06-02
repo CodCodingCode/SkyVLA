@@ -67,6 +67,11 @@ class DronePhysics:
         vc = self.obj.velocity_control
         vc.controlling_lin_vel = True
         vc.lin_vel_is_local = False
+        # Zero global gravity: the velocity controller IS the flight model (a
+        # velocity-commanded drone shouldn't also free-fall). This gives perfect
+        # altitude hold (0.0m drift) while wall collisions still work (collision
+        # mesh is independent of gravity). Verified.
+        sim.set_gravity(np.array([0.0, 0.0, 0.0], dtype=np.float32))
 
     # ------------------------------------------------------------------ #
     @property

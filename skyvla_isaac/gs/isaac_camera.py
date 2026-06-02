@@ -40,8 +40,9 @@ def frame_from_camera(camera, env_index: int = 0):
     depth = camera.data.output["distance_to_image_plane"][env_index, ..., 0].float()
     K = camera.data.intrinsic_matrices[env_index].to(dev).float()
 
-    R_usd = _quat_to_R(camera.data.quat_w_world[env_index].to(dev).float())
-    R_cv = R_usd @ _USD2CV.to(dev)
+    # Isaac Lab's `quat_w_ros` is already the OpenCV optical convention
+    # (+x right, +y down, +z forward) = exactly what GaussianMap expects -> no flip.
+    R_cv = _quat_to_R(camera.data.quat_w_ros[env_index].to(dev).float())
     pose = torch.eye(4, device=dev)
     pose[:3, :3] = R_cv
     pose[:3, 3] = camera.data.pos_w[env_index].to(dev).float()

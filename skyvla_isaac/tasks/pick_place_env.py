@@ -77,7 +77,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     object: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Object",
         spawn=sim_utils.CuboidCfg(
-            size=(0.09, 0.09, 0.09),
+            size=(0.05, 0.05, 0.05),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=5.0),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -85,7 +85,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
                 static_friction=1.2, dynamic_friction=1.0),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.2, 0.2)),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.045)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.025)),
     )
 
     # flight controller gains + ranges
@@ -137,6 +137,9 @@ class DronePickPlaceEnv(DirectRLEnv):
         v_now = self.robot.data.root_lin_vel_w
         force = (self.cfg.kv * (v_des - v_now) * self._mass.unsqueeze(-1))
         force[:, 2] += self._mass * GRAV                      # gravity compensation
+        # clamp + sanitize so a flung env can't explode the controller -> NaN
+        fmax = (4.0 * self._mass * GRAV).unsqueeze(-1)
+        force = torch.nan_to_num(force, nan=0.0).clamp(-fmax, fmax)
         torque = torch.zeros(self.num_envs, 3, device=self.device)
         torque[:, 2] = a[:, 3] * self.cfg.yaw_rate * 0.5      # yaw
         self.robot.set_external_force_and_torque(
@@ -172,6 +175,7 @@ class DronePickPlaceEnv(DirectRLEnv):
             self._target - obj_p,
             (obj_p[:, 2:3]),                                  # object height
         ], dim=-1)
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -179,20 +183,27 @@ class DronePickPlaceEnv(DirectRLEnv):
         tip = self._tip_w() - self.scene.env_origins
         d_reach = torch.norm(obj_p - tip, dim=-1)
         d_place = torch.norm(obj_p[:, :2] - self._target[:, :2], dim=-1)
-        lifted = (obj_p[:, 2] > 0.045 + self.cfg.lift_height).float()
+        lifted = (obj_p[:, 2] > 0.025 + self.cfg.lift_height).float()
         placed = ((d_place < self.cfg.target_radius) & (lifted < 0.5)).float()
-        r = (-0.3 * d_reach                       # reach the object
+        # dense, bounded, always-positive shaping -> a clear hill for PPO to climb
+        reach = torch.exp(-2.0 * d_reach)         # peaks (=1) at the object
+        carry = torch.exp(-2.0 * d_place)         # peaks at the target
+        r = (0.5 * reach                          # approach the object
              + 3.0 * lifted                       # real grasp: object off floor
-             - 1.0 * d_place * lifted             # carry toward target while held
-             + 10.0 * placed                      # placed in zone
-             - 0.001)                             # time cost
+             + 2.0 * lifted * carry               # carry toward target while held
+             + 10.0 * placed                      # released in the target zone
+             - 0.002)                             # small time cost
         return r
 
     def _get_dones(self):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         obj_p = self.object.data.root_pos_w - self.scene.env_origins
-        fell = obj_p[:, 2] < -0.5
-        return fell, time_out
+        base_p = self.robot.data.root_pos_w - self.scene.env_origins
+        base_v = torch.norm(self.robot.data.root_lin_vel_w, dim=-1)
+        # terminate (and reset) diverging envs so they can't NaN the batch
+        oob = (obj_p[:, 2] < -0.5) | (base_p[:, 2] < -0.5) | (base_p[:, 2] > 4.0) \
+            | (torch.norm(base_p[:, :2], dim=-1) > 5.0) | (base_v > 12.0)
+        return oob, time_out
 
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
@@ -213,5 +224,5 @@ class DronePickPlaceEnv(DirectRLEnv):
         self.object.write_root_velocity_to_sim(obj[:, 7:], env_ids)
         # target placement (env-local)
         t = (torch.rand(n, 3, device=self.device) - 0.5)
-        t[:, 0] *= 1.5; t[:, 1] *= 1.5; t[:, 2] = 0.045
+        t[:, 0] *= 1.5; t[:, 1] *= 1.5; t[:, 2] = 0.025
         self._target[env_ids] = t

@@ -37,9 +37,10 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
     max_iterations=args.max_iterations,
     save_interval=50,
     experiment_name="drone_pick_place",
-    empirical_normalization=False,
+    empirical_normalization=True,        # normalize observations -> stability
     policy=RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
+        noise_std_type="log",           # std = exp(log_std) -> always > 0 (fixes std>=0 crash)
         actor_hidden_dims=[256, 128, 64],
         critic_hidden_dims=[256, 128, 64],
         activation="elu",
@@ -47,7 +48,7 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
     algorithm=RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0, use_clipped_value_loss=True, clip_param=0.2,
         entropy_coef=0.005, num_learning_epochs=5, num_mini_batches=4,
-        learning_rate=1.0e-3, schedule="adaptive", gamma=0.99, lam=0.95,
+        learning_rate=3.0e-4, schedule="adaptive", gamma=0.99, lam=0.95,
         desired_kl=0.01, max_grad_norm=1.0,
     ),
 )

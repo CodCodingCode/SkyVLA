@@ -25,7 +25,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
-from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
@@ -39,12 +39,15 @@ GRAV = 9.81
 @configclass
 class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     decimation = 2
-    episode_length_s = 12.0
+    episode_length_s = 8.0
     action_space = 6
     observation_space = 17
     state_space = 0
 
     sim: SimulationCfg = SimulationCfg(dt=1.0 / 120.0, render_interval=2)
+    # close follow-camera on env 0 (for clear rollout videos)
+    viewer: ViewerCfg = ViewerCfg(eye=(1.6, 1.6, 1.2), lookat=(0.0, 0.0, 0.3),
+                                  origin_type="env", env_index=0)
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=5.0,
                                                      replicate_physics=True)
@@ -62,7 +65,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
                 solver_velocity_iteration_count=2),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 1.3),
+            pos=(0.0, 0.0, 1.0),
             joint_pos={"lower": 0.0, "grip_l": 0.02, "grip_r": 0.02},
         ),
         actuators={
@@ -85,7 +88,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
                 static_friction=1.2, dynamic_friction=1.0),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.2, 0.2)),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.025)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.6, 0.0, 0.025)),
     )
 
     # flight controller gains + ranges
@@ -95,6 +98,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     max_drop: float = 0.5
     target_radius: float = 0.25
     lift_height: float = 0.15  # object this far off floor counts as grasped
+    grasp_radius: float = 0.15  # tip within this of cube + grip on -> magnetic latch
 
 
 class DronePickPlaceEnv(DirectRLEnv):
@@ -110,6 +114,16 @@ class DronePickPlaceEnv(DirectRLEnv):
         self._target = torch.zeros(self.num_envs, 3, device=self.device)
         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._mass = self.robot.root_physx_view.get_masses().sum(-1).to(self.device)
+        # potential-based-reward bookkeeping (see _get_rewards)
+        z = lambda: torch.zeros(self.num_envs, device=self.device)  # noqa: E731
+        self._prev_d_reach, self._prev_d_tgt, self._prev_d_goal = z(), z(), z()
+        self._d_reach, self._d_tgt = z(), z()
+        self._holding = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._grasped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # magnetic/suction gripper state (realistic aerial end-effector; learnable)
+        self._held = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._obj_mass = float(self.object.root_physx_view.get_masses()[0].sum())
 
     # ------------------------------------------------------------------ #
     def _setup_scene(self):
@@ -152,6 +166,24 @@ class DronePickPlaceEnv(DirectRLEnv):
         idx = torch.tensor(self._lower_i + self._gl_i + self._gr_i, device=self.device)
         self.robot.set_joint_position_target(tgt, joint_ids=idx.tolist())
 
+        # --- magnetic/suction grasp: when activated (grip>0.5) and the tip is near
+        # the cube, latch it and pull it to the tip with a spring force. Real
+        # dynamics (mass/swing/drop-on-release); no finger precision needed. ---
+        grip_on = (a[:, 5] * 0.5 + 0.5) > 0.5
+        tip = self._tip_w()
+        obj = self.object.data.root_pos_w
+        d = torch.norm(tip - obj, dim=-1)
+        self._held = (self._held & grip_on) | (grip_on & (d < self.cfg.grasp_radius))
+        held_ids = self._held.nonzero(as_tuple=False).squeeze(-1)
+        if held_ids.numel() > 0:
+            # attach: snap the cube to the tip while held (released -> falls under gravity)
+            pose = torch.zeros(held_ids.numel(), 7, device=self.device)
+            pose[:, :3] = tip[held_ids]
+            pose[:, 3] = 1.0                                 # quat (w,x,y,z) = identity
+            self.object.write_root_pose_to_sim(pose, held_ids)
+            self.object.write_root_velocity_to_sim(
+                torch.zeros(held_ids.numel(), 6, device=self.device), held_ids)
+
     # ------------------------------------------------------------------ #
     def _tip_w(self):
         """Approx gripper tip in world: base minus lower extension along -Z."""
@@ -178,32 +210,52 @@ class DronePickPlaceEnv(DirectRLEnv):
         obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         return {"policy": obs}
 
-    def _get_rewards(self) -> torch.Tensor:
-        obj_p = self.object.data.root_pos_w - self.scene.env_origins
-        tip = self._tip_w() - self.scene.env_origins
-        d_reach = torch.norm(obj_p - tip, dim=-1)
-        d_place = torch.norm(obj_p[:, :2] - self._target[:, :2], dim=-1)
-        lifted = (obj_p[:, 2] > 0.025 + self.cfg.lift_height).float()
-        placed = ((d_place < self.cfg.target_radius) & (lifted < 0.5)).float()
-        # dense, bounded, always-positive shaping -> a clear hill for PPO to climb
-        reach = torch.exp(-2.0 * d_reach)         # peaks (=1) at the object
-        carry = torch.exp(-2.0 * d_place)         # peaks at the target
-        r = (0.5 * reach                          # approach the object
-             + 3.0 * lifted                       # real grasp: object off floor
-             + 2.0 * lifted * carry               # carry toward target while held
-             + 10.0 * placed                      # released in the target zone
-             - 0.002)                             # small time cost
-        return r
-
     def _get_dones(self):
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        # _get_dones runs BEFORE _get_rewards -> compute shared state + log metrics.
         obj_p = self.object.data.root_pos_w - self.scene.env_origins
         base_p = self.robot.data.root_pos_w - self.scene.env_origins
         base_v = torch.norm(self.robot.data.root_lin_vel_w, dim=-1)
-        # terminate (and reset) diverging envs so they can't NaN the batch
+        tip = self._tip_w() - self.scene.env_origins
+        self._d_reach = torch.norm(obj_p - tip, dim=-1)
+        self._d_goal = torch.norm(obj_p - self._target, dim=-1)            # 3D to goal waypoint
+        self._obj_z = obj_p[:, 2]
+        self._lifted = obj_p[:, 2] > 0.025 + 0.05                          # off floor 5cm
+        self._success = self._d_goal < 0.18                               # cube delivered to goal
+
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
         oob = (obj_p[:, 2] < -0.5) | (base_p[:, 2] < -0.5) | (base_p[:, 2] > 4.0) \
             | (torch.norm(base_p[:, :2], dim=-1) > 5.0) | (base_v > 12.0)
-        return oob, time_out
+
+        self.extras["log"] = {
+            "metrics/grasp_rate": self._lifted.float().mean(),
+            "metrics/held_rate": self._held.float().mean(),
+            "metrics/place_success": self._success.float().mean(),
+            "metrics/obj_to_goal": self._d_goal.mean(),
+        }
+        return oob, time_out          # dense task: no success-termination
+
+    def _get_rewards(self) -> torch.Tensor:
+        # Isaac-Lab "lift-cube" dense recipe (known to converge): approach ->
+        # lift -> track the object to a 3D goal waypoint (fine term near goal).
+        held = self._held.float()
+        notheld = 1.0 - held
+        reach = 1.0 - torch.tanh(self._d_reach / 0.8)
+        near = (self._d_reach < 0.12).float()
+        grip_closed = (self._actions[:, 5] * 0.5 + 0.5)
+        # BALANCED: a modest hold bonus keeps the grasp; a DOMINANT, wide-gradient
+        # goal-track term makes carrying to the goal clearly beat hovering.
+        goal_track = 1.0 - torch.tanh(self._d_goal / 0.8)              # wide gradient (~2 m)
+        fine = 1.0 - torch.tanh(self._d_goal / 0.1)                    # sharp at-goal bonus
+        carry_prog = held * (self._prev_d_goal - self._d_goal)
+        r = (notheld * (1.0 * reach + 1.0 * near * grip_closed)        # reach + grab
+             + 2.0 * held                                             # maintain grasp (modest)
+             + 15.0 * held * goal_track                               # carry to goal (dominant)
+             + 10.0 * carry_prog                                      # extra progress gradient
+             + 10.0 * held * fine                                     # delivered at goal
+             - 0.01)
+        self._grasped = self._grasped | self._held
+        self._prev_d_goal = self._d_goal.clone()
+        return r
 
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
@@ -215,14 +267,28 @@ class DronePickPlaceEnv(DirectRLEnv):
         self.robot.write_root_velocity_to_sim(root[:, 7:], env_ids)
         jpos = self.robot.data.default_joint_pos[env_ids].clone()
         self.robot.write_joint_state_to_sim(jpos, torch.zeros_like(jpos), env_ids=env_ids)
-        # object on the floor at a random offset
+        # object on the floor near the start (curriculum: closer = learnable)
         obj = self.object.data.default_root_state[env_ids].clone()
-        rand = (torch.rand(n, 2, device=self.device) - 0.5) * 1.5
+        rand = (torch.rand(n, 2, device=self.device) - 0.5) * 0.8        # +/-0.4 m
         obj[:, 0] += rand[:, 0]; obj[:, 1] += rand[:, 1]
         obj[:, :3] += self.scene.env_origins[env_ids]
         self.object.write_root_pose_to_sim(obj[:, :7], env_ids)
         self.object.write_root_velocity_to_sim(obj[:, 7:], env_ids)
-        # target placement (env-local)
-        t = (torch.rand(n, 3, device=self.device) - 0.5)
-        t[:, 0] *= 1.5; t[:, 1] *= 1.5; t[:, 2] = 0.025
+        # goal = a 3D waypoint NEAR the object (short, uniform carry distance):
+        # pick the cube up and deliver it ~0.5 m away at 0.5 m height.
+        obj_local = obj[:, :3] - self.scene.env_origins[env_ids]
+        t = torch.zeros(n, 3, device=self.device)
+        t[:, :2] = obj_local[:, :2] + (torch.rand(n, 2, device=self.device) - 0.5) * 0.5
+        t[:, 2] = 0.4                                                    # 0.4 m off the floor
         self._target[env_ids] = t
+
+        # seed potential-reward bookkeeping from the reset positions
+        self._grasped[env_ids] = False
+        self._success[env_ids] = False
+        self._held[env_ids] = False
+        tip = root[:, :3].clone(); tip[:, 2] -= 0.05                     # gripper tip (lower=0)
+        obj_w = obj[:, :3]
+        tgt_w = self.scene.env_origins[env_ids] + t
+        self._prev_d_reach[env_ids] = torch.norm(obj_w - tip, dim=-1)
+        self._prev_d_tgt[env_ids] = torch.norm((obj_w - tgt_w)[:, :2], dim=-1)
+        self._prev_d_goal[env_ids] = torch.norm(obj_w - tgt_w, dim=-1)

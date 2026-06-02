@@ -155,7 +155,10 @@ class PhysicsCoverageEnv(gym.Env):
         yaw = self.drone.yaw
         c, s = math.cos(yaw), math.sin(yaw)
         R = torch.tensor([[c, 0, s], [0, 1, 0], [-s, 0, c]], device=self._gs_dev).float()
-        flip = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, 1]], device=self._gs_dev).float()
+        # habitat (-z fwd, +y up) -> OpenCV (+z fwd, +y down): flip Y and Z, matching
+        # _HAB2CV. (Was diag(1,-1,1), an improper reflection that mirrored the cloud
+        # per frame and corrupted the cross-frame coverage reward.)
+        flip = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]], device=self._gs_dev).float()
         T = torch.eye(4, device=self._gs_dev)
         T[:3, :3] = R @ flip
         T[:3, 3] = torch.tensor(self.drone.position, device=self._gs_dev).float()

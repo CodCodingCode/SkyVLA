@@ -18,3 +18,5 @@ wandb/
 
 # Local checkpoints are never committed.
 *.pt
+.hm3d_key
+.openai_key

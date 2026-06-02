@@ -62,6 +62,8 @@ class PhysicsCoverageEnv(gym.Env):
         collision_penalty: float = 0.1,
         time_cost: float = 0.001,
         frontier_bonus: float = 0.05,
+        reward_mode: str = "geometric",   # "geometric" (floor-grid) | "gs" (splat reconstruction)
+        gs_stride: int = 6,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -92,7 +94,22 @@ class PhysicsCoverageEnv(gym.Env):
         self.collision_penalty = collision_penalty
         self.time_cost = time_cost
         self.frontier_bonus = frontier_bonus
+        self.reward_mode = reward_mode
+        self.gs_stride = gs_stride
         self._rng = np.random.default_rng(seed)
+        # GS reconstruction reward: maintain a GaussianMap of the scene the drone
+        # is building from its RGB-D; reward = improvement in reconstruction.
+        self._gmap = None
+        self._K = None
+        if reward_mode == "gs":
+            import torch
+            from indoor_uav.gs import GaussianMap
+            self._torch = torch
+            self._GaussianMap = GaussianMap
+            self._gs_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            f = 0.5 * sim_res / np.tan(np.deg2rad(hfov) / 2)
+            self._K = torch.tensor([[f, 0, sim_res / 2], [0, f, sim_res / 2], [0, 0, 1]],
+                                   dtype=torch.float32, device=self._gs_dev)
 
         self.drone = DronePhysics(self.sim, mass=0.5, max_speed=max(speed * 1.5, 1.5))
         self._lo, self._hi = (np.array(x, np.float32) for x in pf.get_bounds())
@@ -132,6 +149,36 @@ class PhysicsCoverageEnv(gym.Env):
         idx = np.linspace(0, rgb.shape[0] - 1, self.obs_res).astype(int)
         return rgb[np.ix_(idx, idx)].astype(np.uint8)
 
+    def _gs_pose_c2w(self):
+        """Camera-to-world (OpenCV) for the GaussianMap, from drone pose+yaw."""
+        import torch
+        yaw = self.drone.yaw
+        c, s = math.cos(yaw), math.sin(yaw)
+        R = torch.tensor([[c, 0, s], [0, 1, 0], [-s, 0, c]], device=self._gs_dev).float()
+        flip = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, 1]], device=self._gs_dev).float()
+        T = torch.eye(4, device=self._gs_dev)
+        T[:3, :3] = R @ flip
+        T[:3, 3] = torch.tensor(self.drone.position, device=self._gs_dev).float()
+        return T
+
+    def _gs_reconstruction_gain(self, rgb, depth):
+        """Splat this RGB-D into the scene GaussianMap; reward = NEW reconstructed
+        surface this view added (rendered alpha over real geometry, measured
+        BEFORE adding so re-seeing earns ~0). This makes the reward 'improve the
+        Gaussian-splat reconstruction', not 'cover the floor grid'."""
+        from indoor_uav.gs.coverage import exploration_gain
+        torch = self._torch
+        rgb_t = torch.from_numpy(np.ascontiguousarray(rgb)).to(self._gs_dev).float() / 255.0
+        depth_t = torch.from_numpy(np.ascontiguousarray(depth)).to(self._gs_dev).float()
+        pose = self._gs_pose_c2w()
+        gmask = depth_t > 1e-3
+        gain = exploration_gain(self._gmap, pose, self._K, depth_t.shape[1], depth_t.shape[0],
+                                geometry_mask=gmask)
+        self._gmap.add_from_rgbd(rgb_t, depth_t, pose, self._K,
+                                 stride=self.gs_stride, max_depth=10.0)
+        # weight by how much of the view actually had surface (avoid rewarding void)
+        return float(gain) * float(gmask.float().mean().item())
+
     def _obs(self, rgb):
         p = self.drone.position; v = self.drone.velocity
         span = (self._hi - self._lo); span[span < 1e-3] = 1.0
@@ -155,7 +202,10 @@ class PhysicsCoverageEnv(gym.Env):
         self._cov.mark_visited(p)
         self._t = 0
         self._prev_cov = self._cov.coverage_fraction()
-        rgb, _ = self._render()
+        rgb, depth = self._render()
+        if self.reward_mode == "gs":
+            self._gmap = self._GaussianMap(device=self._gs_dev)
+            self._gs_reconstruction_gain(rgb, depth)  # seed with start view (no reward)
         return self._obs(rgb), {}
 
     def step(self, action):
@@ -172,16 +222,24 @@ class PhysicsCoverageEnv(gym.Env):
 
         self._cov.mark_visited(self.drone.position)
         cov = self._cov.coverage_fraction()
-        gain = max(0.0, cov - self._prev_cov)
-        # frontier progress: reward shrinking distance to nearest unexplored boundary
-        df = self._cov.dist_to_frontier(self.drone.position)
-        reward = (gain * 100.0                                   # dense coverage gain (scaled)
-                  + self.frontier_bonus * (1.0 - df)            # head toward frontier
-                  - (self.collision_penalty if tel["collided"] else 0.0)
-                  - self.time_cost)
-        self._prev_cov = cov
+        df = self._cov.dist_to_frontier(self.drone.position)  # frontier shaping (both modes)
+        rgb, depth = self._render()
 
-        rgb, _ = self._render()
+        if self.reward_mode == "gs":
+            # (a) reward = improvement of the Gaussian-splat RECONSTRUCTION
+            gain = self._gs_reconstruction_gain(rgb, depth)
+            reward = (gain * 20.0
+                      + self.frontier_bonus * (1.0 - df)
+                      - (self.collision_penalty if tel["collided"] else 0.0)
+                      - self.time_cost)
+        else:
+            # geometric floor-grid coverage (placeholder / fast baseline)
+            gain = max(0.0, cov - self._prev_cov)
+            reward = (gain * 100.0
+                      + self.frontier_bonus * (1.0 - df)
+                      - (self.collision_penalty if tel["collided"] else 0.0)
+                      - self.time_cost)
+        self._prev_cov = cov
         terminated = cov >= self.target_coverage or (self._cov.frontier().sum() == 0)
         truncated = self._t >= self.max_steps
         info = {"coverage": cov, "gain": gain, "collided": tel["collided"],

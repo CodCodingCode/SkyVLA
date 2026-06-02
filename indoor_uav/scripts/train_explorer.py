@@ -77,6 +77,7 @@ def main() -> int:
     ap.add_argument("--ent_coef", type=float, default=0.01)
     ap.add_argument("--vf_coef", type=float, default=0.5)
     ap.add_argument("--max_grad_norm", type=float, default=0.5)
+    ap.add_argument("--reward_mode", choices=["geometric", "gs"], default="geometric")
     ap.add_argument("--sim_res", type=int, default=128)
     ap.add_argument("--obs_res", type=int, default=64)
     ap.add_argument("--map_res", type=int, default=64)
@@ -95,7 +96,8 @@ def main() -> int:
     def make_env(i):
         return PhysicsCoverageEnv(scenes[i % len(scenes)], sim_res=args.sim_res,
                                   obs_res=args.obs_res, map_res=args.map_res,
-                                  max_steps=args.ep_len, seed=args.seed + i)
+                                  max_steps=args.ep_len, reward_mode=args.reward_mode,
+                                  seed=args.seed + i)
 
     env_i = 0
     env = make_env(env_i)

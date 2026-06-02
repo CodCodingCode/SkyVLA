@@ -37,6 +37,8 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
     max_iterations=args.max_iterations,
     save_interval=50,
     experiment_name="drone_pick_place",
+    logger="wandb",                      # W&B on by default (project convention)
+    wandb_project="skyvla-isaac",
     empirical_normalization=True,        # normalize observations -> stability
     policy=RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
@@ -52,6 +54,12 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
         desired_kl=0.01, max_grad_norm=1.0,
     ),
 )
+
+# W&B auth from the gitignored key (so logger="wandb" can init), per repo convention
+import os  # noqa: E402
+_kf = "/home/ubuntu/SkyVLA/.wandb_key"
+if "WANDB_API_KEY" not in os.environ and os.path.exists(_kf):
+    os.environ["WANDB_API_KEY"] = open(_kf).read().strip()
 
 runner = OnPolicyRunner(env, class_to_dict(agent_cfg), log_dir=args.log_dir, device=env.unwrapped.device)
 runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)

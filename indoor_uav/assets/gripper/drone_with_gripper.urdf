@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<!--
+  Full quadrotor + 2-DoF gripper, as ONE articulated object for Habitat-Sim.
+  (Habitat loads URDF, NOT USD — there is no USD runtime/Isaac on this machine.)
+
+  This replaces the placeholder cube body with a recognizable quad: a central
+  hub, two crossed booms, four rotor disks, and the underslung gripper.
+  Fixed joints hold the frame together; the only MOVABLE joints are:
+    * lower  (prismatic, -Y)   -> raise/lower the gripper  (DoF 1)
+    * grip_l / grip_r          -> close/open the jaws       (DoF 2, mirrored)
+  +Y is up; the gripper hangs down -Y.
+-->
+<robot name="drone_with_gripper">
+
+  <material name="body"><color rgba="0.13 0.14 0.18 1"/></material>
+  <material name="boom"><color rgba="0.20 0.20 0.24 1"/></material>
+  <material name="rotor"><color rgba="0.30 0.55 0.95 0.9"/></material>
+  <material name="armmat"><color rgba="0.45 0.45 0.50 1"/></material>
+  <material name="grip"><color rgba="0.95 0.55 0.10 1"/></material>
+
+  <!-- central hub -->
+  <link name="base">
+    <visual><geometry><box size="0.12 0.05 0.12"/></geometry><material name="body"/></visual>
+    <collision><geometry><box size="0.12 0.05 0.12"/></geometry></collision>
+    <inertial><mass value="0.35"/><inertia ixx="1e-3" iyy="1e-3" izz="1e-3" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+
+  <!-- two crossed booms (a '+' frame) -->
+  <link name="boom_x"><visual><geometry><box size="0.42 0.02 0.025"/></geometry><material name="boom"/></visual></link>
+  <joint name="j_boom_x" type="fixed"><parent link="base"/><child link="boom_x"/><origin xyz="0 0 0"/></joint>
+  <link name="boom_z"><visual><geometry><box size="0.025 0.02 0.42"/></geometry><material name="boom"/></visual></link>
+  <joint name="j_boom_z" type="fixed"><parent link="base"/><child link="boom_z"/><origin xyz="0 0 0"/></joint>
+
+  <!-- four rotor disks at the boom ends (flat: cylinder axis rotated to +Y) -->
+  <link name="rotor_xp"><visual><origin rpy="1.5708 0 0"/><geometry><cylinder radius="0.09" length="0.012"/></geometry><material name="rotor"/></visual></link>
+  <joint name="j_rxp" type="fixed"><parent link="base"/><child link="rotor_xp"/><origin xyz="0.21 0.03 0"/></joint>
+  <link name="rotor_xn"><visual><origin rpy="1.5708 0 0"/><geometry><cylinder radius="0.09" length="0.012"/></geometry><material name="rotor"/></visual></link>
+  <joint name="j_rxn" type="fixed"><parent link="base"/><child link="rotor_xn"/><origin xyz="-0.21 0.03 0"/></joint>
+  <link name="rotor_zp"><visual><origin rpy="1.5708 0 0"/><geometry><cylinder radius="0.09" length="0.012"/></geometry><material name="rotor"/></visual></link>
+  <joint name="j_rzp" type="fixed"><parent link="base"/><child link="rotor_zp"/><origin xyz="0 0.03 0.21"/></joint>
+  <link name="rotor_zn"><visual><origin rpy="1.5708 0 0"/><geometry><cylinder radius="0.09" length="0.012"/></geometry><material name="rotor"/></visual></link>
+  <joint name="j_rzn" type="fixed"><parent link="base"/><child link="rotor_zn"/><origin xyz="0 0.03 -0.21"/></joint>
+
+  <!-- ============ gripper (the only moving joints) ============ -->
+  <!-- DoF 1: lower the gripper -->
+  <link name="arm">
+    <visual><origin xyz="0 -0.15 0"/><geometry><cylinder radius="0.010" length="0.30"/></geometry><material name="armmat"/></visual>
+    <collision><origin xyz="0 -0.15 0"/><geometry><cylinder radius="0.010" length="0.30"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-5" iyy="1e-5" izz="1e-5" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="lower" type="prismatic">
+    <parent link="base"/><child link="arm"/><origin xyz="0 -0.03 0"/><axis xyz="0 -1 0"/>
+    <limit lower="0.0" upper="0.50" effort="20" velocity="1.0"/>
+  </joint>
+
+  <!-- DoF 2: two fingers (mirrored in code from one grip command) -->
+  <link name="finger_l">
+    <visual><geometry><box size="0.014 0.08 0.035"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.014 0.08 0.035"/></geometry></collision>
+    <inertial><mass value="0.01"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_l" type="prismatic">
+    <parent link="arm"/><child link="finger_l"/><origin xyz="0.045 -0.31 0"/><axis xyz="-1 0 0"/>
+    <limit lower="0.0" upper="0.04" effort="10" velocity="0.5"/>
+  </joint>
+  <link name="finger_r">
+    <visual><geometry><box size="0.014 0.08 0.035"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.014 0.08 0.035"/></geometry></collision>
+    <inertial><mass value="0.01"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_r" type="prismatic">
+    <parent link="arm"/><child link="finger_r"/><origin xyz="-0.045 -0.31 0"/><axis xyz="1 0 0"/>
+    <limit lower="0.0" upper="0.04" effort="10" velocity="0.5"/>
+  </joint>
+
+</robot>

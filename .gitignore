@@ -20,3 +20,4 @@ wandb/
 *.pt
 .hm3d_key
 .openai_key
+*.log

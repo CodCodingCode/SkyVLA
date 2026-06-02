@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<!--
+  2-DoF underslung drone gripper for Habitat-Sim (Bullet).
+
+  NOTE on formats: USD is NVIDIA Isaac/Omniverse. Habitat-Sim loads ARTICULATED
+  objects from URDF, so this is a URDF. It is loaded as a KINEMATIC articulated
+  object; each step its base is pinned under the drone and its joints are driven
+  from the policy's (lower, grip) commands (see indoor_uav/sim/gripper.py).
+
+  Controlled DoF:
+    * lower  (prismatic, +travel = down, -Y)         -> extends the gripper down
+    * grip   (one command -> drives grip_l & grip_r) -> closes/opens the jaws
+  grip_l/grip_r are mirrored in code from the single grip command, so the
+  CONTROL space is 2-DoF (lower, grip) as intended.
+
+  Frame: link origin at the drone mount; -Y is down (matches habitat +Y up).
+-->
+<robot name="drone_gripper">
+
+  <material name="dark"><color rgba="0.12 0.12 0.16 1"/></material>
+  <material name="gray"><color rgba="0.45 0.45 0.50 1"/></material>
+  <material name="grip"><color rgba="0.85 0.55 0.10 1"/></material>
+
+  <!-- mount: rigidly under the drone body -->
+  <link name="mount">
+    <visual><geometry><box size="0.07 0.02 0.07"/></geometry><material name="dark"/></visual>
+    <collision><geometry><box size="0.07 0.02 0.07"/></geometry></collision>
+    <inertial><mass value="0.03"/>
+      <inertia ixx="1e-5" iyy="1e-5" izz="1e-5" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+
+  <!-- DoF 1: lower the gripper (prismatic along -Y) -->
+  <link name="arm">
+    <visual><origin xyz="0 -0.15 0"/>
+      <geometry><cylinder radius="0.009" length="0.30"/></geometry><material name="gray"/></visual>
+    <collision><origin xyz="0 -0.15 0"/>
+      <geometry><cylinder radius="0.009" length="0.30"/></geometry></collision>
+    <inertial><mass value="0.02"/>
+      <inertia ixx="1e-5" iyy="1e-5" izz="1e-5" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="lower" type="prismatic">
+    <parent link="mount"/><child link="arm"/>
+    <origin xyz="0 -0.02 0"/><axis xyz="0 -1 0"/>
+    <limit lower="0.0" upper="0.50" effort="20" velocity="1.0"/>
+  </joint>
+
+  <!-- DoF 2: grip — two fingers driven symmetrically (mirrored in code) -->
+  <link name="finger_l">
+    <visual><geometry><box size="0.012 0.07 0.03"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.012 0.07 0.03"/></geometry></collision>
+    <inertial><mass value="0.01"/>
+      <inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_l" type="prismatic">
+    <parent link="arm"/><child link="finger_l"/>
+    <origin xyz="0.04 -0.31 0"/><axis xyz="-1 0 0"/>
+    <limit lower="0.0" upper="0.035" effort="10" velocity="0.5"/>
+  </joint>
+
+  <link name="finger_r">
+    <visual><geometry><box size="0.012 0.07 0.03"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.012 0.07 0.03"/></geometry></collision>
+    <inertial><mass value="0.01"/>
+      <inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_r" type="prismatic">
+    <parent link="arm"/><child link="finger_r"/>
+    <origin xyz="-0.04 -0.31 0"/><axis xyz="1 0 0"/>
+    <limit lower="0.0" upper="0.035" effort="10" velocity="0.5"/>
+  </joint>
+
+</robot>

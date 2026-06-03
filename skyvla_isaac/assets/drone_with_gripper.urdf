@@ -22,7 +22,10 @@
   <link name="base">
     <visual><geometry><box size="0.14 0.14 0.05"/></geometry><material name="body"/></visual>
     <collision><geometry><box size="0.14 0.14 0.05"/></geometry></collision>
-    <inertial><mass value="0.35"/><inertia ixx="1e-3" iyy="1e-3" izz="1e-3" ixy="0" ixz="0" iyz="0"/></inertial>
+    <!-- realistic rotational inertia for a 1.5 kg quad with ~0.42 m booms. The old
+         1e-3 was ~15x too low, so the hanging gripper's reaction torque flung the
+         drone around. ixx/iyy ~0.012, izz ~0.022 resists that. -->
+    <inertial><mass value="1.5"/><inertia ixx="1.2e-2" iyy="1.2e-2" izz="2.2e-2" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
 
   <!-- crossed booms in the horizontal X-Y plane -->
@@ -51,22 +54,44 @@
     <limit lower="0.0" upper="0.50" effort="20" velocity="1.0"/>
   </joint>
 
-  <!-- two jaws at the arm tip (visual end-effector); move along +/-X to close -->
-  <link name="finger_l">
-    <visual><geometry><box size="0.02 0.05 0.08"/></geometry><material name="grip"/></visual>
-    <inertial><mass value="0.01"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  <!-- 4-JAW CAGE: walls close on all four sides (X and Y) so a free cube gets
+       boxed in and cannot squirt out (two flat fingers eject it). Open ~8 cm,
+       closed they press the 5 cm cube's four faces -> caged + force closure. -->
+  <link name="finger_xl">
+    <visual><geometry><box size="0.012 0.07 0.05"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.012 0.07 0.05"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
-  <joint name="grip_l" type="prismatic">
-    <parent link="arm"/><child link="finger_l"/><origin xyz="0.05 0 -0.32"/><axis xyz="-1 0 0"/>
-    <limit lower="0.0" upper="0.04" effort="10" velocity="0.5"/>
+  <joint name="grip_xl" type="prismatic">
+    <parent link="arm"/><child link="finger_xl"/><origin xyz="0.04 0 -0.30"/><axis xyz="-1 0 0"/>
+    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
   </joint>
-  <link name="finger_r">
-    <visual><geometry><box size="0.02 0.05 0.08"/></geometry><material name="grip"/></visual>
-    <inertial><mass value="0.01"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  <link name="finger_xr">
+    <visual><geometry><box size="0.012 0.07 0.05"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.012 0.07 0.05"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
-  <joint name="grip_r" type="prismatic">
-    <parent link="arm"/><child link="finger_r"/><origin xyz="-0.05 0 -0.32"/><axis xyz="1 0 0"/>
-    <limit lower="0.0" upper="0.04" effort="10" velocity="0.5"/>
+  <joint name="grip_xr" type="prismatic">
+    <parent link="arm"/><child link="finger_xr"/><origin xyz="-0.04 0 -0.30"/><axis xyz="1 0 0"/>
+    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+  </joint>
+  <link name="finger_yl">
+    <visual><geometry><box size="0.07 0.012 0.05"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.07 0.012 0.05"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_yl" type="prismatic">
+    <parent link="arm"/><child link="finger_yl"/><origin xyz="0 0.04 -0.30"/><axis xyz="0 -1 0"/>
+    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+  </joint>
+  <link name="finger_yr">
+    <visual><geometry><box size="0.07 0.012 0.05"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.07 0.012 0.05"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_yr" type="prismatic">
+    <parent link="arm"/><child link="finger_yr"/><origin xyz="0 -0.04 -0.30"/><axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
   </joint>
 
 </robot>

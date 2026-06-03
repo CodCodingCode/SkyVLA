@@ -19,31 +19,13 @@ jobs:
         with:
           python-version: "3.10"
 
-      # Compile every Python file we ship. PaliGemma and AirSim imports are
-      # avoided because the runner has no GPU and no upstream OpenFly-Platform
-      # checkout; the syntax check still catches `SyntaxError` and
-      # `IndentationError` across the whole tree.
+      # Compile every Python file we ship. Isaac Sim / Isaac Lab are not
+      # installed on the runner (no GPU, no Omniverse), so we don't import the
+      # modules — compileall still catches `SyntaxError` / `IndentationError`
+      # across the whole tree without executing any isaaclab imports.
       - name: Compile Python sources
         run: |
-          python -m compileall -q \
-            openfly \
-            vla/vla_policy.py
-
-      # Smoke-import the lightweight RL modules. AirSim, transformers, and
-      # PaliGemma are not installed on the runner, so we only touch modules
-      # that do not import the heavy stack at module load.
-      - name: Import-check RL core
-        run: |
-          pip install --quiet numpy 'gymnasium>=1.0'
-          PYTHONPATH=. python - <<'PY'
-          import openfly.actions
-          import openfly.episodes
-          import openfly.rewards
-          import openfly.rollout
-          # envs module triggers gymnasium.register on import
-          from openfly.envs import AirSimVLNEnv, AirSimVLNEnvConfig  # noqa: F401
-          print("imports ok")
-          PY
+          python -m compileall -q skyvla_isaac
 
   markdown-links:
     name: Markdown link check

@@ -1,163 +1,110 @@
 # SkyVLA
 
-[![Site](https://img.shields.io/badge/site-skyvla-blue.svg)](https://codcodingcode.github.io/SkyVLA/)
-[![W&B](https://img.shields.io/badge/W%26B-skyvla--subgoal--dit-yellow.svg)](https://wandb.ai/nathanyan2008p-personal/skyvla-subgoal-dit)
+[![Isaac Sim](https://img.shields.io/badge/Isaac%20Sim-4.5-76b900.svg)](https://developer.nvidia.com/isaac/sim)
+[![Isaac Lab](https://img.shields.io/badge/Isaac%20Lab-2.1-76b900.svg)](https://isaac-sim.github.io/IsaacLab/)
+[![W&B](https://img.shields.io/badge/W%26B-skyvla--isaac-yellow.svg)](https://wandb.ai/nathanyan2008p-personal/skyvla-isaac)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Aerial vision-language navigation for the [OpenFly](https://github.com/SHAILAB-IPEC/OpenFly-Platform) benchmark.
+A free-flying quadrotor with a gripper that **picks things up, carries them, and puts them down** — and **maps the space it flies through**. Built on NVIDIA Isaac Sim 4.5 + Isaac Lab 2.1, with real PhysX contact grasping and thousands of parallel environments on one GPU.
 
 ```
-RGB ─► PaliGemma 3B (frozen + LoRA) ─► curr SigLIP ──┬──► SubgoalDiT (~150M) ─► predicted subgoal
-                                                     │                                  │
-                                                     └────► cross-attn + action head ◄──┘
-                                                                       │
-                                                                       ▼
-                                                              discrete action (0..7)
+                 ┌─────────────────────────────────────────┐
+   action (6) ──►│  free-floating quadrotor  (base wrench)   │
+ [vx vy vz yaw   │      │                                    │
+  lower grip]    │      └─► 2-DoF arm: lower + 4-jaw cage ────┼─► contact+friction grasp
+                 │                                            │      (no attach hack)
+  obs (17) ◄─────┤  drone pose · gripper state · object ·     │
+                 │  target · tip→object · object→goal         │
+                 └─────────────────────────────────────────┘
+        PPO (rsl_rl), 2048 envs/GPU          GaussianMap (gsplat) ── flight → 3D map
 ```
 
-## Demo
+## What it does
 
-P3 policy (PaliGemma BC + SubgoalDiT) navigating the unseen `env_ue_smallcity` Unreal scene. 1920×1080 FPV with HUD; companion top-down view tracks position vs goal.
+- **Manipulation — pick & place.** [`DronePickPlaceEnv`](skyvla_isaac/tasks/pick_place_env.py) is an Isaac Lab `DirectRLEnv` where the drone flies to a cube, **cages it with a 4-jaw gripper, and the cube is held by PhysX contact + friction** — a bad grasp slips, there is no kinematic attach. Trained end-to-end with PPO.
+- **Navigation — live 3D mapping.** [`GaussianMap`](skyvla_isaac/gs/gaussian_map.py) fuses posed RGB-D frames into an explicit 3D-Gaussian map by closed-form back-projection (no per-step fitting), so coverage and novel-view rendering are cheap enough to drive a navigation reward. The [`isaac_camera`](skyvla_isaac/gs/isaac_camera.py) adapter is the entire sim port: feed it an Isaac Lab `Camera` instead of a Habitat sensor.
 
-https://github.com/CodCodingCode/SkyVLA/raw/main/videos/p3_realsim.mp4
+## Results
 
-> Files: [`videos/p3_realsim.mp4`](videos/p3_realsim.mp4) (FPV) · [`videos/p3_realsim_topdown.mp4`](videos/p3_realsim_topdown.mp4) (map). Reproducer in [`docs/RECORDING_DEMOS.md`](docs/RECORDING_DEMOS.md).
+Real-physics pick-and-place, trained 3000 iterations across 2048 parallel envs (`model_2999.pt`):
 
-## What's new — May 2026 world-model breakthrough
+| Metric | Rate |
+|---|---:|
+| Grasp (cube caged & lifted off the floor) | **79%** |
+| Lift | **82%** |
+| Place (carried to goal while held, < 18 cm) | **77%** |
 
-For two weeks the `SubgoalDiT` validation cosine similarity sat at the noise floor (`val_cos ≈ 0`) despite training loss dropping cleanly. We tracked it to a degenerate ε-MSE minimum: the model was learning to predict near-mean noise, which minimises MSE while contributing nothing to direction. Three changes broke the collapse.
+The hard part was reward shaping, not flight: lift must be a strong gradient so grasping is discovered, but capped low so "rocket to the ceiling" stops paying — placement only rewards while the cube is genuinely held. A curriculum anneals the start pose from straddling the cube (grasp discovery) to starting from altitude (the real task).
 
-1. **Mean-pool the subgoal target to 1 × 2048.** Predicting all 256 SigLIP tokens dilutes the directional signal. The PaliGemma policy's cross-attention already pools tokens to a single scene summary — so pooling at the WM target costs nothing downstream and concentrates supervision on the direction the policy actually uses. `--subgoal_pool mean` in [`openfly/train_subgoal_dit.py`](openfly/train_subgoal_dit.py).
-2. **Add a direct cos-loss term on `x0`.** Reconstruct the model's predicted `x0` from the ε prediction every step, take cosine similarity with the target, add `(1 − cos)` to the loss with weight 0.3. ε-MSE has the degenerate minimum; cos-on-`x0` does not. `--cos_loss_weight 0.3`.
-3. **Keep [REPA](https://arxiv.org/abs/2410.06940) on as a representation regulariser.** Auxiliary alignment between an intermediate DiT layer and the target stayed near +0.99 throughout — useful as a prior even when its own gradient is small. `--repa_layer_idx 8 --repa_weight 0.1`.
-
-Results across two epochs of the balanced 50 k step-pair set (10 k cap per env after the image-existence filter — see CLAUDE.md for why per-env episode caps don't actually balance):
-
-| Epoch | train_loss | val_loss | **val_cos (seen)** | **val_cos (unseen)** |
-|------:|-----------:|---------:|-------------------:|---------------------:|
-| 0 | 0.838 | 1.007 | **+0.086** | **+0.085** |
-| 1 | 0.811 | 1.019 | **+0.107** | **+0.108** |
-
-First time clearing the noise floor in the whole investigation, with the unseen split tracking — and at epoch 1 *beating* — the seen split. An 8-epoch resume run is in flight; live curves on [W&B](https://wandb.ai/nathanyan2008p-personal/skyvla-subgoal-dit/runs/balanced_50k_pooled_cosloss_clean).
-
-### How the WM loss is wired
-
-```mermaid
-flowchart TB
-    A[Current frame RGB] --> B[PaliGemma SigLIP encoder<br/>256 × 2048, frozen]
-    T[Instruction + sub-instruction] --> TT[PaliGemma text encoder]
-    P[Body-frame pose delta<br/>last action, horizon] --> PE[Pose / action / horizon<br/>embeddings]
-    B --> C[curr SigLIP tokens]
-    C --> DIT[SubgoalDiT denoiser<br/>~150M params, hidden=1152]
-    TT --> DIT
-    PE --> DIT
-    DIT -- intermediate layer 8 --> REPA[REPA proj head]
-    DIT --> EPS[ε prediction]
-    EPS -- x0 = x_t − √1-ᾱ · ε / √ᾱ --> X0[predicted x0<br/>mean-pooled to 1 × 2048]
-    F[Next-keyframe SigLIP<br/>mean-pooled to 1 × 2048] --> CMP[cos x0, target]
-    F --> EPSMSE[ε-MSE  with min-SNR-γ]
-    EPS --> EPSMSE
-    F --> REPACMP[REPA aux cos]
-    REPA --> REPACMP
-    X0 --> CMP
-    EPSMSE --> L[Total loss]
-    CMP --> L
-    REPACMP --> L
-    L --> OPT[AdamW + warmup + grad clip<br/>+ NaN-skip + EMA]
-```
-
-### Training-quality dashboard
-
-W&B logs only progress signals — no per-step jitter, no constants, no operational counters. Per-epoch: `val/cos_seen`, `val/cos_ood`, `val/cos_gap_seen_ood`, `val/best_cos`. Per-step (EMA-smoothed, ~50-step half-life): `train/loss_ema`, `train/train_cos_ema`, `train/cos_loss_ema`, `train/repa_loss_ema`. Health: `epoch/nan_skip_ratio`. The logging policy is enforced in [`CLAUDE.md`](CLAUDE.md) under "W&B is on by default" and implemented in [`openfly/train_subgoal_dit.py`](openfly/train_subgoal_dit.py).
-
-### Crash-resilient training
-
-The A100 on this host throws periodic NVIDIA Xid 43 ("GPU stopped processing") errors. The DiT trainer ships with `--auto_resume --ckpt_every_steps 500` and a tmux crash-loop wrapper so a mid-run segfault drops at most ~3 min of training and resumes from `last.pt` with optimizer / EMA / history intact. See [`CLAUDE.md`](CLAUDE.md) for the full pattern.
-
-1. **P1 — behaviour cloning.** PaliGemma + LoRA + action head, offline on OpenFly's `train.json`.
-2. **P2 — world model.** `SubgoalDiT` is a feature-space DDPM (~150M, PixArt-Σ-init DiT) that predicts the next-keyframe SigLIP tokens from the current frame, instruction, and pose delta. PaliGemma is frozen for this stage so the diffusion loss is the only signal. The original from-scratch DiT and a thin-adapter PixArt variant both plateaued at the noise floor — see "What's new" above for the fix.
-3. **P3 — subgoal-conditioned policy.** The frozen world model feeds the policy via cross-attention. Online RL — GRPO on PaliGemma, PPO on the OpenFly-Agent 7B baseline — updates only the action head, with an easy → medium → hard reward curriculum on the GRPO run.
-
-Eval uses OpenFly's seen / unseen splits, with a per-env breakdown for the three unseen scenes (`env_game_gtav`, `env_ue_smallcity`, `env_gs_sjtu02`).
-
-## Quick start
+## Install
 
 ```bash
-git clone https://github.com/CodCodingCode/SkyVLA.git ~/SkyVLA
-cd ~/SkyVLA
-
-bash openfly/setup.sh                              # conda env, OpenFly-Platform clone, annotations
-bash openfly/download_scene.sh env_airsim_16       # ~2 GB
-source openfly/activate.sh
-bash openfly/run_eval.sh --split unseen --policy heuristic \
-  --env_filter env_airsim_16 --max_episodes 5
+conda activate isaac                  # Isaac Sim 4.5 + Isaac Lab 2.1, Python 3.10
+export OMNI_KIT_ACCEPT_EULA=YES
+export PYTHONPATH=/home/ubuntu/SkyVLA
+pip install gsplat                     # only needed for the Gaussian-map navigation demo
 ```
 
-Eval JSON lands in `logs/benchmarks/`.
-
-## Train
+## Run
 
 ```bash
-export OPENFLY_IMAGE_ROOT=~/assets/OpenFly/images/Image
+# 1. build the PhysX articulation from the URDF (one-time; lower/grip become real DoFs)
+python skyvla_isaac/scripts/convert_urdf.py
 
-# P1 — BC
-bash openfly/run_train_paligemma.sh --epochs 10 --batch_size 8
+# 2. smoke the env — N parallel envs, random actions, headless
+python skyvla_isaac/scripts/smoke_env.py --num_envs 16
 
-# P2 — world model (PaliGemma frozen, SigLIP-token diffusion)
-bash openfly/run_train_subgoal_dit.sh
+# 3. train pick-and-place (PPO, rsl_rl) — smoke, then full
+python skyvla_isaac/scripts/train.py --num_envs 256  --max_iterations 3
+python skyvla_isaac/scripts/train.py --num_envs 2048 --max_iterations 1500
 
-# P3 — RL on the subgoal-conditioned policy
-bash openfly/run_train_curriculum.sh \
-  --init_ckpt logs/openfly/paligemma/<run>/last.pt \
-  --steps_easy 80 --steps_medium 60 --steps_hard 60
+# 4. evaluate a checkpoint — deterministic rollout + real success rate (+ optional mp4)
+python skyvla_isaac/scripts/play.py --checkpoint logs/isaac/drone_pick_place/model_1499.pt --video
 
-# Eval any checkpoint
-bash openfly/run_eval.sh --split unseen --policy paligemma \
-  --paligemma_ckpt logs/openfly/<run>/last.pt
+# 5. render a polished 3rd-person rollout to mp4
+python skyvla_isaac/scripts/render_rollout.py \
+  --checkpoint logs/isaac/drone_pick_place/model_1499.pt --out videos/isaac_pickplace.mp4
+
+# 6. navigation: fuse Isaac RGB-D into a GaussianMap and render a novel view
+python skyvla_isaac/scripts/gs_isaac_demo.py
 ```
-
-A second training track ships for the upstream OpenFly-Agent (OpenVLA 7B) via FSDP — see [`openfly/README.md`](openfly/README.md).
 
 ## Layout
 
 ```
-openfly/
-  eval_benchmark.py              eval harness
-  train_paligemma.py             P1 — BC
-  train_subgoal_dit.py           P2 — SigLIP-token diffusion world model
-  train_grpo_paligemma.py        P3 — GRPO on PaliGemma
-  train_curriculum_grpo.py       P3 — easy → medium → hard reward curriculum
-  train_ppo_openfly_agent.py     P3 — PPO + LoRA + value head on OpenFly-Agent 7B
-  models/
-    paligemma_vln.py             BC backbone
-    subgoal_dit.py               world model (vanilla DiT)
-    subgoal_dit_pixart.py        failed ablation — PixArt-Σ frozen backbone + thin adapter
-    openfly_agent_rl.py          7B + value head
-  envs/airsim_vln_env.py         gymnasium wrapper around the AirSim / UE bridge
-  rewards.py, rollout.py         episode rewards + trajectory collection
-vla/                             portable PaliGemma feature extractor + design notes
-docs/                            research plan, setup, fairness, Jekyll site
-logs/                            training and benchmark outputs (gitignored)
+skyvla_isaac/
+  assets/
+    drone_with_gripper.urdf      quadrotor + 2-DoF gripper (lower + 4-jaw cage)
+    drone_with_gripper.usd       PhysX articulation (generated from the URDF)
+  tasks/
+    pick_place_env.py            DronePickPlaceEnv — DirectRLEnv, real contact grasping
+  gs/
+    gaussian_map.py              incremental 3D-Gaussian map (gsplat), sim-agnostic
+    isaac_camera.py              Isaac Camera → (rgb, depth, pose, K) adapter
+  scripts/
+    convert_urdf.py              URDF → USD articulation (Isaac URDF importer)
+    smoke_env.py                 build N envs, step random actions (sanity check)
+    train.py                     PPO via rsl_rl, thousands of envs on one GPU
+    play.py                      deterministic eval + success rate + video
+    render_rollout.py            3rd-person Camera rollout → mp4
+    gs_isaac_demo.py             end-to-end Gaussian-map navigation demo
 ```
 
-## Docs
+## How it works
 
-| File | What's in it |
-|---|---|
-| [`docs/RESEARCH.md`](docs/RESEARCH.md) | research question, splits, reward curriculum, experiment matrix |
-| [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md) | motivation, architecture, expected contribution |
-| [`docs/implementation.md`](docs/implementation.md) | one-page tour: env, data, policy, world model, training, eval |
-| [`docs/A100_SETUP.md`](docs/A100_SETUP.md) | end-to-end host bring-up on an x86_64 A100 |
-| [`docs/BENCHMARK_FAIRNESS.md`](docs/BENCHMARK_FAIRNESS.md) | what each leaderboard number can and can't claim |
-| [`vla/VLA_SYSTEM.md`](vla/VLA_SYSTEM.md) | PaliGemma + LoRA backbone notes |
-| [Project site](https://codcodingcode.github.io/SkyVLA/) | the same content, browsable |
+- **Drone.** A single free-floating PhysX articulation. Instead of per-rotor thrust, a base wrench tracks a commanded velocity (`kv`) and an attitude controller (`k_att`, `k_damp`) keeps it upright — so the policy commands flight, the controller keeps it stable.
+- **Gripper.** A 4-jaw cage (`grip_xl/xr/yl/yr`) closing along ±X and ±Y, plus a stiff `lower` arm. A flat two-finger pinch ejects a free cube; the cage boxes it in. High contact friction holds it during carry.
+- **Action / obs.** 6 continuous actions `[vx, vy, vz, yaw_rate, lower, grip]`; 17-dim observation (drone pose, gripper state, object & target pose, tip→object and object→goal vectors). World is +Z up.
+- **Navigation map.** Gaussian Splatting's cost is *fitting*; we skip it. `add_from_rgbd` splats in the Gaussians implied by each posed RGB-D frame in closed form, and `render` rasterizes a view in milliseconds — fast enough for an inner-loop coverage reward.
 
 ## Requirements
 
-- x86_64 Linux with an NVIDIA GPU. The upstream UE scene binaries are x86 only — no GH200 / aarch64.
-- 24 GB VRAM covers P1–P3 except the OpenFly-Agent 7B FSDP track, which needs more.
-- Python 3.10 inside a conda env named `openfly` (created by `openfly/setup.sh`).
+- NVIDIA GPU with **Isaac Sim 4.5 + Isaac Lab 2.1** installed, in a conda env named `isaac` (Python 3.10).
+- `OMNI_KIT_ACCEPT_EULA=YES` and `PYTHONPATH` set to the repo root (see Install).
+- `gsplat` only for the navigation / Gaussian-map demo.
+
+Agent/operator conventions for this repo (W&B logging, crash-resilient training on this host) live in [`CLAUDE.md`](CLAUDE.md).
 
 ## License
 
-MIT.
+MIT — see [`LICENSE`](LICENSE).

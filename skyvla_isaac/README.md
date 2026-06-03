@@ -32,17 +32,16 @@ python skyvla_isaac/scripts/smoke_env.py --num_envs 16
 # train (smoke / full)
 python skyvla_isaac/scripts/train.py --num_envs 256  --max_iterations 3
 python skyvla_isaac/scripts/train.py --num_envs 2048 --max_iterations 1500
+# evaluate a checkpoint (real success rate, optional mp4)
+python skyvla_isaac/scripts/play.py --checkpoint logs/isaac/drone_pick_place/model_1499.pt --video
 ```
 
 ## Status
-Working: install, URDF→USD articulation, parallel DirectRLEnv with real contact
-grasping, rsl_rl PPO loop. **Reward shaping in `pick_place_env._get_rewards`
-still needs tuning** for convergence (the smoke run's reward declines — expected
-for an untrained policy against the time/effort costs).
-
-## Not yet ported from Habitat (kept intact in `indoor_uav/`, `openfly/`)
-- Gaussian-splat **navigation reward** loop (the `gs/` module is ported as a
-  sim-agnostic consumer, but the camera-driven coverage env is not).
-- OpenFly **VLN** benchmark + PaliGemma policy (large, scene/pose-bound).
-These remain in the Habitat tree until ported — deleting them before porting
-would remove un-replaced functionality.
+**Converged.** Real-physics (contact + friction, no attach) pick-and-place trains
+to grasp 79% / lift 82% / place 77% over 3000 PPO iterations at 2048 envs
+(`model_2999.pt`). The crux was reward shaping in `pick_place_env._get_rewards`:
+lift is a strong gradient (so grasping is discovered) but capped low (so "hover
+high" stops paying), and placement only rewards while the cube is genuinely
+*held*. A curriculum anneals the start pose from straddling the cube to starting
+from altitude. The `gs/` Gaussian-map module is ported as a sim-agnostic
+navigation consumer (see `scripts/gs_isaac_demo.py`).

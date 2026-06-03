@@ -99,6 +99,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     target_radius: float = 0.25
     lift_height: float = 0.15  # object this far off floor counts as grasped
     grasp_radius: float = 0.15  # tip within this of cube + grip on -> magnetic latch
+    render_camera: bool = False  # add a close 3rd-person Camera sensor (for rollout mp4)
 
 
 class DronePickPlaceEnv(DirectRLEnv):
@@ -136,6 +137,14 @@ class DronePickPlaceEnv(DirectRLEnv):
         self.scene.rigid_objects["object"] = self.object
         light = sim_utils.DomeLightCfg(intensity=2000.0)
         light.func("/World/Light", light)
+        if getattr(self.cfg, "render_camera", False):
+            from isaaclab.sensors import Camera, CameraCfg
+            ccfg = CameraCfg(
+                prim_path="/World/render_cam", height=540, width=720, update_period=0.0,
+                data_types=["rgb"],
+                spawn=sim_utils.PinholeCameraCfg(focal_length=22.0, clipping_range=(0.05, 80.0)))
+            self._render_cam = Camera(ccfg)
+            self.scene.sensors["render_cam"] = self._render_cam
 
     # ------------------------------------------------------------------ #
     def _pre_physics_step(self, actions: torch.Tensor):

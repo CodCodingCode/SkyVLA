@@ -84,6 +84,9 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
             "lower": ImplicitActuatorCfg(joint_names_expr=["lower"],
                                          effort_limit=200.0, velocity_limit=2.0,
                                          stiffness=8000.0, damping=300.0),
+            # jaws: firm but NOT so hard they punt the free cube out before caging it
+            # (effort 200/stiffness 4000 ejected it). These values gave 95% far-grasp;
+            # the carry is fixed via higher friction + the carry_up reward, not force.
             "grip": ImplicitActuatorCfg(joint_names_expr=["grip_.*"],
                                         effort_limit=80.0, velocity_limit=1.0,
                                         stiffness=2000.0, damping=10.0),
@@ -113,7 +116,13 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     k_damp: float = 0.6        # angular-velocity damping (stops spin/tumble)
     max_drop: float = 0.5
     target_radius: float = 0.25
-    curriculum_p: float = 0.7  # fraction of envs that start with the gripper straddling the cube
+    curriculum_p: float = 0.7  # (unused when annealing) fraction starting straddling the cube
+    # CURRICULUM ANNEAL: start mostly straddling (grasp discovery), end mostly from
+    # altitude (the real task). A fixed 0.7 overfit the easy case -> far-start
+    # delivery was 3%. Anneal p_straddle 0.85 -> 0.10 over the run.
+    curriculum_p_start: float = 0.85
+    curriculum_p_end: float = 0.15
+    anneal_steps: float = 60000.0   # policy steps over which to anneal (~ first 2500 iters)
     render_camera: bool = False  # add a close 3rd-person Camera sensor (for rollout mp4)
 
 
@@ -165,6 +174,7 @@ class DronePickPlaceEnv(DirectRLEnv):
     # ------------------------------------------------------------------ #
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clamp(-1.0, 1.0)
+        self._train_steps = getattr(self, "_train_steps", 0) + 1   # for curriculum anneal
 
     def _apply_action(self):
         a = self._actions
@@ -253,6 +263,7 @@ class DronePickPlaceEnv(DirectRLEnv):
             "metrics/grasp_rate": self._held.float().mean(),          # real contact grasp
             "metrics/place_success": self._success.float().mean(),
             "metrics/obj_to_goal": self._d_goal.mean(),
+            "metrics/curriculum_straddle_p": torch.tensor(getattr(self, "_cur_p", self.cfg.curriculum_p)),
         }
         return oob, time_out          # dense task: no success-termination
 
@@ -275,9 +286,15 @@ class DronePickPlaceEnv(DirectRLEnv):
         # big reward is unlockable ONLY through grasping-then-carrying to the 3D goal.
         place = held * (1.0 - torch.tanh(self._d_goal / 0.35))        # deliver cube to goal waypoint
         carry_prog = held * (self._prev_d_goal - self._d_goal)        # shaped progress toward goal
+        # DENSE carry-up: reward raising the HELD cube from the floor (0.15) toward
+        # goal height (~0.40). Bootstraps the ascend-while-holding behavior even before
+        # full deliveries happen -- the missing step (86% grasped from altitude but
+        # would not risk carrying it up; only 9% delivered).
+        carry_up = held * torch.clamp(self._obj_z - 0.15, 0.0, 0.25)
         success = (self._held & (self._d_goal < 0.18)).float()        # carried-and-delivered
         r = (1.0 * reach + 0.5 * align + 1.5 * grab                    # approach, center, clamp
              + 60.0 * cube_h                                          # grasp/lift gate (strong, low plateau)
+             + 30.0 * carry_up                                        # raise the held cube toward goal height
              + 40.0 * place                                           # DOMINANT: deliver to goal
              + 25.0 * carry_prog                                      # progress toward goal
              + 80.0 * success                                         # sparse delivery bonus
@@ -299,10 +316,15 @@ class DronePickPlaceEnv(DirectRLEnv):
         self.object.write_root_velocity_to_sim(obj[:, 7:], env_ids)
         obj_local = obj[:, :3] - origins
 
-        # --- CURRICULUM: a fraction start with the gripper STRADDLING the cube
-        # (drone directly above at grasp height, jaws open) so the policy can
-        # discover close->lift; the rest start at altitude and must fly in. ---
-        near = torch.rand(n, device=self.device) < self.cfg.curriculum_p
+        # --- CURRICULUM (annealed): a fraction start with the gripper STRADDLING the
+        # cube (drone directly above at grasp height, jaws open) so the policy can
+        # discover close->lift; the rest start at altitude and must fly in. The
+        # straddle fraction anneals high->low so the policy is forced to master the
+        # full fly-in-from-altitude task, not just the spoon-fed grasp. ---
+        prog = min(1.0, getattr(self, "_train_steps", 0) / self.cfg.anneal_steps)
+        cur_p = self.cfg.curriculum_p_start + (self.cfg.curriculum_p_end - self.cfg.curriculum_p_start) * prog
+        self._cur_p = cur_p                                              # logged in _get_dones
+        near = torch.rand(n, device=self.device) < cur_p
         root = self.robot.data.default_root_state[env_ids].clone()       # (0,0,1.0), level, v=0
         root[near, 0] = obj_local[near, 0]
         root[near, 1] = obj_local[near, 1]

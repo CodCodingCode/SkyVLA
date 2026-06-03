@@ -19,6 +19,8 @@ parser.add_argument("--checkpoint", required=True)
 parser.add_argument("--out", default="/home/ubuntu/SkyVLA/videos/isaac_pickplace.mp4")
 parser.add_argument("--steps", type=int, default=500)
 parser.add_argument("--fps", type=int, default=30)
+parser.add_argument("--cur_p", type=float, default=None,
+                    help="pin straddle-start fraction (0.0 = full fly-in-from-altitude task)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -36,6 +38,8 @@ from isaaclab.utils.dict import class_to_dict  # noqa: E402
 from skyvla_isaac.tasks.pick_place_env import DronePickPlaceEnv, DronePickPlaceEnvCfg  # noqa: E402
 
 cfg = DronePickPlaceEnvCfg()
+if args.cur_p is not None:
+    cfg.curriculum_p_start = cfg.curriculum_p_end = args.cur_p   # pin start (no anneal)
 cfg.scene.num_envs = 1
 cfg.render_camera = True
 env = DronePickPlaceEnv(cfg)

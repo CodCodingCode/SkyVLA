@@ -29,6 +29,7 @@ from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg, ViewerCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_rotate
 
 _USD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "assets", "drone_with_gripper.usd")
@@ -95,6 +96,8 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     speed: float = 1.5
     yaw_rate: float = 2.0
     kv: float = 8.0            # velocity-tracking force gain (per unit mass)
+    k_att: float = 4.0         # attitude-leveling torque gain (keeps drone upright)
+    k_damp: float = 0.6        # angular-velocity damping (stops spin/tumble)
     max_drop: float = 0.5
     target_radius: float = 0.25
     lift_height: float = 0.15  # object this far off floor counts as grasped
@@ -163,8 +166,15 @@ class DronePickPlaceEnv(DirectRLEnv):
         # clamp + sanitize so a flung env can't explode the controller -> NaN
         fmax = (4.0 * self._mass * GRAV).unsqueeze(-1)
         force = torch.nan_to_num(force, nan=0.0).clamp(-fmax, fmax)
-        torque = torch.zeros(self.num_envs, 3, device=self.device)
-        torque[:, 2] = a[:, 3] * self.cfg.yaw_rate * 0.5      # yaw
+        # ATTITUDE STABILIZATION: a real quad's controller keeps it level + damps
+        # rotation. Without this the body free-spins (yaw doesn't affect reward).
+        q = self.robot.data.root_quat_w
+        wup = torch.zeros(self.num_envs, 3, device=self.device); wup[:, 2] = 1.0
+        up_body = quat_rotate(q, wup)                          # body up-axis, in world
+        level_err = torch.cross(up_body, wup, dim=-1)         # restoring axis (roll/pitch)
+        ang = self.robot.data.root_ang_vel_w
+        torque = self.cfg.k_att * level_err - self.cfg.k_damp * ang   # level + damp all spin
+        torque = torch.nan_to_num(torque).clamp(-2.0, 2.0)
         self.robot.set_external_force_and_torque(
             force.unsqueeze(1), torque.unsqueeze(1), body_ids=self._base_i)
         # --- gripper joints ---

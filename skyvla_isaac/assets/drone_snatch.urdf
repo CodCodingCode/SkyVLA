@@ -1,0 +1,126 @@
+<?xml version="1.0"?>
+<!--
+  SNATCH drone — Z-UP free-flying quadrotor with a SINGLE-DOF caging gripper.
+
+  Derived from the proven drone_with_gripper.urdf, with two deliberate changes
+  required by the SNATCH BOM (one jaw servo, no lowering DOF):
+
+    * REMOVED the `lower` prismatic joint and the `arm` link entirely. The four
+      cage fingers now mount DIRECTLY / rigidly under the base via fixed joints;
+      the drone descends *bodily* to grasp.
+    * The ONLY movable joints are the 4 jaw-close prismatic joints
+      (grip_xl/grip_xr/grip_yl/grip_yr). One policy "gripper" action drives all
+      four symmetrically (single-DOF cage).
+
+  Two camera MOUNT frames are added as fixed links:
+    * cam_top    — forward-facing (+X), on the top plate (RealSense, depth fwd)
+    * cam_bottom — downward-facing (-Z), under the base (Pi-cam, depth down)
+
+  Collision is ONLY on base + the 4 fingers. Booms / rotors / cameras are
+  visual-only so they don't snag the cube or the ground.
+
+  Geometry note: in the proven design the fingers sat at world Z = -0.03 (arm
+  joint) + -0.30 (finger joint) = -0.33 below base center. We keep that exact
+  fingertip depth by mounting the fingers at z=-0.33 directly off the base, and
+  keep the open ~8 cm / closed-on-5cm-cube cage that reliably grasps.
+-->
+<robot name="drone_snatch">
+
+  <material name="body"><color rgba="0.13 0.14 0.18 1"/></material>
+  <material name="boom"><color rgba="0.20 0.20 0.24 1"/></material>
+  <material name="rotor"><color rgba="0.30 0.55 0.95 0.9"/></material>
+  <material name="cammat"><color rgba="0.10 0.80 0.30 1"/></material>
+  <material name="grip"><color rgba="0.95 0.55 0.10 1"/></material>
+
+  <!-- central hub (flat box) -->
+  <link name="base">
+    <visual><geometry><box size="0.14 0.14 0.05"/></geometry><material name="body"/></visual>
+    <collision><geometry><box size="0.14 0.14 0.05"/></geometry></collision>
+    <!-- realistic rotational inertia for a 1.5 kg quad with ~0.42 m booms.
+         ixx/iyy ~0.012, izz ~0.022 resists the gripper's reaction torque. -->
+    <inertial><mass value="1.5"/><inertia ixx="1.2e-2" iyy="1.2e-2" izz="2.2e-2" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+
+  <!-- crossed booms in the horizontal X-Y plane (visual only) -->
+  <link name="boom_x"><visual><geometry><box size="0.42 0.025 0.02"/></geometry><material name="boom"/></visual></link>
+  <joint name="j_boom_x" type="fixed"><parent link="base"/><child link="boom_x"/><origin xyz="0 0 0.01"/></joint>
+  <link name="boom_y"><visual><geometry><box size="0.025 0.42 0.02"/></geometry><material name="boom"/></visual></link>
+  <joint name="j_boom_y" type="fixed"><parent link="base"/><child link="boom_y"/><origin xyz="0 0 0.01"/></joint>
+
+  <!-- four rotor disks (flat horizontal disks; visual only) -->
+  <link name="rotor_xp"><visual><geometry><cylinder radius="0.10" length="0.012"/></geometry><material name="rotor"/></visual></link>
+  <joint name="j_rxp" type="fixed"><parent link="base"/><child link="rotor_xp"/><origin xyz="0.21 0 0.03"/></joint>
+  <link name="rotor_xn"><visual><geometry><cylinder radius="0.10" length="0.012"/></geometry><material name="rotor"/></visual></link>
+  <joint name="j_rxn" type="fixed"><parent link="base"/><child link="rotor_xn"/><origin xyz="-0.21 0 0.03"/></joint>
+  <link name="rotor_yp"><visual><geometry><cylinder radius="0.10" length="0.012"/></geometry><material name="rotor"/></visual></link>
+  <joint name="j_ryp" type="fixed"><parent link="base"/><child link="rotor_yp"/><origin xyz="0 0.21 0.03"/></joint>
+  <link name="rotor_yn"><visual><geometry><cylinder radius="0.10" length="0.012"/></geometry><material name="rotor"/></visual></link>
+  <joint name="j_ryn" type="fixed"><parent link="base"/><child link="rotor_yn"/><origin xyz="0 -0.21 0.03"/></joint>
+
+  <!-- ============ camera MOUNT frames (visual-only, no collision) ============ -->
+  <!-- top: forward-facing (+X), sits on the top plate. The frame's local +Z is
+       world +Z here; the camera sensor cfg (Agent A2) applies its own optical
+       convention relative to this mount. Visual is a small green box marker. -->
+  <link name="cam_top">
+    <visual><geometry><box size="0.03 0.05 0.02"/></geometry><material name="cammat"/></visual>
+    <inertial><mass value="0.005"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="j_cam_top" type="fixed">
+    <parent link="base"/><child link="cam_top"/><origin xyz="0.07 0 0.04" rpy="0 0 0"/>
+  </joint>
+
+  <!-- bottom: downward-facing (-Z), under the base. Small green box marker. -->
+  <link name="cam_bottom">
+    <visual><geometry><box size="0.03 0.03 0.015"/></geometry><material name="cammat"/></visual>
+    <inertial><mass value="0.005"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="j_cam_bottom" type="fixed">
+    <parent link="base"/><child link="cam_bottom"/><origin xyz="0 0 -0.03" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============ 4-JAW CAGE: mounted RIGIDLY under the base (no lower DOF) ============
+       Walls close on all four sides (X and Y) so a free cube gets boxed in and
+       cannot squirt out. Open ~8 cm, closed they press the 5 cm cube's four
+       faces -> caged + force closure. Fingertips sit at world Z = -0.33 below
+       base center (same depth as the proven design). -->
+  <link name="finger_xl">
+    <visual><geometry><box size="0.012 0.07 0.05"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.012 0.07 0.05"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_xl" type="prismatic">
+    <parent link="base"/><child link="finger_xl"/><origin xyz="0.04 0 -0.33"/><axis xyz="-1 0 0"/>
+    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+  </joint>
+
+  <link name="finger_xr">
+    <visual><geometry><box size="0.012 0.07 0.05"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.012 0.07 0.05"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_xr" type="prismatic">
+    <parent link="base"/><child link="finger_xr"/><origin xyz="-0.04 0 -0.33"/><axis xyz="1 0 0"/>
+    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+  </joint>
+
+  <link name="finger_yl">
+    <visual><geometry><box size="0.07 0.012 0.05"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.07 0.012 0.05"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_yl" type="prismatic">
+    <parent link="base"/><child link="finger_yl"/><origin xyz="0 0.04 -0.33"/><axis xyz="0 -1 0"/>
+    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+  </joint>
+
+  <link name="finger_yr">
+    <visual><geometry><box size="0.07 0.012 0.05"/></geometry><material name="grip"/></visual>
+    <collision><geometry><box size="0.07 0.012 0.05"/></geometry></collision>
+    <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
+  </link>
+  <joint name="grip_yr" type="prismatic">
+    <parent link="base"/><child link="finger_yr"/><origin xyz="0 -0.04 -0.33"/><axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+  </joint>
+
+</robot>

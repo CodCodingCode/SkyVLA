@@ -108,14 +108,14 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     anneal_steps: float = 60000.0
 
     def __post_init__(self):
-        self.observation_space = (1024 if self.use_cameras else 0) + 11
+        self.observation_space = (1024 if self.use_cameras else 0) + 14   # +3 for goal
 
 
 class DroneSnatchEnv(DirectRLEnv):
     cfg: DroneSnatchEnvCfg
 
     def __init__(self, cfg: DroneSnatchEnvCfg, render_mode: str | None = None, **kw):
-        cfg.observation_space = (1024 if cfg.use_cameras else 0) + 11   # recompute post-toggle
+        cfg.observation_space = (1024 if cfg.use_cameras else 0) + 14   # recompute post-toggle (+goal)
         super().__init__(cfg, render_mode, **kw)
         self._grip_i, _ = self.robot.find_joints("grip_.*")
         self._base_i, _ = self.robot.find_bodies("base")
@@ -215,7 +215,8 @@ class DroneSnatchEnv(DirectRLEnv):
         block_est = snatch_rand.apply_detection_noise(obj_p, self._dr)
         grip = self.robot.data.joint_pos[:, self._grip_i].mean(-1, keepdim=True)
         grip_tau = self.robot.data.applied_torque[:, self._grip_i].abs().mean(-1, keepdim=True)
-        state = torch.cat([pose_est, base_v, grip, grip_tau, block_est], dim=-1)  # (N,11)
+        goal_rel = self._target - base_p                       # delivery target (drone-relative)
+        state = torch.cat([pose_est, base_v, grip, grip_tau, block_est, goal_rel], dim=-1)  # (N,14)
         latents = self._camera_latents()
         obs = torch.cat([latents, state], dim=-1)
         return {"policy": torch.nan_to_num(obs)}

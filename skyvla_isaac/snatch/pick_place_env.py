@@ -93,8 +93,8 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     kv: float = 18.0
     k_att: float = 4.0
     k_damp: float = 0.6
-    obj_spawn_diam: float = 1.2          # cube uniform +/- diam/2 around origin
-    goal_offset_diam: float = 1.0
+    obj_spawn_diam: float = 0.8          # proven distance for convergence (scale up later)
+    goal_offset_diam: float = 0.5
     grasp_clear: float = 0.06            # cube off-floor height to count as lifted
     # Localization/perception noise: TRAIN CLEAN (0), EVAL sweeps the drift (the gap study).
     # Training under full drift corrupts the drone's own pose estimate -> it can't descend

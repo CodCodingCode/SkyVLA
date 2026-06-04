@@ -70,6 +70,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False, solver_position_iteration_count=16,
                 solver_velocity_iteration_count=4),
+            semantic_tags=[("class", "drone")],         # foreground mask for GS compositing
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.0, 1.0),
@@ -104,6 +105,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 static_friction=2.0, dynamic_friction=1.6, friction_combine_mode="max"),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.2, 0.2)),
+            semantic_tags=[("class", "cube")],          # foreground mask for GS compositing
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.6, 0.0, 0.025)),
     )
@@ -124,6 +126,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     curriculum_p_end: float = 0.15
     anneal_steps: float = 60000.0   # policy steps over which to anneal (~ first 2500 iters)
     render_camera: bool = False  # add a close 3rd-person Camera sensor (for rollout mp4)
+    indoor_room: bool = False    # spawn a visual indoor room (for GS-backdrop rollout capture)
 
 
 class DronePickPlaceEnv(DirectRLEnv):
@@ -162,14 +165,41 @@ class DronePickPlaceEnv(DirectRLEnv):
         self.scene.rigid_objects["object"] = self.object
         light = sim_utils.DomeLightCfg(intensity=2000.0)
         light.func("/World/Light", light)
+        if getattr(self.cfg, "indoor_room", False):
+            self._spawn_indoor_room()
         if getattr(self.cfg, "render_camera", False):
             from isaaclab.sensors import Camera, CameraCfg
+            # for the GS-backdrop rollout we also need depth (to back-project the room
+            # into Gaussians) and semantic seg (to mask drone+cube as foreground).
+            dtypes = ["rgb"]
+            if getattr(self.cfg, "indoor_room", False):
+                dtypes += ["distance_to_image_plane", "semantic_segmentation"]
             ccfg = CameraCfg(
                 prim_path="/World/render_cam", height=540, width=720, update_period=0.0,
-                data_types=["rgb"],
+                data_types=dtypes, colorize_semantic_segmentation=False,
                 spawn=sim_utils.PinholeCameraCfg(focal_length=22.0, clipping_range=(0.05, 80.0)))
             self._render_cam = Camera(ccfg)
             self.scene.sensors["render_cam"] = self._render_cam
+
+    def _spawn_indoor_room(self):
+        """A visual-only indoor room (floor + 4 walls + ceiling) centered on the origin,
+        so an RGB-D orbit can be fused into a GaussianMap for the rollout backdrop. No
+        collision -> the physics is unchanged (cosmetic backdrop)."""
+        H, R, T = 3.2, 4.0, 0.05      # ceiling height, half-room, wall thickness
+        def panel(name, size, pos, color):
+            c = sim_utils.CuboidCfg(size=size,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color, roughness=0.9),
+                semantic_tags=[("class", "room")])
+            c.func(f"/World/room/{name}", c, translation=pos)
+        panel("floor",   (2 * R, 2 * R, T), (0, 0, -T / 2),       (0.62, 0.55, 0.46))  # wood-ish
+        panel("ceiling", (2 * R, 2 * R, T), (0, 0, H),            (0.86, 0.86, 0.88))  # off-white
+        panel("wall_xp", (T, 2 * R, H),     (R, 0, H / 2),        (0.74, 0.70, 0.62))
+        panel("wall_xn", (T, 2 * R, H),     (-R, 0, H / 2),       (0.55, 0.62, 0.70))  # blue-gray
+        panel("wall_yp", (2 * R, T, H),     (0, R, H / 2),        (0.70, 0.66, 0.60))
+        panel("wall_yn", (2 * R, T, H),     (0, -R, H / 2),       (0.68, 0.58, 0.55))  # warm
+        # a couple of furniture-ish blocks so the room has depth/parallax in the splat
+        panel("shelf",   (0.5, 1.4, 1.2),   (R - 0.45, 1.0, 0.6), (0.40, 0.30, 0.24))
+        panel("table",   (1.0, 0.7, 0.5),   (-1.3, -1.4, 0.25),   (0.45, 0.35, 0.28))
 
     # ------------------------------------------------------------------ #
     def _pre_physics_step(self, actions: torch.Tensor):

@@ -46,6 +46,7 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     state_space = 0
 
     use_cameras: bool = True             # visuomotor obs (dual depth + ResNet encoders)
+    render_camera: bool = False          # add a 3rd-person RGB follow cam (for rollout mp4)
 
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 200.0, render_interval=4,
@@ -155,6 +156,14 @@ class DroneSnatchEnv(DirectRLEnv):
             self._bottom_cam = TiledCamera(P.bottom_camera_cfg())
             self.scene.sensors["top_cam"] = self._top_cam
             self.scene.sensors["bottom_cam"] = self._bottom_cam
+        if getattr(self.cfg, "render_camera", False):
+            from isaaclab.sensors import Camera, CameraCfg
+            ccfg = CameraCfg(
+                prim_path="/World/snatch_render_cam", height=540, width=720,
+                update_period=0.0, data_types=["rgb"],
+                spawn=sim_utils.PinholeCameraCfg(focal_length=22.0, clipping_range=(0.05, 80.0)))
+            self._render_cam = Camera(ccfg)
+            self.scene.sensors["render_cam"] = self._render_cam
 
     # ------------------------------------------------------------------ #
     def _pre_physics_step(self, actions: torch.Tensor):

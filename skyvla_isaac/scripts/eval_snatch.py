@@ -28,6 +28,8 @@ parser.add_argument("--drift_scales", type=float, nargs="+",
                     help="vio_drift_scale values for the sim2real gap sweep")
 parser.add_argument("--no_cams", action="store_true",
                     help="evaluate the state-based variant (match a --no_cams trained policy)")
+parser.add_argument("--cur_p", type=float, default=None,
+                    help="pin straddle-start fraction (0.0 = full fly-in-from-altitude) for honest eval")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -123,6 +125,8 @@ def run_eval(env, policy, base, steps):
 def make_env(num_envs, drift_scale):
     cfg = DroneSnatchEnvCfg()
     cfg.use_cameras = not args.no_cams
+    if args.cur_p is not None:                       # pin start distribution (no anneal at eval)
+        cfg.curriculum_p_start = cfg.curriculum_p_end = args.cur_p
     cfg.scene.num_envs = num_envs
     # Headline sim2real knob: scale the VIO drift magnitude applied to the
     # pose terms in the observation. The orchestrator's env reads this and

@@ -234,6 +234,10 @@ class DroneSnatchEnv(DirectRLEnv):
         self._held = self._lifted & (self._d_reach < 0.10)
         self._carry = self._held
         self._success = self._held & (self._d_goal < 0.18)
+        # aliases for eval_snatch's metric contract
+        self._grasped = self._held
+        self._placed = self._success
+        self._grasp_pos_err = self._d_reach
         self._crashed = (base_p[:, 2] < 0.05) | (torch.norm(base_p[:, :2], dim=-1) > 5.0) \
             | (torch.norm(self.robot.data.root_lin_vel_w, dim=-1) > 12.0)
         time_out = self.episode_length_buf >= self.max_episode_length - 1

@@ -88,7 +88,7 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     )
 
     # flight + task params
-    speed: float = 2.0
+    speed: float = 1.5                   # proven value; eases precise bodily descent-grasp
     yaw_rate_scale: float = 1.0
     kv: float = 18.0
     k_att: float = 4.0
@@ -96,7 +96,11 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     obj_spawn_diam: float = 1.2          # cube uniform +/- diam/2 around origin
     goal_offset_diam: float = 1.0
     grasp_clear: float = 0.06            # cube off-floor height to count as lifted
-    vio_drift_scale: float = 1.0         # headline sim2real knob (eval sweeps this)
+    # Localization/perception noise: TRAIN CLEAN (0), EVAL sweeps the drift (the gap study).
+    # Training under full drift corrupts the drone's own pose estimate -> it can't descend
+    # onto the cube and grasp collapses. eval_snatch sets vio_drift_scale per sweep point.
+    vio_drift_scale: float = 0.0         # headline sim2real knob (eval sweeps this)
+    detection_noise_scale: float = 0.0   # block-position estimate noise (eval can sweep too)
     # curriculum: a fraction start straddling the cube (grasp discovery), annealed down
     # so the policy masters the full fly-in task. (Proven necessary for convergence.)
     curriculum_p_start: float = 0.85
@@ -124,7 +128,8 @@ class DroneSnatchEnv(DirectRLEnv):
         self._carry = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # per-env DR params (resampled on reset); vio_drift_scale is the eval-sweep knob
         self._dr = snatch_rand.sample_dr_params(
-            self.num_envs, self.device, vio_drift_scale=self.cfg.vio_drift_scale)
+            self.num_envs, self.device, vio_drift_scale=self.cfg.vio_drift_scale,
+            detection_noise_scale=self.cfg.detection_noise_scale)
         # perception encoders (frozen ResNet-18 feature extractors), lazily built
         self._enc_top = self._enc_bottom = None
         if self.cfg.use_cameras:
@@ -304,7 +309,8 @@ class DroneSnatchEnv(DirectRLEnv):
         t[:, 2] = 0.4
         self._target[env_ids] = t
         # resample DR for these envs (keep the vio_drift_scale knob fixed)
-        fresh = snatch_rand.sample_dr_params(n, self.device, vio_drift_scale=self.cfg.vio_drift_scale)
+        fresh = snatch_rand.sample_dr_params(n, self.device, vio_drift_scale=self.cfg.vio_drift_scale,
+                                             detection_noise_scale=self.cfg.detection_noise_scale)
         for k, v in fresh.items():
             if k in self._dr and self._dr[k].shape[0] == self.num_envs:
                 self._dr[k][env_ids] = v

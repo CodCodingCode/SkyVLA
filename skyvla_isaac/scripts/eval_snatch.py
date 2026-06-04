@@ -26,10 +26,12 @@ parser.add_argument("--steps", type=int, default=1000)
 parser.add_argument("--drift_scales", type=float, nargs="+",
                     default=[0.0, 0.25, 0.5, 1.0, 2.0],
                     help="vio_drift_scale values for the sim2real gap sweep")
+parser.add_argument("--no_cams", action="store_true",
+                    help="evaluate the state-based variant (match a --no_cams trained policy)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
-args.enable_cameras = True   # visuomotor policy needs the depth cams
+args.enable_cameras = not args.no_cams   # visuomotor policy needs the depth cams
 app_launcher = AppLauncher(args)
 sim_app = app_launcher.app
 
@@ -120,6 +122,7 @@ def run_eval(env, policy, base, steps):
 
 def make_env(num_envs, drift_scale):
     cfg = DroneSnatchEnvCfg()
+    cfg.use_cameras = not args.no_cams
     cfg.scene.num_envs = num_envs
     # Headline sim2real knob: scale the VIO drift magnitude applied to the
     # pose terms in the observation. The orchestrator's env reads this and

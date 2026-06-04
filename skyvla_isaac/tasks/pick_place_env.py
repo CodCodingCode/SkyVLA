@@ -127,6 +127,10 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     anneal_steps: float = 60000.0   # policy steps over which to anneal (~ first 2500 iters)
     render_camera: bool = False  # add a close 3rd-person Camera sensor (for rollout mp4)
     indoor_room: bool = False    # spawn a visual indoor room (for GS-backdrop rollout capture)
+    cam_w: int = 720             # render-camera resolution (raise for higher-quality rollouts)
+    cam_h: int = 540
+    obj_spawn_diam: float = 0.8  # cube spawns uniformly in +/- obj_spawn_diam/2 around origin
+    goal_offset_diam: float = 0.5  # goal waypoint uniform in +/- goal_offset_diam/2 around cube
 
 
 class DronePickPlaceEnv(DirectRLEnv):
@@ -175,7 +179,8 @@ class DronePickPlaceEnv(DirectRLEnv):
             if getattr(self.cfg, "indoor_room", False):
                 dtypes += ["distance_to_image_plane", "semantic_segmentation"]
             ccfg = CameraCfg(
-                prim_path="/World/render_cam", height=540, width=720, update_period=0.0,
+                prim_path="/World/render_cam", height=self.cfg.cam_h, width=self.cfg.cam_w,
+                update_period=0.0,
                 data_types=dtypes, colorize_semantic_segmentation=False,
                 spawn=sim_utils.PinholeCameraCfg(focal_length=22.0, clipping_range=(0.05, 80.0)))
             self._render_cam = Camera(ccfg)
@@ -339,7 +344,7 @@ class DronePickPlaceEnv(DirectRLEnv):
         origins = self.scene.env_origins[env_ids]
         # --- object on the floor near the origin ---
         obj = self.object.data.default_root_state[env_ids].clone()
-        rand = (torch.rand(n, 2, device=self.device) - 0.5) * 0.8        # +/-0.4 m
+        rand = (torch.rand(n, 2, device=self.device) - 0.5) * self.cfg.obj_spawn_diam
         obj[:, 0] += rand[:, 0]; obj[:, 1] += rand[:, 1]
         obj[:, :3] += origins
         self.object.write_root_pose_to_sim(obj[:, :7], env_ids)
@@ -367,7 +372,7 @@ class DronePickPlaceEnv(DirectRLEnv):
 
         # --- goal: a 3D waypoint near the cube (short, uniform carry) ---
         t = torch.zeros(n, 3, device=self.device)
-        t[:, :2] = obj_local[:, :2] + (torch.rand(n, 2, device=self.device) - 0.5) * 0.5
+        t[:, :2] = obj_local[:, :2] + (torch.rand(n, 2, device=self.device) - 0.5) * self.cfg.goal_offset_diam
         t[:, 2] = 0.4
         self._target[env_ids] = t
 

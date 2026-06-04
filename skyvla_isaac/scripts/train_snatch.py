@@ -23,10 +23,12 @@ parser.add_argument("--max_iterations", type=int, default=1500)
 parser.add_argument("--log_dir", type=str,
                     default="/home/ubuntu/SkyVLA/logs/isaac/drone_snatch")
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--no_cams", action="store_true",
+                    help="state-based variant (no cameras): tractable convergence + VIO-gap study")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
-args.enable_cameras = True   # SNATCH is visuomotor (top + bottom depth cams)
+args.enable_cameras = not args.no_cams   # SNATCH is visuomotor; state-based for the gap study
 app_launcher = AppLauncher(args)
 sim_app = app_launcher.app
 
@@ -39,6 +41,7 @@ from skyvla_isaac.snatch.pick_place_env import (  # noqa: E402
     DroneSnatchEnv, DroneSnatchEnvCfg)
 
 cfg = DroneSnatchEnvCfg()
+cfg.use_cameras = not args.no_cams
 cfg.scene.num_envs = args.num_envs
 if hasattr(cfg, "seed"):
     cfg.seed = args.seed

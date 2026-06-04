@@ -97,6 +97,11 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     goal_offset_diam: float = 1.0
     grasp_clear: float = 0.06            # cube off-floor height to count as lifted
     vio_drift_scale: float = 1.0         # headline sim2real knob (eval sweeps this)
+    # curriculum: a fraction start straddling the cube (grasp discovery), annealed down
+    # so the policy masters the full fly-in task. (Proven necessary for convergence.)
+    curriculum_p_start: float = 0.85
+    curriculum_p_end: float = 0.15
+    anneal_steps: float = 60000.0
 
     def __post_init__(self):
         self.observation_space = (1024 if self.use_cameras else 0) + 11
@@ -149,6 +154,7 @@ class DroneSnatchEnv(DirectRLEnv):
     # ------------------------------------------------------------------ #
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clamp(-1.0, 1.0)
+        self._train_steps = getattr(self, "_train_steps", 0) + 1
 
     def _apply_action(self):
         a = self._actions
@@ -246,7 +252,15 @@ class DroneSnatchEnv(DirectRLEnv):
             place_success=self._success,
             crashed=self._crashed,
         )
-        return snatch_rewards.compute_reward(s)
+        r = snatch_rewards.compute_reward(s)
+        # additive discoverability shaping (the SNATCH spec reward alone is too sparse to
+        # bootstrap grasp from altitude): strong-but-low-plateau lift gate + held carry-up.
+        held = self._held.float()
+        cube_h = torch.clamp(self._obj_p[:, 2] - 0.025, 0.0, 0.15)
+        carry_up = held * torch.clamp(self._obj_p[:, 2] - 0.15, 0.0, 0.25)
+        carry_prog = held * (self._prev_d_goal - self._d_goal)
+        self._prev_d_goal = self._d_goal.clone()
+        return r + 60.0 * cube_h + 30.0 * carry_up + 25.0 * carry_prog
 
     # ------------------------------------------------------------------ #
     def _reset_idx(self, env_ids):
@@ -261,8 +275,16 @@ class DroneSnatchEnv(DirectRLEnv):
         self.object.write_root_pose_to_sim(obj[:, :7], env_ids)
         self.object.write_root_velocity_to_sim(obj[:, 7:], env_ids)
         obj_local = obj[:, :3] - origins
-        # drone from altitude
+        # curriculum: a fraction start straddling the cube at grasp height (jaws open),
+        # the rest from altitude; straddle fraction anneals high->low.
+        prog = min(1.0, getattr(self, "_train_steps", 0) / self.cfg.anneal_steps)
+        cur_p = self.cfg.curriculum_p_start + (self.cfg.curriculum_p_end - self.cfg.curriculum_p_start) * prog
+        self._cur_p = cur_p
+        near = torch.rand(n, device=self.device) < cur_p
         root = self.robot.data.default_root_state[env_ids].clone()
+        root[near, 0] = obj_local[near, 0]
+        root[near, 1] = obj_local[near, 1]
+        root[near, 2] = 0.355                          # tip (base-0.33) at the cube
         root[:, :3] += origins
         self.robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(root[:, 7:], env_ids)

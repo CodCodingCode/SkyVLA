@@ -252,15 +252,23 @@ class DroneSnatchEnv(DirectRLEnv):
             place_success=self._success,
             crashed=self._crashed,
         )
-        r = snatch_rewards.compute_reward(s)
-        # additive discoverability shaping (the SNATCH spec reward alone is too sparse to
-        # bootstrap grasp from altitude): strong-but-low-plateau lift gate + held carry-up.
+        # PROVEN balance (drove the base task to 99.8%): dominant held-only placement so
+        # the policy can't just "grab + hold high anywhere" (that made obj_to_goal blow up
+        # to 6.5m with place~0). A4's spec reward is kept as a small auxiliary signal.
         held = self._held.float()
-        cube_h = torch.clamp(self._obj_p[:, 2] - 0.025, 0.0, 0.15)
+        grip_cmd = self._actions[:, 4] * 0.5 + 0.5
+        reach = 1.0 - torch.tanh(self._d_reach / 0.5)
+        align = 1.0 - torch.tanh(self._horiz / 0.06)
+        grab = (self._d_reach < 0.07).float() * grip_cmd
+        cube_h = torch.clamp(self._obj_p[:, 2] - 0.025, 0.0, 0.15)        # lift gate (discovery)
+        place = held * (1.0 - torch.tanh(self._d_goal / 0.35))           # DOMINANT delivery
         carry_up = held * torch.clamp(self._obj_p[:, 2] - 0.15, 0.0, 0.25)
         carry_prog = held * (self._prev_d_goal - self._d_goal)
+        success = (self._held & (self._d_goal < 0.18)).float()
         self._prev_d_goal = self._d_goal.clone()
-        return r + 60.0 * cube_h + 30.0 * carry_up + 25.0 * carry_prog
+        r = (1.0 * reach + 0.5 * align + 1.5 * grab + 60.0 * cube_h
+             + 40.0 * place + 30.0 * carry_up + 25.0 * carry_prog + 80.0 * success - 0.01)
+        return r + 0.1 * snatch_rewards.compute_reward(s)               # spec reward as aux
 
     # ------------------------------------------------------------------ #
     def _reset_idx(self, env_ids):

@@ -119,8 +119,13 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     detection_noise_scale: float = 0.0   # block-position estimate noise (eval can sweep too)
     # curriculum: a fraction start straddling the cube (grasp discovery), annealed down
     # so the policy masters the full fly-in task. (Proven necessary for convergence.)
-    curriculum_p_start: float = 0.85
-    curriculum_p_end: float = 0.15
+    # STABLE curriculum (no aggressive anneal): a fixed straddle/fly-in mix. The
+    # 0.85->0.15 anneal destabilized PPO on the harder table task (success peaked ~0.59
+    # then DECLINED to 0.27 as the distribution shifted faster than the policy could
+    # track -> catastrophic forgetting). A fixed 0.6 mix is a stationary target -> stable
+    # convergence (high straddle + decent fly-in).
+    curriculum_p_start: float = 0.6
+    curriculum_p_end: float = 0.6
     anneal_steps: float = 60000.0
 
     def __post_init__(self):
@@ -264,7 +269,10 @@ class DroneSnatchEnv(DirectRLEnv):
         self._grasped = self._held
         self._placed = self._success
         self._grasp_pos_err = self._d_reach
-        self._crashed = (base_p[:, 2] < self.cfg.surface_z + 0.05) | (torch.norm(base_p[:, :2], dim=-1) > 5.0) \
+        # crash only at/below the table top (body physically rests at surface_z+0.025).
+        # Was surface_z+0.05 = just 4.5cm under the 0.395 grasp hover -> from-altitude
+        # descents kept tripping it, so success DECLINED as the curriculum added fly-ins.
+        self._crashed = (base_p[:, 2] < self.cfg.surface_z) | (torch.norm(base_p[:, :2], dim=-1) > 5.0) \
             | (torch.norm(self.robot.data.root_lin_vel_w, dim=-1) > 12.0)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         self.extras["log"] = {

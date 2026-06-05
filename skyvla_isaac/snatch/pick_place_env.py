@@ -47,6 +47,8 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
 
     use_cameras: bool = True             # visuomotor obs (dual depth + ResNet encoders)
     render_camera: bool = False          # add a 3rd-person RGB follow cam (for rollout mp4)
+    render_cam_w: int = 1920             # demo-film resolution (render path only)
+    render_cam_h: int = 1080
 
     sim: SimulationCfg = SimulationCfg(
         dt=1.0 / 200.0, render_interval=4,
@@ -92,15 +94,19 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     # the drone hovers just above the table -- the body stays well clear of the floor
     # (a floor cube would force the body down ~9cm and the base scrapes the ground).
     surface_z: float = 0.30              # table top height
+    # Solid table that RESTS ON THE FLOOR: a 1.0x1.0 m top, full height from the floor
+    # (z=0) up to surface_z=0.30 -> the box spans [0, 0.30], bottom flush on the ground
+    # (not hovering). Kinematic = immovable furniture (real static collision, like the
+    # floor). The cube rests on top via gravity; the gripper grasps it there.
     platform: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Platform",
         spawn=sim_utils.CuboidCfg(
-            size=(1.6, 1.6, 0.30),
+            size=(1.0, 1.0, 0.30),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=0.8),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.35, 0.28))),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.15)),    # top at surface_z=0.30
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.32, 0.22))),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.15)),    # box [0,0.30], on the floor
     )
 
     # flight + task params
@@ -169,8 +175,19 @@ class DroneSnatchEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self.robot
         self.scene.rigid_objects["object"] = self.object
         self.scene.rigid_objects["platform"] = self.platform
-        light = sim_utils.DomeLightCfg(intensity=2000.0)
-        light.func("/World/Light", light)
+        if getattr(self.cfg, "render_camera", False):
+            # cinematic 2-light rig for the demo film: cool sky-dome fill + a warm
+            # directional key with a soft penumbra (angle>0) so the cube/table cast
+            # readable, real-looking shadows. Render-path only -> the visuomotor
+            # training cameras still see the plain bright dome below.
+            dome = sim_utils.DomeLightCfg(intensity=900.0, color=(0.82, 0.88, 1.0))
+            dome.func("/World/Light", dome)
+            key = sim_utils.DistantLightCfg(intensity=3000.0, angle=2.0,
+                                            color=(1.0, 0.95, 0.86))
+            key.func("/World/KeyLight", key, orientation=(0.94, -0.342, 0.0, 0.0))
+        else:
+            light = sim_utils.DomeLightCfg(intensity=2000.0)
+            light.func("/World/Light", light)
         if self.cfg.use_cameras:
             from isaaclab.sensors import TiledCamera
             from skyvla_isaac.snatch import perception as P
@@ -181,7 +198,8 @@ class DroneSnatchEnv(DirectRLEnv):
         if getattr(self.cfg, "render_camera", False):
             from isaaclab.sensors import Camera, CameraCfg
             ccfg = CameraCfg(
-                prim_path="/World/snatch_render_cam", height=540, width=720,
+                prim_path="/World/snatch_render_cam",
+                height=self.cfg.render_cam_h, width=self.cfg.render_cam_w,
                 update_period=0.0, data_types=["rgb"],
                 spawn=sim_utils.PinholeCameraCfg(focal_length=22.0, clipping_range=(0.05, 80.0)))
             self._render_cam = Camera(ccfg)

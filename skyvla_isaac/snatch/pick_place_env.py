@@ -133,6 +133,59 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     curriculum_p_start: float = 0.6
     curriculum_p_end: float = 0.6
     anneal_steps: float = 60000.0
+    # ANNEAL THE HOVER REWARD: the approach reward (earned just by being near/over the
+    # cube) decays over training, so hovering stops paying and the only way to keep score
+    # is to descend -> grab -> lift -> carry -> place. (Hover was a local optimum.)
+    approach_w_start: float = 1.0        # early: guide the drone toward the cube
+    approach_w_end: float = 0.2          # late: hovering barely pays -> must actually pick
+    approach_anneal_steps: float = 100000.0
+
+    # --- competence-gated curriculum + reward staging (OPT-IN; defaults off so the
+    # converged fixed-0.6 config and model_650 path are unchanged) -----------------
+    # The earlier 0.85->0.15 anneal failed because it was TIME-based: difficulty rose
+    # on a fixed clock regardless of skill -> "shifted faster than the policy could
+    # track" -> catastrophic forgetting. Here the anneal is gated on MEASURED fly-in
+    # success: cur_p only ratchets down when the policy is already succeeding at the
+    # current mix, and if a step hurts, the controller stalls and waits. Self-pacing.
+    adaptive_curriculum: bool = False    # ratchet cur_p -> curr_floor as fly-in success rises
+    reward_staging: bool = False         # learn pickup first, phase placement in after
+    curr_grasp_thresh: float = 0.80      # fly-in grasp EMA needed to ramp placement reward
+    curr_place_thresh: float = 0.65      # fly-in place EMA needed to lower cur_p one step
+    curr_step: float = 0.05              # cur_p decrement per ratchet
+    curr_floor: float = 0.0              # target floor (pure fly-in)
+    curr_dwell: int = 4000               # env-steps to hold after any change (PPO re-settle)
+    curr_ema: float = 0.99               # EMA decay over completed fly-in episodes
+    place_gain_step: float = 0.10        # placement-reward ramp per ratchet (0 -> 1)
+
+    # --- 3-stage reward curriculum (OPT-IN): hover -> grab -> carry/drop ----------
+    # Decomposes the task so each sub-skill gets DENSE reward, fixing the "payoff only
+    # after a grasp" sparsity that traps the policy in a hover. Stage 1 adds a dense
+    # descent reward (pull the body to grasp height when aligned) + softens the
+    # table-touch (small penalty, no episode-end) so the drone can EXPLORE the descent
+    # instead of fearing the -50 crash. Stage transitions are competence-gated.
+    # Run with --cur_p 0.0 (all fly-in) so it learns the descent from altitude.
+    staged_curriculum: bool = False
+    stage_dwell: int = 3000              # env-steps min per stage (let it settle)
+    stage_hover_thresh: float = 0.70     # frac horizontally over cube (EMA) to leave stage 0
+    stage_grasp_thresh: float = 0.45     # grasp_rate EMA to leave stage 1
+    stage_ema: float = 0.995             # per-step EMA decay for stage metrics
+    descend_coef: float = 6.0            # dense "get body to grasp height when aligned" reward
+    table_touch_pen: float = 1.0         # soft table-touch penalty (stage>=1; replaces crash-end)
+
+    # --- reverse curriculum (OPT-IN; Florensa et al. 2017) -----------------------
+    # The literature-standard fix for "won't commit to the descent": start episodes AT
+    # the grasp pose (trivial grasp) and expand the start distribution outward (spawn
+    # height + horizontal offset) ONLY as grasp competence grows. Each env samples its
+    # own difficulty in [0, ceiling] so easy starts are retained (no forgetting). This
+    # replaces the binary straddle/altitude split (a cliff) with a smooth ramp. Uses the
+    # original full reward + soft table-touch. Run WITHOUT staged_curriculum/cur_p.
+    reverse_curriculum: bool = False
+    rc_h_max: float = 0.75               # max spawn height ADDED above grasp pose (~full altitude)
+    rc_r_max: float = 0.40               # max horizontal spawn offset from the cube
+    rc_step: float = 0.05                # difficulty-ceiling increment per expansion
+    rc_floor_thresh: float = 0.50        # grasp_rate EMA needed to expand the start distribution
+    rc_dwell: int = 3000                 # env-steps to hold after each expansion
+    rc_ema: float = 0.99                 # per-step EMA decay for the grasp gate
 
     def __post_init__(self):
         self.observation_space = (1024 if self.use_cameras else 0) + 14   # +3 for goal
@@ -153,6 +206,22 @@ class DroneSnatchEnv(DirectRLEnv):
         self._prev_d_goal = z()
         self._held = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._carry = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # competence-gated curriculum / reward-staging controller state
+        self._cur_p_dyn = float(self.cfg.curriculum_p_start)
+        self._place_gain = 0.0 if self.cfg.reward_staging else 1.0
+        self._grasp_ema = 0.0                # EMA of fly-in (far-start) grasp rate
+        self._place_ema = 0.0                # EMA of fly-in (far-start) place success
+        self._curr_ema_init = False          # seed EMAs on first real sample
+        self._last_curr_change = 0           # env-step of last cur_p / place_gain change
+        self._is_near = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # 3-stage reward-curriculum controller (hover -> grab -> carry/drop)
+        self._stage = 0
+        self._hover_ema = 0.0; self._gr_ema = 0.0; self._pl_ema = 0.0
+        self._stage_ema_init = False
+        self._last_stage_change = 0
+        # reverse-curriculum controller state
+        self._rc_p = 0.0                     # start-distribution difficulty ceiling [0,1]
+        self._rc_grasp_ema = 0.0; self._rc_ema_init = False; self._last_rc_change = 0
         # per-env DR params (resampled on reset); vio_drift_scale is the eval-sweep knob
         self._dr = snatch_rand.sample_dr_params(
             self.num_envs, self.device, vio_drift_scale=self.cfg.vio_drift_scale,
@@ -290,15 +359,132 @@ class DroneSnatchEnv(DirectRLEnv):
         # crash only at/below the table top (body physically rests at surface_z+0.025).
         # Was surface_z+0.05 = just 4.5cm under the 0.395 grasp hover -> from-altitude
         # descents kept tripping it, so success DECLINED as the curriculum added fly-ins.
-        self._crashed = (base_p[:, 2] < self.cfg.surface_z) | (torch.norm(base_p[:, :2], dim=-1) > 5.0) \
+        self._table_touch = base_p[:, 2] < self.cfg.surface_z
+        out_of_bounds = (torch.norm(base_p[:, :2], dim=-1) > 5.0) \
             | (torch.norm(self.robot.data.root_lin_vel_w, dim=-1) > 12.0)
+        if self.cfg.staged_curriculum or self.cfg.reverse_curriculum:
+            # soft table-touch: bumping the table no longer ends the episode (penalized in
+            # the reward instead) so the policy can explore the descent toward the cube.
+            self._crashed = out_of_bounds
+        else:
+            self._crashed = self._table_touch | out_of_bounds
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        # competence-gated curriculum + reward staging (opt-in; no-op when off)
+        if self.cfg.adaptive_curriculum or self.cfg.reward_staging:
+            self._update_curriculum(self._crashed | time_out)
+        if self.cfg.staged_curriculum:
+            self._update_stage()
+        if self.cfg.reverse_curriculum:
+            self._update_rc()
         self.extras["log"] = {
             "metrics/grasp_rate": self._held.float().mean(),
             "metrics/place_success": self._success.float().mean(),
             "metrics/obj_to_goal": self._d_goal.mean(),
         }
+        if self.cfg.staged_curriculum:
+            dev = self.device
+            self.extras["log"].update({
+                "stage/stage": torch.tensor(float(self._stage), device=dev),
+                "stage/hover_ema": torch.tensor(self._hover_ema, device=dev),
+                "stage/grasp_ema": torch.tensor(self._gr_ema, device=dev),
+                "stage/place_ema": torch.tensor(self._pl_ema, device=dev),
+            })
+        if self.cfg.reverse_curriculum:
+            dev = self.device
+            self.extras["log"].update({
+                "revcurr/difficulty": torch.tensor(self._rc_p, device=dev),
+                "revcurr/grasp_ema": torch.tensor(self._rc_grasp_ema, device=dev),
+            })
+        if self.cfg.adaptive_curriculum or self.cfg.reward_staging:
+            dev = self.device
+            self.extras["log"].update({
+                "curriculum/cur_p": torch.tensor(self._cur_p_dyn, device=dev),
+                "curriculum/place_gain": torch.tensor(self._place_gain, device=dev),
+                "curriculum/grasp_ema_flyin": torch.tensor(self._grasp_ema, device=dev),
+                "curriculum/place_ema_flyin": torch.tensor(self._place_ema, device=dev),
+            })
         return self._crashed, time_out
+
+    # ------------------------------------------------------------------ #
+    def _update_curriculum(self, finished: torch.Tensor):
+        """Competence-gated controller. Tracks fly-in (far-start) grasp/place EMAs
+        and (1) phases placement reward in once pickup is reliable, then (2) ratchets
+        the straddle fraction cur_p down toward pure fly-in once placement is reliable.
+        Each change is gated on EMA thresholds + a dwell window, so difficulty only
+        rises with skill and a harmful step stalls further changes until recovery."""
+        far = finished & (~self._is_near)
+        n_far = int(far.sum().item())
+        if n_far > 0:
+            g = self._held[far].float().mean().item()
+            p = self._success[far].float().mean().item()
+            if not self._curr_ema_init:
+                self._grasp_ema, self._place_ema, self._curr_ema_init = g, p, True
+            else:
+                w = self.cfg.curr_ema ** n_far     # more episodes finished -> faster blend
+                self._grasp_ema = w * self._grasp_ema + (1 - w) * g
+                self._place_ema = w * self._place_ema + (1 - w) * p
+        step = getattr(self, "_train_steps", 0)
+        if step - self._last_curr_change < self.cfg.curr_dwell:
+            return
+        changed = False
+        if (self.cfg.reward_staging and self._place_gain < 1.0
+                and self._grasp_ema >= self.cfg.curr_grasp_thresh):
+            self._place_gain = min(1.0, self._place_gain + self.cfg.place_gain_step)
+            changed = True
+        elif (self.cfg.adaptive_curriculum and self._place_gain >= 1.0
+                and self._cur_p_dyn > self.cfg.curr_floor
+                and self._place_ema >= self.cfg.curr_place_thresh):
+            self._cur_p_dyn = max(self.cfg.curr_floor, self._cur_p_dyn - self.cfg.curr_step)
+            changed = True
+        if changed:
+            self._last_curr_change = step
+            print(f"[curriculum] step={step} cur_p={self._cur_p_dyn:.2f} "
+                  f"place_gain={self._place_gain:.2f} grasp_ema={self._grasp_ema:.2f} "
+                  f"place_ema={self._place_ema:.2f}", flush=True)
+
+    def _update_stage(self):
+        """3-stage curriculum controller. EMAs of (hover over cube / grasp / place) and
+        advances stage 0->1 once it reliably hovers over the cube, 1->2 once it grasps."""
+        hov = (self._horiz < 0.08).float().mean().item()    # horizontally over the cube
+        grb = self._held.float().mean().item()
+        plc = self._success.float().mean().item()
+        a = self.cfg.stage_ema
+        if not self._stage_ema_init:
+            self._hover_ema, self._gr_ema, self._pl_ema = hov, grb, plc
+            self._stage_ema_init = True
+        else:
+            self._hover_ema = a * self._hover_ema + (1 - a) * hov
+            self._gr_ema = a * self._gr_ema + (1 - a) * grb
+            self._pl_ema = a * self._pl_ema + (1 - a) * plc
+        step = getattr(self, "_train_steps", 0)
+        if step - self._last_stage_change < self.cfg.stage_dwell:
+            return
+        if self._stage == 0 and self._hover_ema >= self.cfg.stage_hover_thresh:
+            self._stage = 1; self._last_stage_change = step
+            print(f"[stage] -> 1 GRAB  step={step} hover_ema={self._hover_ema:.2f}", flush=True)
+        elif self._stage == 1 and self._gr_ema >= self.cfg.stage_grasp_thresh:
+            self._stage = 2; self._last_stage_change = step
+            print(f"[stage] -> 2 CARRY/DROP  step={step} grasp_ema={self._gr_ema:.2f}", flush=True)
+
+    def _update_rc(self):
+        """Reverse-curriculum controller (Florensa 2017): expand the start-state
+        distribution outward (higher/farther spawns) only once grasp is reliable at the
+        current spread. Self-paces -- if an expansion drops grasp below the gate, it
+        stalls until the policy recovers."""
+        g = self._held.float().mean().item()
+        a = self.cfg.rc_ema
+        if not self._rc_ema_init:
+            self._rc_grasp_ema = g; self._rc_ema_init = True
+        else:
+            self._rc_grasp_ema = a * self._rc_grasp_ema + (1 - a) * g
+        step = getattr(self, "_train_steps", 0)
+        if step - self._last_rc_change < self.cfg.rc_dwell:
+            return
+        if self._rc_p < 1.0 and self._rc_grasp_ema >= self.cfg.rc_floor_thresh:
+            self._rc_p = min(1.0, self._rc_p + self.cfg.rc_step)
+            self._last_rc_change = step
+            print(f"[revcurr] difficulty={self._rc_p:.2f} grasp_ema={self._rc_grasp_ema:.2f} "
+                  f"step={step}", flush=True)
 
     def _get_rewards(self) -> torch.Tensor:
         # bottom-cam centering proxy: horizontal tip-block offset -> pixels (~320 half-width)
@@ -328,9 +514,40 @@ class DroneSnatchEnv(DirectRLEnv):
         carry_prog = held * (self._prev_d_goal - self._d_goal)
         success = (self._held & (self._d_goal < 0.18)).float()
         self._prev_d_goal = self._d_goal.clone()
-        r = (1.0 * reach + 0.5 * align + 1.5 * grab + 60.0 * cube_h
-             + 40.0 * place + 30.0 * carry_up + 25.0 * carry_prog + 80.0 * success - 0.01)
-        return r + 0.1 * snatch_rewards.compute_reward(s)               # spec reward as aux
+
+        if self.cfg.staged_curriculum:
+            # Stage 0: hover over cube (reach+align). Stage 1: + DENSE descent reward
+            # (pull body to grasp height when horizontally aligned) + grab + lift, minus a
+            # soft table-touch penalty. Stage 2: + carry + deliver. Dense signal per stage
+            # -> the descent has a downward gradient instead of only a post-grasp payoff.
+            grasp_z = self.cfg.surface_z + 0.025 + 0.07     # body height for tip-at-cube (~0.395)
+            z_err = (self._base_p[:, 2] - grasp_z).abs()
+            # gate by a SOFT "roughly over the cube" term (0.15 scale) -- the tight align
+            # (0.06) was ~0 at the hover standoff, so the descent reward was switched off.
+            over_cube = 1.0 - torch.tanh(self._horiz / 0.15)
+            descend = over_cube * (1.0 - torch.tanh(z_err / 0.15))
+            touch = self._table_touch.float()
+            r = 1.0 * reach + 0.5 * align
+            if self._stage >= 1:
+                r = r + self.cfg.descend_coef * descend + 1.5 * grab + 60.0 * cube_h \
+                    - self.cfg.table_touch_pen * touch
+            if self._stage >= 2:
+                r = r + 40.0 * place + 30.0 * carry_up + 25.0 * carry_prog + 80.0 * success
+            return r - 0.01
+
+        # reward staging: pickup terms always on; delivery ramps in via _place_gain.
+        pg = self._place_gain
+        # ANNEALED HOVER: the approach reward (close to the cube, incl. hovering above it)
+        # decays start->end over training. Sharper 3D distance (/0.3) so it pulls the
+        # gripper DOWN onto the cube, not just laterally over it. As it decays, lift+carry+
+        # place (constant, large) dominate -> the policy must descend->grab->lift->deliver.
+        prog = min(1.0, getattr(self, "_train_steps", 0) / self.cfg.approach_anneal_steps)
+        w_app = self.cfg.approach_w_start + (self.cfg.approach_w_end - self.cfg.approach_w_start) * prog
+        approach = 1.0 - torch.tanh(self._d_reach / 0.3)
+        held_bonus = held * 5.0                                          # clear "you grabbed it" milestone
+        r = (w_app * approach + 0.5 * align + 2.0 * grab + 60.0 * cube_h + held_bonus
+             + pg * (40.0 * place + 30.0 * carry_up + 25.0 * carry_prog + 80.0 * success) - 0.01)
+        return r
 
     # ------------------------------------------------------------------ #
     def _reset_idx(self, env_ids):
@@ -345,16 +562,33 @@ class DroneSnatchEnv(DirectRLEnv):
         self.object.write_root_pose_to_sim(obj[:, :7], env_ids)
         self.object.write_root_velocity_to_sim(obj[:, 7:], env_ids)
         obj_local = obj[:, :3] - origins
-        # curriculum: a fraction start straddling the cube at grasp height (jaws open),
-        # the rest from altitude; straddle fraction anneals high->low.
-        prog = min(1.0, getattr(self, "_train_steps", 0) / self.cfg.anneal_steps)
-        cur_p = self.cfg.curriculum_p_start + (self.cfg.curriculum_p_end - self.cfg.curriculum_p_start) * prog
-        self._cur_p = cur_p
-        near = torch.rand(n, device=self.device) < cur_p
+        grasp_z = self.cfg.surface_z + 0.025 + 0.07         # body height so tip is at the cube
         root = self.robot.data.default_root_state[env_ids].clone()
-        root[near, 0] = obj_local[near, 0]
-        root[near, 1] = obj_local[near, 1]
-        root[near, 2] = self.cfg.surface_z + 0.025 + 0.07   # tip (base-0.07) at the cube on the table
+        if self.cfg.reverse_curriculum:
+            # Florensa reverse curriculum: spawn AT the grasp pose, expand outward as the
+            # ceiling self._rc_p grows. Per-env difficulty d ~ U[0, rc_p] -> a mix of easy
+            # (at the cube) and hard (high+offset) starts at every stage (retains skills).
+            d = torch.rand(n, device=self.device) * self._rc_p
+            ang = torch.rand(n, device=self.device) * 6.2831853
+            rad = d * self.cfg.rc_r_max
+            root[:, 0] = obj_local[:, 0] + rad * torch.cos(ang)
+            root[:, 1] = obj_local[:, 1] + rad * torch.sin(ang)
+            root[:, 2] = grasp_z + d * self.cfg.rc_h_max
+            self._is_near[env_ids] = d < 0.15
+        else:
+            # curriculum: a fraction start straddling the cube at grasp height (jaws open),
+            # the rest from altitude; straddle fraction anneals high->low.
+            if self.cfg.adaptive_curriculum:
+                cur_p = self._cur_p_dyn                   # competence-gated (controller)
+            else:
+                prog = min(1.0, getattr(self, "_train_steps", 0) / self.cfg.anneal_steps)
+                cur_p = self.cfg.curriculum_p_start + (self.cfg.curriculum_p_end - self.cfg.curriculum_p_start) * prog
+            self._cur_p = cur_p
+            near = torch.rand(n, device=self.device) < cur_p
+            self._is_near[env_ids] = near                 # remember start stratum for the EMA gate
+            root[near, 0] = obj_local[near, 0]
+            root[near, 1] = obj_local[near, 1]
+            root[near, 2] = grasp_z                       # tip (base-0.07) at the cube on the table
         root[:, :3] += origins
         self.robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(root[:, 7:], env_ids)

@@ -81,15 +81,17 @@
   <!-- ============ 4-JAW CAGE: mounted RIGIDLY under the base (no lower DOF) ============
        Walls close on all four sides (X and Y) so a free cube gets boxed in and
        cannot squirt out. Open ~8 cm, closed they press the 5 cm cube's four
-       faces -> caged + force closure. Fingertips sit at world Z = -0.33 below
-       base center (same depth as the proven design). -->
+       faces -> caged + force closure. The cage mounts DIRECTLY under the body
+       (center at z=-0.07, just below the base bottom at -0.025) -- NOT dangled
+       on a long standoff. The drone descends bodily to ~0.095 m to grasp a
+       floor cube; grasp point = base - 0.07. -->
   <link name="finger_xl">
     <visual><geometry><box size="0.012 0.07 0.05"/></geometry><material name="grip"/></visual>
     <collision><geometry><box size="0.012 0.07 0.05"/></geometry></collision>
     <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="grip_xl" type="prismatic">
-    <parent link="base"/><child link="finger_xl"/><origin xyz="0.04 0 -0.33"/><axis xyz="-1 0 0"/>
+    <parent link="base"/><child link="finger_xl"/><origin xyz="0.04 0 -0.07"/><axis xyz="-1 0 0"/>
     <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
   </joint>
 
@@ -99,7 +101,7 @@
     <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="grip_xr" type="prismatic">
-    <parent link="base"/><child link="finger_xr"/><origin xyz="-0.04 0 -0.33"/><axis xyz="1 0 0"/>
+    <parent link="base"/><child link="finger_xr"/><origin xyz="-0.04 0 -0.07"/><axis xyz="1 0 0"/>
     <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
   </joint>
 
@@ -109,7 +111,7 @@
     <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="grip_yl" type="prismatic">
-    <parent link="base"/><child link="finger_yl"/><origin xyz="0 0.04 -0.33"/><axis xyz="0 -1 0"/>
+    <parent link="base"/><child link="finger_yl"/><origin xyz="0 0.04 -0.07"/><axis xyz="0 -1 0"/>
     <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
   </joint>
 
@@ -119,7 +121,7 @@
     <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="grip_yr" type="prismatic">
-    <parent link="base"/><child link="finger_yr"/><origin xyz="0 -0.04 -0.33"/><axis xyz="0 1 0"/>
+    <parent link="base"/><child link="finger_yr"/><origin xyz="0 -0.04 -0.07"/><axis xyz="0 1 0"/>
     <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
   </joint>
 

@@ -85,7 +85,22 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 static_friction=2.0, dynamic_friction=1.6, friction_combine_mode="max"),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.2, 0.2))),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.025)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.325)),   # rests on the table
+    )
+
+    # raised pick surface (table): the cage mounts FLUSH under the body, so to grasp
+    # the drone hovers just above the table -- the body stays well clear of the floor
+    # (a floor cube would force the body down ~9cm and the base scrapes the ground).
+    surface_z: float = 0.30              # table top height
+    platform: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Platform",
+        spawn=sim_utils.CuboidCfg(
+            size=(1.6, 1.6, 0.30),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=0.8),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.35, 0.28))),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.15)),    # top at surface_z=0.30
     )
 
     # flight + task params
@@ -143,10 +158,12 @@ class DroneSnatchEnv(DirectRLEnv):
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot)
         self.object = RigidObject(self.cfg.object)
+        self.platform = RigidObject(self.cfg.platform)
         sim_utils.GroundPlaneCfg().func("/World/ground", sim_utils.GroundPlaneCfg())
         self.scene.clone_environments(copy_from_source=False)
         self.scene.articulations["robot"] = self.robot
         self.scene.rigid_objects["object"] = self.object
+        self.scene.rigid_objects["platform"] = self.platform
         light = sim_utils.DomeLightCfg(intensity=2000.0)
         light.func("/World/Light", light)
         if self.cfg.use_cameras:
@@ -202,7 +219,7 @@ class DroneSnatchEnv(DirectRLEnv):
     # ------------------------------------------------------------------ #
     def _tip_w(self):
         tip = self.robot.data.root_pos_w.clone()
-        tip[:, 2] = tip[:, 2] - 0.33                # fingers rigid at base-0.33 (no lower DOF)
+        tip[:, 2] = tip[:, 2] - 0.07                # cage mounted directly under the body (base-0.07)
         return tip
 
     def _camera_latents(self):
@@ -239,7 +256,7 @@ class DroneSnatchEnv(DirectRLEnv):
         self._horiz = torch.norm((obj_p - tip)[:, :2], dim=-1)
         self._d_goal = torch.norm(obj_p - self._target, dim=-1)
         self._obj_p, self._base_p = obj_p, base_p
-        self._lifted = obj_p[:, 2] > 0.025 + self.cfg.grasp_clear
+        self._lifted = obj_p[:, 2] > self.cfg.surface_z + 0.025 + self.cfg.grasp_clear
         self._held = self._lifted & (self._d_reach < 0.10)
         self._carry = self._held
         self._success = self._held & (self._d_goal < 0.18)
@@ -247,7 +264,7 @@ class DroneSnatchEnv(DirectRLEnv):
         self._grasped = self._held
         self._placed = self._success
         self._grasp_pos_err = self._d_reach
-        self._crashed = (base_p[:, 2] < 0.05) | (torch.norm(base_p[:, :2], dim=-1) > 5.0) \
+        self._crashed = (base_p[:, 2] < self.cfg.surface_z + 0.05) | (torch.norm(base_p[:, :2], dim=-1) > 5.0) \
             | (torch.norm(self.robot.data.root_lin_vel_w, dim=-1) > 12.0)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         self.extras["log"] = {
@@ -279,9 +296,9 @@ class DroneSnatchEnv(DirectRLEnv):
         reach = 1.0 - torch.tanh(self._d_reach / 0.5)
         align = 1.0 - torch.tanh(self._horiz / 0.06)
         grab = (self._d_reach < 0.07).float() * grip_cmd
-        cube_h = torch.clamp(self._obj_p[:, 2] - 0.025, 0.0, 0.15)        # lift gate (discovery)
+        cube_h = torch.clamp(self._obj_p[:, 2] - (self.cfg.surface_z + 0.025), 0.0, 0.15)  # lift off table
         place = held * (1.0 - torch.tanh(self._d_goal / 0.35))           # DOMINANT delivery
-        carry_up = held * torch.clamp(self._obj_p[:, 2] - 0.15, 0.0, 0.25)
+        carry_up = held * torch.clamp(self._obj_p[:, 2] - (self.cfg.surface_z + 0.085), 0.0, 0.25)
         carry_prog = held * (self._prev_d_goal - self._d_goal)
         success = (self._held & (self._d_goal < 0.18)).float()
         self._prev_d_goal = self._d_goal.clone()
@@ -311,7 +328,7 @@ class DroneSnatchEnv(DirectRLEnv):
         root = self.robot.data.default_root_state[env_ids].clone()
         root[near, 0] = obj_local[near, 0]
         root[near, 1] = obj_local[near, 1]
-        root[near, 2] = 0.355                          # tip (base-0.33) at the cube
+        root[near, 2] = self.cfg.surface_z + 0.025 + 0.07   # tip (base-0.07) at the cube on the table
         root[:, :3] += origins
         self.robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(root[:, 7:], env_ids)
@@ -320,7 +337,7 @@ class DroneSnatchEnv(DirectRLEnv):
         # goal drop-zone near the cube, at carry height
         t = torch.zeros(n, 3, device=self.device)
         t[:, :2] = obj_local[:, :2] + (torch.rand(n, 2, device=self.device) - 0.5) * self.cfg.goal_offset_diam
-        t[:, 2] = 0.4
+        t[:, 2] = self.cfg.surface_z + 0.25           # deliver up off the table
         self._target[env_ids] = t
         # resample DR for these envs (keep the vio_drift_scale knob fixed)
         fresh = snatch_rand.sample_dr_params(n, self.device, vio_drift_scale=self.cfg.vio_drift_scale,

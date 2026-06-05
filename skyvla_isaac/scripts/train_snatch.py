@@ -25,6 +25,8 @@ parser.add_argument("--log_dir", type=str,
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--no_cams", action="store_true",
                     help="state-based variant (no cameras): tractable convergence + VIO-gap study")
+parser.add_argument("--cur_p", type=float, default=None,
+                    help="fixed straddle-start fraction (overrides cfg curriculum; e.g. 0.9 for a clean demo)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -42,6 +44,8 @@ from skyvla_isaac.snatch.pick_place_env import (  # noqa: E402
 
 cfg = DroneSnatchEnvCfg()
 cfg.use_cameras = not args.no_cams
+if args.cur_p is not None:
+    cfg.curriculum_p_start = cfg.curriculum_p_end = args.cur_p
 cfg.scene.num_envs = args.num_envs
 if hasattr(cfg, "seed"):
     cfg.seed = args.seed

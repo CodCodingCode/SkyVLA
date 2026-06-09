@@ -13,6 +13,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--steps", type=int, default=1000)
+parser.add_argument("--cur_p", type=float, default=None,
+                    help="pin straddle-start fraction (no anneal); default keeps cfg default")
 parser.add_argument("--video", action="store_true")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -31,6 +33,8 @@ from isaaclab.utils.dict import class_to_dict  # noqa: E402
 from skyvla_isaac.tasks.pick_place_env import DronePickPlaceEnv, DronePickPlaceEnvCfg  # noqa: E402
 
 cfg = DronePickPlaceEnvCfg()
+if args.cur_p is not None:
+    cfg.curriculum_p_start = cfg.curriculum_p_end = args.cur_p   # pin (no anneal during eval)
 cfg.scene.num_envs = 1 if args.video else args.num_envs
 env = DronePickPlaceEnv(cfg, render_mode="rgb_array" if args.video else None)
 if args.video:

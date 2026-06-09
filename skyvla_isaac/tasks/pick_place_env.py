@@ -70,6 +70,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False, solver_position_iteration_count=16,
                 solver_velocity_iteration_count=4),
+            semantic_tags=[("class", "drone")],         # foreground mask for GS compositing
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.0, 1.0),
@@ -84,6 +85,9 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
             "lower": ImplicitActuatorCfg(joint_names_expr=["lower"],
                                          effort_limit=200.0, velocity_limit=2.0,
                                          stiffness=8000.0, damping=300.0),
+            # jaws: firm but NOT so hard they punt the free cube out before caging it
+            # (effort 200/stiffness 4000 ejected it). These values gave 95% far-grasp;
+            # the carry is fixed via higher friction + the carry_up reward, not force.
             "grip": ImplicitActuatorCfg(joint_names_expr=["grip_.*"],
                                         effort_limit=80.0, velocity_limit=1.0,
                                         stiffness=2000.0, damping=10.0),
@@ -101,6 +105,7 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 static_friction=2.0, dynamic_friction=1.6, friction_combine_mode="max"),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.2, 0.2)),
+            semantic_tags=[("class", "cube")],          # foreground mask for GS compositing
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.6, 0.0, 0.025)),
     )
@@ -113,8 +118,19 @@ class DronePickPlaceEnvCfg(DirectRLEnvCfg):
     k_damp: float = 0.6        # angular-velocity damping (stops spin/tumble)
     max_drop: float = 0.5
     target_radius: float = 0.25
-    curriculum_p: float = 0.7  # fraction of envs that start with the gripper straddling the cube
+    curriculum_p: float = 0.7  # (unused when annealing) fraction starting straddling the cube
+    # CURRICULUM ANNEAL: start mostly straddling (grasp discovery), end mostly from
+    # altitude (the real task). A fixed 0.7 overfit the easy case -> far-start
+    # delivery was 3%. Anneal p_straddle 0.85 -> 0.10 over the run.
+    curriculum_p_start: float = 0.85
+    curriculum_p_end: float = 0.15
+    anneal_steps: float = 60000.0   # policy steps over which to anneal (~ first 2500 iters)
     render_camera: bool = False  # add a close 3rd-person Camera sensor (for rollout mp4)
+    indoor_room: bool = False    # spawn a visual indoor room (for GS-backdrop rollout capture)
+    cam_w: int = 720             # render-camera resolution (raise for higher-quality rollouts)
+    cam_h: int = 540
+    obj_spawn_diam: float = 0.8  # cube spawns uniformly in +/- obj_spawn_diam/2 around origin
+    goal_offset_diam: float = 0.5  # goal waypoint uniform in +/- goal_offset_diam/2 around cube
 
 
 class DronePickPlaceEnv(DirectRLEnv):
@@ -153,18 +169,47 @@ class DronePickPlaceEnv(DirectRLEnv):
         self.scene.rigid_objects["object"] = self.object
         light = sim_utils.DomeLightCfg(intensity=2000.0)
         light.func("/World/Light", light)
+        if getattr(self.cfg, "indoor_room", False):
+            self._spawn_indoor_room()
         if getattr(self.cfg, "render_camera", False):
             from isaaclab.sensors import Camera, CameraCfg
+            # for the GS-backdrop rollout we also need depth (to back-project the room
+            # into Gaussians) and semantic seg (to mask drone+cube as foreground).
+            dtypes = ["rgb"]
+            if getattr(self.cfg, "indoor_room", False):
+                dtypes += ["distance_to_image_plane", "semantic_segmentation"]
             ccfg = CameraCfg(
-                prim_path="/World/render_cam", height=540, width=720, update_period=0.0,
-                data_types=["rgb"],
+                prim_path="/World/render_cam", height=self.cfg.cam_h, width=self.cfg.cam_w,
+                update_period=0.0,
+                data_types=dtypes, colorize_semantic_segmentation=False,
                 spawn=sim_utils.PinholeCameraCfg(focal_length=22.0, clipping_range=(0.05, 80.0)))
             self._render_cam = Camera(ccfg)
             self.scene.sensors["render_cam"] = self._render_cam
 
+    def _spawn_indoor_room(self):
+        """A visual-only indoor room (floor + 4 walls + ceiling) centered on the origin,
+        so an RGB-D orbit can be fused into a GaussianMap for the rollout backdrop. No
+        collision -> the physics is unchanged (cosmetic backdrop)."""
+        H, R, T = 3.2, 4.0, 0.05      # ceiling height, half-room, wall thickness
+        def panel(name, size, pos, color):
+            c = sim_utils.CuboidCfg(size=size,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color, roughness=0.9),
+                semantic_tags=[("class", "room")])
+            c.func(f"/World/room/{name}", c, translation=pos)
+        panel("floor",   (2 * R, 2 * R, T), (0, 0, -T / 2),       (0.62, 0.55, 0.46))  # wood-ish
+        panel("ceiling", (2 * R, 2 * R, T), (0, 0, H),            (0.86, 0.86, 0.88))  # off-white
+        panel("wall_xp", (T, 2 * R, H),     (R, 0, H / 2),        (0.74, 0.70, 0.62))
+        panel("wall_xn", (T, 2 * R, H),     (-R, 0, H / 2),       (0.55, 0.62, 0.70))  # blue-gray
+        panel("wall_yp", (2 * R, T, H),     (0, R, H / 2),        (0.70, 0.66, 0.60))
+        panel("wall_yn", (2 * R, T, H),     (0, -R, H / 2),       (0.68, 0.58, 0.55))  # warm
+        # a couple of furniture-ish blocks so the room has depth/parallax in the splat
+        panel("shelf",   (0.5, 1.4, 1.2),   (R - 0.45, 1.0, 0.6), (0.40, 0.30, 0.24))
+        panel("table",   (1.0, 0.7, 0.5),   (-1.3, -1.4, 0.25),   (0.45, 0.35, 0.28))
+
     # ------------------------------------------------------------------ #
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clamp(-1.0, 1.0)
+        self._train_steps = getattr(self, "_train_steps", 0) + 1   # for curriculum anneal
 
     def _apply_action(self):
         a = self._actions
@@ -253,6 +298,7 @@ class DronePickPlaceEnv(DirectRLEnv):
             "metrics/grasp_rate": self._held.float().mean(),          # real contact grasp
             "metrics/place_success": self._success.float().mean(),
             "metrics/obj_to_goal": self._d_goal.mean(),
+            "metrics/curriculum_straddle_p": torch.tensor(getattr(self, "_cur_p", self.cfg.curriculum_p)),
         }
         return oob, time_out          # dense task: no success-termination
 
@@ -275,9 +321,15 @@ class DronePickPlaceEnv(DirectRLEnv):
         # big reward is unlockable ONLY through grasping-then-carrying to the 3D goal.
         place = held * (1.0 - torch.tanh(self._d_goal / 0.35))        # deliver cube to goal waypoint
         carry_prog = held * (self._prev_d_goal - self._d_goal)        # shaped progress toward goal
+        # DENSE carry-up: reward raising the HELD cube from the floor (0.15) toward
+        # goal height (~0.40). Bootstraps the ascend-while-holding behavior even before
+        # full deliveries happen -- the missing step (86% grasped from altitude but
+        # would not risk carrying it up; only 9% delivered).
+        carry_up = held * torch.clamp(self._obj_z - 0.15, 0.0, 0.25)
         success = (self._held & (self._d_goal < 0.18)).float()        # carried-and-delivered
         r = (1.0 * reach + 0.5 * align + 1.5 * grab                    # approach, center, clamp
              + 60.0 * cube_h                                          # grasp/lift gate (strong, low plateau)
+             + 30.0 * carry_up                                        # raise the held cube toward goal height
              + 40.0 * place                                           # DOMINANT: deliver to goal
              + 25.0 * carry_prog                                      # progress toward goal
              + 80.0 * success                                         # sparse delivery bonus
@@ -292,17 +344,22 @@ class DronePickPlaceEnv(DirectRLEnv):
         origins = self.scene.env_origins[env_ids]
         # --- object on the floor near the origin ---
         obj = self.object.data.default_root_state[env_ids].clone()
-        rand = (torch.rand(n, 2, device=self.device) - 0.5) * 0.8        # +/-0.4 m
+        rand = (torch.rand(n, 2, device=self.device) - 0.5) * self.cfg.obj_spawn_diam
         obj[:, 0] += rand[:, 0]; obj[:, 1] += rand[:, 1]
         obj[:, :3] += origins
         self.object.write_root_pose_to_sim(obj[:, :7], env_ids)
         self.object.write_root_velocity_to_sim(obj[:, 7:], env_ids)
         obj_local = obj[:, :3] - origins
 
-        # --- CURRICULUM: a fraction start with the gripper STRADDLING the cube
-        # (drone directly above at grasp height, jaws open) so the policy can
-        # discover close->lift; the rest start at altitude and must fly in. ---
-        near = torch.rand(n, device=self.device) < self.cfg.curriculum_p
+        # --- CURRICULUM (annealed): a fraction start with the gripper STRADDLING the
+        # cube (drone directly above at grasp height, jaws open) so the policy can
+        # discover close->lift; the rest start at altitude and must fly in. The
+        # straddle fraction anneals high->low so the policy is forced to master the
+        # full fly-in-from-altitude task, not just the spoon-fed grasp. ---
+        prog = min(1.0, getattr(self, "_train_steps", 0) / self.cfg.anneal_steps)
+        cur_p = self.cfg.curriculum_p_start + (self.cfg.curriculum_p_end - self.cfg.curriculum_p_start) * prog
+        self._cur_p = cur_p                                              # logged in _get_dones
+        near = torch.rand(n, device=self.device) < cur_p
         root = self.robot.data.default_root_state[env_ids].clone()       # (0,0,1.0), level, v=0
         root[near, 0] = obj_local[near, 0]
         root[near, 1] = obj_local[near, 1]
@@ -315,7 +372,7 @@ class DronePickPlaceEnv(DirectRLEnv):
 
         # --- goal: a 3D waypoint near the cube (short, uniform carry) ---
         t = torch.zeros(n, 3, device=self.device)
-        t[:, :2] = obj_local[:, :2] + (torch.rand(n, 2, device=self.device) - 0.5) * 0.5
+        t[:, :2] = obj_local[:, :2] + (torch.rand(n, 2, device=self.device) - 0.5) * self.cfg.goal_offset_diam
         t[:, 2] = 0.4
         self._target[env_ids] = t
 

@@ -83,6 +83,33 @@ toolkit; the user explicitly chose **not** to (preferred checkpoint + restart).
 Don't propose the reinstall again unless the restart strategy starts failing in
 a new way — the reinstall has a real blast radius (Isaac Lab / rsl_rl pinning).
 
+## GS rendering is CACHED — never rebuild the splat room from scratch
+
+The Gaussian-splat backdrop in `scripts/render_rollout_gs.py` is **static
+geometry** (no policy/checkpoint dependence), so it is cached and reused — never
+re-run the slow ~44-view RGB-D room orbit when a cache exists. Full reference:
+[`skyvla_isaac/gs/CACHING.md`](skyvla_isaac/gs/CACHING.md).
+
+Two caches under `skyvla_isaac/gs/cache/` (gitignored), via `gs/cache.py`:
+- **scene** (`room_splat.pt`) — the splat + `K` + render W×H. Built once with
+  Isaac; reused every run. `render_rollout_gs.py` loads it automatically and
+  skips the orbit. Force a rebuild only with `--rebuild_gs` (changed room/res).
+- **rollout** (`rollout_<ckpt>.npz`) — per-frame foreground + follow-cam pose for
+  one checkpoint. Written by `render_rollout_gs.py --save_rollout`.
+
+**To iterate on the render/camera look, do NOT boot Isaac.** Use the Isaac-free
+consumer in the `habitat` env (~1.5 ms/frame):
+```bash
+conda activate habitat
+PYTHONUTF8=1 PYTHONPATH=/home/ubuntu/SkyVLA \
+python skyvla_isaac/scripts/render_gs_cache.py \
+    --rollout skyvla_isaac/gs/cache/rollout_<ckpt>.npz --out videos/replay.mp4
+# or orbit the bare room:  render_gs_cache.py --out videos/gs_orbit.mp4
+```
+`PYTHONUTF8=1` is required (gsplat JITs `.cu` kernels via the locale codec). The
+rollout cache is per-checkpoint; the scene cache is reused across all of them.
+Clean `cache/rollout_*.npz` when done — disk is tight (see below).
+
 ## Disk hygiene
 
 `/dev/vda1` is shared with `/tmp` and runs 90%+ full on this machine. PPO

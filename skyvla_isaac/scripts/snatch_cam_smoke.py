@@ -6,7 +6,7 @@ prints the captured depth tensor shapes + min/max for both cameras. Then runs th
 two (separate) DepthEncoders on the captured depth and prints the latent shapes.
 
   conda activate isaac
-  OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1 PYTHONPATH=/home/ubuntu/SkyVLA \
+  OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1 PYTHONPATH=$PWD \
     python scripts/snatch_cam_smoke.py
 
 Prints CAM_SMOKE_OK on success.

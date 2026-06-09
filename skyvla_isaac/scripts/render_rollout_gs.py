@@ -24,9 +24,11 @@ import tempfile
 
 from isaaclab.app import AppLauncher
 
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
-parser.add_argument("--out", default="/home/ubuntu/SkyVLA/videos/isaac_pickplace_gs.mp4")
+parser.add_argument("--out", default=os.path.join(_REPO, "videos/isaac_pickplace_gs.mp4"))
 parser.add_argument("--steps", type=int, default=450)
 parser.add_argument("--fps", type=int, default=30)
 parser.add_argument("--cur_p", type=float, default=0.0)   # full fly-in-from-altitude task

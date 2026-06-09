@@ -4,7 +4,7 @@ SNATCH = Sim-trained Neural Aerial Transport and Capture. Free-flying quadrotor
 with a single-DOF caging gripper, dual-camera visuomotor policy, 5-action direct
 velocity control (see snatch/DESIGN.md). Same rsl_rl stack as scripts/train.py.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=/home/ubuntu/SkyVLA \
+  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD \
     python skyvla_isaac/scripts/train_snatch.py --num_envs 2048 --max_iterations 1500
   # smoke:
     python skyvla_isaac/scripts/train_snatch.py --num_envs 256 --max_iterations 3
@@ -14,14 +14,17 @@ this entrypoint is written against that import path and the 5-action / dict-obs
 contract, so it may not run end-to-end until that env lands.
 """
 import argparse
+import os
 
 from isaaclab.app import AppLauncher
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=2048)
 parser.add_argument("--max_iterations", type=int, default=1500)
 parser.add_argument("--log_dir", type=str,
-                    default="/home/ubuntu/SkyVLA/logs/isaac/drone_snatch")
+                    default=os.path.join(_REPO, "logs/isaac/drone_snatch"))
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--no_cams", action="store_true",
                     help="state-based variant (no cameras): tractable convergence + VIO-gap study")
@@ -103,6 +106,18 @@ if hasattr(cfg, "seed"):
 env = DroneSnatchEnv(cfg, render_mode=None)
 env = RslRlVecEnvWrapper(env)
 
+# W&B auth from the gitignored key (repo convention). On a machine with no W&B
+# credentials (env var, key file, or `wandb login`), fall back to tensorboard
+# instead of crashing at logger init.
+_kf = os.path.join(_REPO, ".wandb_key")
+if "WANDB_API_KEY" not in os.environ and os.path.exists(_kf):
+    os.environ["WANDB_API_KEY"] = open(_kf).read().strip()
+_netrc = os.path.expanduser("~/.netrc")
+_use_wandb = ("WANDB_API_KEY" in os.environ
+              or (os.path.exists(_netrc) and "api.wandb.ai" in open(_netrc).read()))
+if not _use_wandb:
+    print("[train_snatch] no W&B credentials found -> logging to tensorboard only")
+
 # PPO hyperparams from the SNATCH spec: lr=3e-4, clip=0.2, entropy_coef=0.01,
 # ~64 steps/rollout, 10 epochs/update.
 agent_cfg = RslRlOnPolicyRunnerCfg(
@@ -111,7 +126,7 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
     save_interval=50,
     experiment_name="drone_snatch",
     seed=args.seed,
-    logger="wandb",                       # W&B on by default (project convention)
+    logger="wandb" if _use_wandb else "tensorboard",  # W&B on by default (project convention)
     wandb_project="skyvla-isaac",
     empirical_normalization=True,         # normalize obs -> stability
     policy=RslRlPpoActorCriticCfg(
@@ -136,12 +151,6 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
         entropy_coef=args.entropy_coef,  # lower when refining a warm-started policy
     ),
 )
-
-# W&B auth from the gitignored key (so logger="wandb" can init), per repo convention.
-import os  # noqa: E402
-_kf = "/home/ubuntu/SkyVLA/.wandb_key"
-if "WANDB_API_KEY" not in os.environ and os.path.exists(_kf):
-    os.environ["WANDB_API_KEY"] = open(_kf).read().strip()
 
 runner = OnPolicyRunner(
     env, class_to_dict(agent_cfg), log_dir=args.log_dir, device=env.unwrapped.device)

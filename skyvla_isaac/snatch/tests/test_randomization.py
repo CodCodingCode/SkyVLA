@@ -2,7 +2,7 @@
 
 Runnable with plain ``python`` (no Isaac):
 
-    PYTHONPATH=/home/ubuntu/SkyVLA \
+    PYTHONPATH=$PWD \
         python skyvla_isaac/snatch/tests/test_randomization.py
 
 Prints TESTS_OK iff every assert passes.

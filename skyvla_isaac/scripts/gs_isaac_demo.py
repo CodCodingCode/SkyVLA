@@ -6,12 +6,15 @@ render a novel view. Confirms the Habitat->Isaac GS port end to end.
     python skyvla_isaac/scripts/gs_isaac_demo.py
 """
 import argparse
+import os
 import math
 
 from isaaclab.app import AppLauncher
 
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 parser = argparse.ArgumentParser()
-parser.add_argument("--out", default="/home/ubuntu/SkyVLA/videos/gs_isaac.png")
+parser.add_argument("--out", default=os.path.join(_REPO, "videos/gs_isaac.png"))
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True

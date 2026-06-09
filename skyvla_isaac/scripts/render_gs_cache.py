@@ -42,6 +42,8 @@ import torch.nn.functional as F
 
 from skyvla_isaac.gs import cache as gs_cache
 
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def look_at_c2w(eye, target, up=(0.0, 0.0, 1.0), device="cuda") -> torch.Tensor:
     """OpenCV camera-to-world (x right, y down, z forward) looking from eye->target."""
@@ -76,7 +78,7 @@ def main() -> None:
                    help="scene-cache path (default skyvla_isaac/gs/cache/room_splat.pt).")
     p.add_argument("--rollout", default=None,
                    help="rollout-cache .npz to replay + composite (else render an orbit).")
-    p.add_argument("--out", default="/home/ubuntu/drone_project/videos/gs_cache.mp4")
+    p.add_argument("--out", default=os.path.join(_REPO, "videos/gs_cache.mp4"))
     p.add_argument("--device", default="cuda")
     p.add_argument("--fps", type=int, default=30)
     # orbit-mode camera path

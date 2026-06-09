@@ -15,9 +15,11 @@ from supersampling (--supersample 1.5) rendered big then Lanczos-downscaled by f
 import argparse, os, subprocess, tempfile
 from isaaclab.app import AppLauncher
 
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
-parser.add_argument("--out", default="/home/ubuntu/SkyVLA/videos/snatch_pickplace.mp4")
+parser.add_argument("--out", default=os.path.join(_REPO, "videos/snatch_pickplace.mp4"))
 parser.add_argument("--steps", type=int, default=500)
 parser.add_argument("--fps", type=int, default=30)
 parser.add_argument("--cur_p", type=float, default=0.0)   # from-altitude demo

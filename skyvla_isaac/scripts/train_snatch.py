@@ -27,6 +27,35 @@ parser.add_argument("--no_cams", action="store_true",
                     help="state-based variant (no cameras): tractable convergence + VIO-gap study")
 parser.add_argument("--cur_p", type=float, default=None,
                     help="fixed straddle-start fraction (overrides cfg curriculum; e.g. 0.9 for a clean demo)")
+parser.add_argument("--adaptive_curriculum", action="store_true",
+                    help="competence-gated anneal of straddle-start fraction toward pure fly-in (cur_p->0)")
+parser.add_argument("--reward_staging", action="store_true",
+                    help="learn pickup first, then phase in the placement/delivery reward")
+parser.add_argument("--staged_curriculum", action="store_true",
+                    help="3-stage reward curriculum: hover -> grab(+dense descent, soft table) -> carry/drop")
+parser.add_argument("--reverse_curriculum", action="store_true",
+                    help="Florensa reverse curriculum: spawn at grasp pose, expand start distribution as grasp improves")
+parser.add_argument("--rc_start", type=float, default=None,
+                    help="reverse-curriculum starting difficulty (use on crash-restart to resume the expansion)")
+parser.add_argument("--cube_mass", type=float, default=None,
+                    help="cube mass kg (heavier e.g. 0.15 resists being knocked by an imperfect descent)")
+parser.add_argument("--cube_size", type=float, default=None,
+                    help="cube edge length m (smaller e.g. 0.035 gives the cage clearance to descend around it)")
+parser.add_argument("--speed", type=float, default=None,
+                    help="max velocity m/s (lower e.g. 0.6 -> gentler, controllable descent into the cage)")
+parser.add_argument("--rc_distance_mode", action="store_true",
+                    help="DISTANCE curriculum: slowly ramp the fly-in distance to the cube up to rc_dist_max")
+parser.add_argument("--rc_dist_max", type=float, default=10.0,
+                    help="max fly-in spawn distance from the cube (m) for the distance curriculum")
+parser.add_argument("--curr_start", type=float, default=None,
+                    help="adaptive-curriculum starting cur_p (use on crash-restart to resume the anneal point)")
+parser.add_argument("--resume", type=str, default=None,
+                    help="warm-start from a checkpoint (e.g. logs/isaac/drone_snatch_state/model_650.pt)")
+parser.add_argument("--reset_std", type=float, default=None,
+                    help="after warm-start, override the policy exploration std (e.g. 0.25). model_650's "
+                         "saved std is ~17 -> stochastic rollouts saturate to random; reset for a real head start")
+parser.add_argument("--entropy_coef", type=float, default=0.01,
+                    help="PPO entropy bonus; lower (e.g. 0.002) when refining a warm-started policy so std stays sane")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -46,6 +75,28 @@ cfg = DroneSnatchEnvCfg()
 cfg.use_cameras = not args.no_cams
 if args.cur_p is not None:
     cfg.curriculum_p_start = cfg.curriculum_p_end = args.cur_p
+cfg.adaptive_curriculum = args.adaptive_curriculum
+cfg.reward_staging = args.reward_staging
+cfg.staged_curriculum = args.staged_curriculum
+cfg.reverse_curriculum = args.reverse_curriculum
+if args.rc_start is not None:
+    cfg.rc_start = args.rc_start
+if args.cube_mass is not None:
+    cfg.cube_mass = args.cube_mass
+if args.cube_size is not None:
+    cfg.cube_size = args.cube_size
+if args.speed is not None:
+    cfg.speed = args.speed
+if args.rc_distance_mode:
+    cfg.reverse_curriculum = True
+    cfg.rc_distance_mode = True
+    cfg.rc_dist_max = args.rc_dist_max
+    # the drone must have room to fly in from far without entering a neighbour env, and time
+    # to actually reach the cube from rc_dist_max at the (slow) grasp speed.
+    cfg.scene.env_spacing = max(cfg.scene.env_spacing, 2.5 * args.rc_dist_max)
+    cfg.episode_length_s = max(cfg.episode_length_s, args.rc_dist_max / max(cfg.speed, 0.3) + 6.0)
+if args.curr_start is not None:
+    cfg.curriculum_p_start = args.curr_start    # adaptive anneal resumes from here
 cfg.scene.num_envs = args.num_envs
 if hasattr(cfg, "seed"):
     cfg.seed = args.seed
@@ -74,7 +125,6 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,                  # spec
-        entropy_coef=0.01,               # spec
         num_learning_epochs=10,          # 10 epochs/update (spec)
         num_mini_batches=4,
         learning_rate=3.0e-4,            # spec
@@ -83,6 +133,7 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
+        entropy_coef=args.entropy_coef,  # lower when refining a warm-started policy
     ),
 )
 
@@ -94,6 +145,21 @@ if "WANDB_API_KEY" not in os.environ and os.path.exists(_kf):
 
 runner = OnPolicyRunner(
     env, class_to_dict(agent_cfg), log_dir=args.log_dir, device=env.unwrapped.device)
+if args.resume is not None:
+    # reset_std => fresh optimizer (loaded momentum is tuned to the huge-std regime and
+    # would fight the reset); keep the good policy mean + obs normalizer.
+    runner.load(args.resume, load_optimizer=(args.reset_std is None))
+    print(f"[train_snatch] warm-started from {args.resume}")
+    if args.reset_std is not None:
+        import math, torch  # noqa: E402
+        with torch.no_grad():
+            pol = runner.alg.policy
+            if hasattr(pol, "log_std"):                       # noise_std_type="log"
+                pol.log_std.fill_(math.log(args.reset_std))
+            elif hasattr(pol, "std"):
+                pol.std.fill_(args.reset_std)
+        print(f"[train_snatch] reset exploration std -> {args.reset_std} "
+              f"(was ~17; entropy_coef={args.entropy_coef})")
 runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 print("TRAIN_SNATCH_OK")
 env.close()

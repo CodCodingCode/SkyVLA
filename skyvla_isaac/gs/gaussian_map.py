@@ -67,6 +67,37 @@ class GaussianMap:
     def num_gaussians(self) -> int:
         return int(self.means.shape[0])
 
+    # ------------------------------------------------------------------ #
+    # Serialization. The map is just five tensors; persisting them lets a
+    # caller skip the (expensive) RGB-D fusion that built it and reload the
+    # finished splat in milliseconds. See gs/cache.py for the scene bundle
+    # (these tensors + intrinsics) used by the render scripts.
+    # ------------------------------------------------------------------ #
+    def state_dict(self) -> dict:
+        """A CPU snapshot of the splat — the five Gaussian tensors."""
+        return {
+            "means": self.means.detach().cpu(),
+            "quats": self.quats.detach().cpu(),
+            "scales": self.scales.detach().cpu(),
+            "opacities": self.opacities.detach().cpu(),
+            "colors": self.colors.detach().cpu(),
+        }
+
+    def load_state_dict(self, sd: dict) -> "GaussianMap":
+        """Replace this map's Gaussians from a ``state_dict`` (in place)."""
+        d = self.device
+        self.means = sd["means"].to(d).float()
+        self.quats = sd["quats"].to(d).float()
+        self.scales = sd["scales"].to(d).float()
+        self.opacities = sd["opacities"].to(d).float()
+        self.colors = sd["colors"].to(d).float()
+        return self
+
+    @classmethod
+    def from_state_dict(cls, sd: dict, device) -> "GaussianMap":
+        """Build a map directly from a ``state_dict`` on ``device``."""
+        return cls(device=torch.device(device)).load_state_dict(sd)
+
     def add(
         self,
         means: torch.Tensor,

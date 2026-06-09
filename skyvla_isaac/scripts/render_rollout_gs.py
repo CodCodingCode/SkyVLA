@@ -30,6 +30,18 @@ parser.add_argument("--out", default="/home/ubuntu/SkyVLA/videos/isaac_pickplace
 parser.add_argument("--steps", type=int, default=450)
 parser.add_argument("--fps", type=int, default=30)
 parser.add_argument("--cur_p", type=float, default=0.0)   # full fly-in-from-altitude task
+# --- GS scene cache (skip the slow RGB-D room orbit on repeat runs) ---
+parser.add_argument("--gs_cache", default=None,
+                    help="scene-cache path (default skyvla_isaac/gs/cache/room_splat.pt). "
+                         "Loaded if present so the room orbit is skipped.")
+parser.add_argument("--rebuild_gs", action="store_true",
+                    help="force a fresh room orbit + fusion even if the cache exists.")
+# --- rollout cache (re-render the whole video later with NO Isaac) ---
+parser.add_argument("--save_rollout", action="store_true",
+                    help="also cache per-frame foreground+pose so render_gs_cache.py "
+                         "can re-composite the video without booting Isaac.")
+parser.add_argument("--rollout_cache", default=None,
+                    help="rollout-cache path (default cache/rollout_<checkpoint>.npz).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -47,6 +59,7 @@ from isaaclab_rl.rsl_rl import (  # noqa: E402
 from isaaclab.utils.dict import class_to_dict  # noqa: E402
 from skyvla_isaac.tasks.pick_place_env import DronePickPlaceEnv, DronePickPlaceEnvCfg  # noqa: E402
 from skyvla_isaac.gs import GaussianMap  # noqa: E402
+from skyvla_isaac.gs import cache as gs_cache  # noqa: E402
 from skyvla_isaac.gs.isaac_camera import frame_from_camera  # noqa: E402
 
 cfg = DronePickPlaceEnvCfg()
@@ -114,36 +127,52 @@ def step_render(n=2):
 
 
 # ---------------------------------------------------------------- #
-# 1) BUILD THE GAUSSIAN-SPLAT ROOM (fuse only room pixels)
+# 1) GET THE GAUSSIAN-SPLAT ROOM — load the cache, or fuse it once.
+#    The room is static geometry (no policy/checkpoint dependence), so a
+#    cached splat is reused verbatim and the slow RGB-D orbit is skipped.
 # ---------------------------------------------------------------- #
 env.reset()                                   # initialize sim before stepping it directly
-gmap = GaussianMap(device=torch.device(dev))
-poses = []
-# rings around the center looking in -> capture far walls/floor/ceiling behind center
-for h in (0.9, 1.8, 2.6):
-    for k in range(12):
-        a = 2 * math.pi * k / 12
-        poses.append(((2.6 * math.cos(a), 2.6 * math.sin(a), h), (0.0, 0.0, 1.2)))
-# from near-center looking OUT -> capture each wall up close
-for k in range(8):
-    a = 2 * math.pi * k / 8
-    poses.append(((0.3 * math.cos(a), 0.3 * math.sin(a), 1.5),
-                  (3.5 * math.cos(a), 3.5 * math.sin(a), 1.3)))
+scene_path = args.gs_cache or gs_cache.DEFAULT_SCENE
 
-added = 0
-for eye, tgt in poses:
-    cam.set_world_poses_from_view(torch.tensor([eye], device=dev),
-                                  torch.tensor([tgt], device=dev))
-    step_render(2)
-    rgb, depth, pose, K = frame_from_camera(cam, 0)
-    fg = seg_mask(["drone", "cube"])          # exclude moving foreground from the map
-    depth = depth.clone()
-    depth[fg] = 0.0                            # 0 depth -> skipped by add_from_rgbd
-    added += gmap.add_from_rgbd(rgb, depth, pose, K, stride=2, max_depth=15.0, scale=0.04)
-print(f"[gs-render] fused {len(poses)} views -> {gmap.num_gaussians} gaussians (added {added})")
+if os.path.exists(scene_path) and not args.rebuild_gs:
+    gmap, K_fix, Wc, Hc, meta = gs_cache.load_scene(scene_path, device=dev)
+    if (Wc, Hc) != (W, H):
+        print(f"[gs-render] WARN cached render size {(Wc, Hc)} != current {(W, H)}; "
+              "rebuild with --rebuild_gs if the room looks wrong.")
+    print(f"[gs-render] loaded scene cache {scene_path} -> {gmap.num_gaussians} gaussians "
+          f"(skipped the room orbit){' meta=' + str(meta) if meta else ''}")
+else:
+    gmap = GaussianMap(device=torch.device(dev))
+    poses = []
+    # rings around the center looking in -> capture far walls/floor/ceiling behind center
+    for h in (0.9, 1.8, 2.6):
+        for k in range(12):
+            a = 2 * math.pi * k / 12
+            poses.append(((2.6 * math.cos(a), 2.6 * math.sin(a), h), (0.0, 0.0, 1.2)))
+    # from near-center looking OUT -> capture each wall up close
+    for k in range(8):
+        a = 2 * math.pi * k / 8
+        poses.append(((0.3 * math.cos(a), 0.3 * math.sin(a), 1.5),
+                      (3.5 * math.cos(a), 3.5 * math.sin(a), 1.3)))
 
-# fixed intrinsics for the splat render (same camera model, constant K)
-_, _, _, K_fix = frame_from_camera(cam, 0)
+    added = 0
+    for eye, tgt in poses:
+        cam.set_world_poses_from_view(torch.tensor([eye], device=dev),
+                                      torch.tensor([tgt], device=dev))
+        step_render(2)
+        rgb, depth, pose, K = frame_from_camera(cam, 0)
+        fg = seg_mask(["drone", "cube"])          # exclude moving foreground from the map
+        depth = depth.clone()
+        depth[fg] = 0.0                            # 0 depth -> skipped by add_from_rgbd
+        added += gmap.add_from_rgbd(rgb, depth, pose, K, stride=2, max_depth=15.0, scale=0.04)
+    print(f"[gs-render] fused {len(poses)} views -> {gmap.num_gaussians} gaussians (added {added})")
+
+    # fixed intrinsics for the splat render (same camera model, constant K)
+    _, _, _, K_fix = frame_from_camera(cam, 0)
+    gs_cache.save_scene(scene_path, gmap, K_fix, W, H,
+                        meta={"views": len(poses), "added": added, "cur_p": args.cur_p})
+    print(f"[gs-render] saved scene cache -> {scene_path}")
+
 room_fill = torch.tensor([0.72, 0.69, 0.63], device=dev)   # neutral wall color for any holes
 
 # ---------------------------------------------------------------- #
@@ -161,6 +190,7 @@ def follow():
 
 tmp = tempfile.mkdtemp(prefix="rollout_gs_")
 nf = 0
+roll_fg, roll_poses = [], []                                   # rollout cache buffers
 for i in range(args.steps):
     with torch.no_grad():
         act = policy(obs)
@@ -182,7 +212,24 @@ for i in range(args.steps):
     import imageio.v2 as imageio
     imageio.imwrite(os.path.join(tmp, f"f{i:05d}.png"), img)
     nf += 1
+
+    if args.save_rollout:
+        # foreground RGB premultiplied by the mask (background -> 0 so it
+        # compresses away), mask in alpha; + the camera pose for the GS render.
+        fg_rgb = (fg * isaac_rgb).clamp(0, 1)
+        rgba = torch.cat([fg_rgb, fg], dim=-1)                      # (H,W,4) [0,1]
+        roll_fg.append((rgba * 255).to(torch.uint8).cpu())
+        roll_poses.append(pose.detach().cpu())
 print(f"[gs-render] captured {nf} composited frames")
+
+if args.save_rollout:
+    roll_path = args.rollout_cache or gs_cache.default_rollout_path(args.checkpoint)
+    gs_cache.save_rollout(roll_path, torch.stack(roll_fg), torch.stack(roll_poses),
+                          fps=args.fps, width=W, height=H,
+                          meta={"checkpoint": os.path.basename(args.checkpoint),
+                                "steps": nf, "cur_p": args.cur_p})
+    print(f"[gs-render] saved rollout cache -> {roll_path}  "
+          f"(re-render with: render_gs_cache.py --rollout {roll_path})")
 
 cmd = ["ffmpeg", "-y", "-framerate", str(args.fps), "-i", os.path.join(tmp, "f%05d.png"),
        "-c:v", "libx264", "-profile:v", "main", "-pix_fmt", "yuv420p",

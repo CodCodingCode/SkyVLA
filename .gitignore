@@ -18,6 +18,10 @@ wandb/
 
 # Local checkpoints are never committed.
 *.pt
+
+# GS scene/rollout caches (rebuildable, can be large) — never committed.
+skyvla_isaac/gs/cache/
+*.npz
 .hm3d_key
 .openai_key
 *.log

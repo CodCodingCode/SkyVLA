@@ -30,6 +30,11 @@ parser.add_argument("--no_cams", action="store_true",
                     help="evaluate the state-based variant (match a --no_cams trained policy)")
 parser.add_argument("--cur_p", type=float, default=None,
                     help="pin straddle-start fraction (0.0 = full fly-in-from-altitude) for honest eval")
+parser.add_argument("--side_spawn", type=float, default=None,
+                    help="randomized side-spawn radius (m); also enables staged-mode soft table-touch "
+                         "so eval termination matches how the policy was trained")
+parser.add_argument("--no_latch", action="store_true",
+                    help="REAL PHYSICS grasp: disable the kinematic latch (floored-scoop cage)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -127,6 +132,13 @@ def make_env(num_envs, drift_scale):
     cfg.use_cameras = not args.no_cams
     if args.cur_p is not None:                       # pin start distribution (no anneal at eval)
         cfg.curriculum_p_start = cfg.curriculum_p_end = args.cur_p
+    if args.side_spawn is not None:
+        cfg.side_spawn_max = args.side_spawn
+        cfg.staged_curriculum = True                 # soft table-touch: match training termination
+        cfg.scene.env_spacing = max(cfg.scene.env_spacing, 2.0 * args.side_spawn + 2.0)
+        cfg.episode_length_s = max(cfg.episode_length_s, 10.0 + args.side_spawn / max(cfg.speed, 0.3))
+    if args.no_latch:
+        cfg.grasp_latch = False
     cfg.scene.num_envs = num_envs
     # Headline sim2real knob: scale the VIO drift magnitude applied to the
     # pose terms in the observation. The orchestrator's env reads this and

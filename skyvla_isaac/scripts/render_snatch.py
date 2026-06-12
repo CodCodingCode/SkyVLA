@@ -35,6 +35,12 @@ parser.add_argument("--rc_diag", type=float, default=None,
                     help="diagnosis: spawn at reverse-curriculum difficulty X (e.g. 0.10) to watch the descent")
 parser.add_argument("--rc_dist_diag", type=float, default=None,
                     help="diagnosis: distance-mode spawn at difficulty X (X*10m fly-in) to watch the approach")
+parser.add_argument("--side_spawn", type=float, default=None,
+                    help="diagnosis: randomized side-spawn radius (m) to watch navigate->hover->descend")
+parser.add_argument("--no_latch", action="store_true",
+                    help="REAL PHYSICS grasp (floored-scoop cage): film what the contact forces do")
+parser.add_argument("--carry_demo", action="store_true",
+                    help="spawn ALREADY CARRYING (shelf-seated cube, jaws nearly shut, airborne)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -68,6 +74,15 @@ if args.rc_dist_diag is not None:
     cfg.rc_distance_mode = True          # spawn at a fly-in distance to watch the approach
     cfg.rc_start = args.rc_dist_diag
     cfg.episode_length_s = 22.0
+if args.side_spawn is not None:
+    cfg.side_spawn_max = args.side_spawn  # same navigate->hover->descend spawns as training
+    cfg.staged_curriculum = True          # soft table-touch: match training termination, or the
+                                          # film kills every episode at the first table graze
+    cfg.episode_length_s = max(cfg.episode_length_s, 10.0 + args.side_spawn / max(cfg.speed, 0.3))
+if args.no_latch:
+    cfg.grasp_latch = False
+if args.carry_demo:
+    cfg.carry_demo_p = 1.0
 cfg.scene.num_envs = 1
 
 # --- renderer quality profile ---------------------------------------------- #
@@ -150,4 +165,6 @@ r = subprocess.run(cmd, capture_output=True, text=True)
 print("ffmpeg ok" if r.returncode == 0 else "ffmpeg error:\n" + r.stderr[-800:])
 print(f"[snatch-render] DONE -> {args.out} ({os.path.getsize(args.out)/1e6:.1f} MB)")
 print("SNATCH_RENDER_DONE")
-app.close()
+# app.close() reliably HANGS on this host (3 zombie renderers so far, each squatting
+# ~5GB GPU + CPU for hours). The mp4 is already written and synced -- hard-exit instead.
+os._exit(0)

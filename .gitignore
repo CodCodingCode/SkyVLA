@@ -16,8 +16,9 @@ wandb/
 .wandb_key
 .env.local
 
-# Local checkpoints are never committed.
+# Local checkpoints are never committed, except curated ones under snatch/checkpoints/.
 *.pt
+!skyvla_isaac/snatch/checkpoints/*.pt
 
 # GS scene/rollout caches (rebuildable, can be large) — never committed.
 skyvla_isaac/gs/cache/

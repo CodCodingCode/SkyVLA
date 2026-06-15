@@ -7,6 +7,14 @@
 
 A free-flying quadrotor with a gripper that **picks things up, carries them, and puts them down** — and **maps the space it flies through**. Built on NVIDIA Isaac Sim 4.5 + Isaac Lab 2.1, with real PhysX contact grasping and thousands of parallel environments on one GPU.
 
+<p align="center">
+  <a href="videos/snatch_pickplace_victory.mp4">
+    <img src="videos/demo.gif" alt="SkyVLA drone flying in, caging a cube, carrying it, and placing it" width="100%">
+  </a>
+</p>
+
+<p align="center"><em>SNATCH policy (<code>model_9250</code>): grasp <b>87.4%</b> · lift <b>19.3 cm</b> · place <b>86.1%</b>. <a href="videos/snatch_pickplace_victory.mp4">▶ Full 1080p render.</a></em></p>
+
 ```
                  ┌─────────────────────────────────────────┐
    action (6) ──►│  free-floating quadrotor  (base wrench)   │

@@ -15,7 +15,7 @@ PASS: while ascending, cube_z tracks base_z UPWARD (cube lifts off the floor) an
 d_reach stays small (~0.01 .. cube stays caged). Prints SNATCH_GRASP_PASS / FAIL.
 
   conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1 \
-    PYTHONPATH=/home/ubuntu/SkyVLA python skyvla_isaac/scripts/snatch_grasp_test.py
+    PYTHONPATH=$PWD python skyvla_isaac/scripts/snatch_grasp_test.py
 """
 import os
 import sys

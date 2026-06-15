@@ -123,6 +123,7 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     # capped distance. Released when the gripper is commanded open (for placement).
     grasp_latch: bool = True
     latch_r: float = 0.035               # cube center within this of cage center (+ gripper closing) -> latched
+    grip_travel: float = 0.035           # jaw prismatic travel (m); must match the URDF joint limit
     # TERMINAL CENTERING: decouple cruise from the grab. The policy flies the drone toward the cube;
     # within term_r the horizontal command is blended toward a proportional pull onto the cube's xy,
     # cancelling the overshoot (drone arrives ~0.34m/s and sails off-center, esp. at distance). Unlike
@@ -197,6 +198,53 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     stage_ema: float = 0.995             # per-step EMA decay for stage metrics
     descend_coef: float = 6.0            # dense "get body to grasp height when aligned" reward
     table_touch_pen: float = 1.0         # soft table-touch penalty (stage>=1; replaces crash-end)
+    # SIDE SPAWN (stage 0 = NAVIGATE -> hover, not just descend): spawn the drone to the
+    # side of the cube at a random angle/radius/altitude so every episode starts with a
+    # real cruise to the hover point. Pair with a lowered stage_hover_thresh -- cruise
+    # time caps the achievable hover EMA.
+    side_spawn_max: float = 0.0          # >0 enables; max horizontal spawn radius from the cube (m)
+    side_spawn_min: float = 0.5          # min spawn radius (every episode keeps some approach)
+    side_spawn_h_lo: float = 0.8         # spawn altitude range (m)
+    side_spawn_h_hi: float = 1.6
+    # HOVER ANNEAL (master-then-diminish): once stage 1 opens, decay the STANDOFF hover
+    # payoff (reach+align) to 20% over this many env-steps, so sitting at the hover point
+    # stops paying and the descent/grab terms take over. The nav cruise term is NOT
+    # annealed -- with side spawns it is what pays for arriving at all.
+    stage1_hover_anneal: float = 0.0     # env-steps; 0 disables (hover stays full-weight)
+    # LATCH-READY reward (stage>=1): sharp bonus peaked at the EXACT pose the latch needs
+    # (cube inside the cage footprint, tip at cube height). The broad descend term (0.15
+    # scale) barely differentiates the last 5cm -- this puts a real gradient across it.
+    latch_ready_coef: float = 0.0        # 0 disables
+    start_stage: int = 0                 # start the 3-stage controller here (2 = all rewards on
+                                         # from step 0; for warm-started expert policies)
+    surround_only: bool = False          # train ONLY "cage surrounds the cube" (exponential horiz
+                                         # precision at cube height); all grip use is taxed
+    # OVERHEAD-FIRST curriculum (user-designed): the only paid spot is DIRECTLY ABOVE the
+    # block at a target altitude that starts high and is LOWERED one rung at a time, gated
+    # on proven centering at the current rung. horiz->0 is learned first by construction;
+    # descent is doled out only as earned; ends at nest depth. Kills the lean exploit:
+    # the cube is never inside the paid band until precision justifies it.
+    overhead_first: bool = False
+    oh_dz_start: float = 0.04            # initial setpoint: tip this far ABOVE cube centre (m).
+                                         # (Was 0.20 -- the policy organically converged to a
+                                         # centred hover at ~3cm and a 20cm rung across a reward
+                                         # valley was unreachable; anchor the ladder where the
+                                         # policy IS and walk the last cm to nest.)
+    oh_dz_end: float = 0.0               # final setpoint: nest (tip at cube centre)
+    oh_dz_step: float = 0.01             # one cm per earned rung
+    oh_gate: float = 0.35                # EMA frac of in-band steps centred (gate_horiz) to earn a rung
+    oh_gate_horiz: float = 0.008         # centring bar per rung. 0.3cm was tried and sat at the
+                                         # physical noise floor (x,y floor ~0.6-0.7cm at std 0.25);
+                                         # cage widened to a 2.4cm fit window instead -- 0.8cm bar
+                                         # now carries ~3x geometric margin.
+    oh_gate_dz: float = 0.010            # vertical alignment bar per rung (user: z must align too)
+    oh_dwell: int = 2000                 # min env-steps between rungs
+    lift_ramp_steps: float = 30000.0     # progress seesaw: env-steps over which squeeze pay
+                                         # depreciates (8->4) and the lift ladder appreciates (x2)
+    carry_demo_p: float = 0.0            # fraction of resets that spawn ALREADY CARRYING (cube
+                                         # seated in the closed cage at altitude): a 15-step
+                                         # coordinated climb cannot be sampled from white noise --
+                                         # the carry's value must be experienced, like the squeeze
 
     # --- reverse curriculum (OPT-IN; Florensa et al. 2017) -----------------------
     # The literature-standard fix for "won't commit to the descent": start episodes AT
@@ -261,8 +309,15 @@ class DroneSnatchEnv(DirectRLEnv):
         self._curr_ema_init = False          # seed EMAs on first real sample
         self._last_curr_change = 0           # env-step of last cur_p / place_gain change
         self._is_near = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        # 3-stage reward-curriculum controller (hover -> grab -> carry/drop)
-        self._stage = 0
+        # 3-stage reward-curriculum controller (hover -> grab -> carry/drop). start_stage
+        # skips the gate-earning for warm-started experts (all rewards on from step 0;
+        # also avoids re-earning gates after every crash-restart).
+        self._stage = int(getattr(self.cfg, "start_stage", 0))
+        self._stage1_step = 0                # hover-anneal clock (runs from boot if start_stage>=1)
+        # overhead-first curriculum state: current altitude setpoint + competence EMA
+        self._oh_dz = float(self.cfg.oh_dz_start)
+        self._oh_ema = 0.0
+        self._oh_last = 0
         self._hover_ema = 0.0; self._gr_ema = 0.0; self._pl_ema = 0.0
         self._stage_ema_init = False
         self._last_stage_change = 0
@@ -371,7 +426,7 @@ class DroneSnatchEnv(DirectRLEnv):
         self.robot.set_external_force_and_torque(
             force.unsqueeze(1), torque.unsqueeze(1), body_ids=self._base_i)
         # gripper: all 4 cage jaws driven by the single gripper action
-        jaw = (a[:, 4] * 0.5 + 0.5) * 0.02
+        jaw = (a[:, 4] * 0.5 + 0.5) * self.cfg.grip_travel
         tgt = jaw.unsqueeze(-1).repeat(1, len(self._grip_i))
         self.robot.set_joint_position_target(tgt, joint_ids=self._grip_i)
         # GRASP LATCH: rigidly carry the caged cube with the gripper (no slide/fall while moving)
@@ -452,6 +507,10 @@ class DroneSnatchEnv(DirectRLEnv):
         # descents kept tripping it, so success DECLINED as the curriculum added fly-ins.
         self._table_touch = base_p[:, 2] < self.cfg.surface_z
         oob_r = (self.cfg.rc_dist_max + 2.0) if self.cfg.rc_distance_mode else 5.0
+        if self.cfg.side_spawn_max > 0.0:
+            # side spawns reach side_spawn_max from the CUBE (itself up to obj_spawn_diam/2
+            # from origin) -- without this, the far spawn tail dies at birth as "OOB"
+            oob_r = max(oob_r, self.cfg.side_spawn_max + 1.5)
         out_of_bounds = (torch.norm(base_p[:, :2], dim=-1) > oob_r) \
             | (torch.norm(self.robot.data.root_lin_vel_w, dim=-1) > 12.0)
         if self.cfg.staged_curriculum or self.cfg.reverse_curriculum:
@@ -468,6 +527,23 @@ class DroneSnatchEnv(DirectRLEnv):
             self._update_stage()
         if self.cfg.reverse_curriculum:
             self._update_rc()
+        if self.cfg.overhead_first:
+            # lower the altitude setpoint one rung once centring at the CURRENT rung is
+            # proven (EMA of "in band AND centred <1.2cm" over in-band time)
+            dz_oh = (self._base_p[:, 2] - 0.07) - self._obj_p[:, 2]
+            in_band = (dz_oh - self._oh_dz).abs() < 0.015
+            ok = (in_band & (self._horiz < self.cfg.oh_gate_horiz)
+                  & ((dz_oh - self._oh_dz).abs() < self.cfg.oh_gate_dz)).float().sum() \
+                / in_band.float().sum().clamp(min=1)
+            self._oh_ema = 0.995 * self._oh_ema + 0.005 * ok.item()
+            step = getattr(self, "_train_steps", 0)
+            if (step - self._oh_last >= self.cfg.oh_dwell and self._oh_ema >= self.cfg.oh_gate
+                    and self._oh_dz > self.cfg.oh_dz_end):
+                self._oh_dz = max(self.cfg.oh_dz_end, self._oh_dz - self.cfg.oh_dz_step)
+                self._oh_last = step
+                self._oh_ema = 0.0   # re-earn at the new rung
+                print(f"[overhead] setpoint lowered -> {self._oh_dz*100:.0f}cm above cube "
+                      f"(step={step})", flush=True)
         self.extras["log"] = {
             "metrics/grasp_rate": self._held.float().mean(),
             "metrics/place_success": self._success.float().mean(),
@@ -481,6 +557,47 @@ class DroneSnatchEnv(DirectRLEnv):
                 "stage/grasp_ema": torch.tensor(self._gr_ema, device=dev),
                 "stage/place_ema": torch.tensor(self._pl_ema, device=dev),
             })
+        if not self.cfg.grasp_latch:
+            # CLOSE DIAGNOSTICS: is it closing in the right place? Envelope occupancy,
+            # grip command inside vs outside it, and terminal accuracy near the cube.
+            gc = self._actions[:, 4] * 0.5 + 0.5
+            dz_t = (self._base_p[:, 2] - 0.07) - self._obj_p[:, 2]
+            enc = ((self._horiz < 0.022) & (dz_t > -0.012) & (dz_t < 0.012)).float()
+            near = (self._d_reach < 0.30).float()
+            nz = near.sum().clamp(min=1)
+            # position zones among near envs (d_reach<30cm): NESTED = cage around cube
+            # (the goal); ON TOP = centred safely above; BESIDE = at cube height but
+            # offset -> wall on cube, the knock zone.
+            on_top = ((dz_t > 0.03) & (self._horiz < 0.02)).float() * near
+            beside = ((dz_t.abs() < 0.03)
+                      & (self._horiz > 0.024) & (self._horiz < 0.08)).float() * near
+            self.extras["log"].update({
+                "close/enclosed_frac": enc.mean(),
+                "close/grip_in_envelope": (gc * enc).sum() / enc.sum().clamp(min=1),
+                "close/grip_outside": (gc * (1 - enc)).sum() / (1 - enc).sum().clamp(min=1),
+                "close/horiz_cm_near": (self._horiz * near).sum() / nz * 100.0,
+                "close/tip_dz_cm_near": (dz_t * near).sum() / nz * 100.0,
+                # per-axis breakdown: is each horizontal axis being optimized, and is
+                # there a systematic bias hiding inside the combined horiz norm?
+                "close/dx_cm_near": ((self._obj_p[:, 0] - self._base_p[:, 0]).abs() * near).sum() / nz * 100.0,
+                "close/dy_cm_near": ((self._obj_p[:, 1] - self._base_p[:, 1]).abs() * near).sum() / nz * 100.0,
+                "close/zone_on_top": on_top.sum() / nz,
+                "close/zone_beside": beside.sum() / nz,
+                # demo-vs-fly-in split: straddle demos dominate the enclosed pool, so the
+                # combined grip_in hides whether closing has TRANSFERRED to fly-ins
+                "close/grip_in_flyin": (gc * enc * (~self._is_near).float()).sum()
+                                        / (enc * (~self._is_near).float()).sum().clamp(min=1),
+                # the lift precursor: mean cube height off its rest pose among near envs.
+                # grasp_ema only sees 6cm+ holds; this sees the first 5mm twitch-lifts.
+                "close/lift_cm_near": (torch.clamp(self._obj_p[:, 2]
+                                        - (self.cfg.surface_z + 0.5 * self.cfg.cube_size), min=0.0)
+                                        * near).sum() / nz * 100.0,
+            })
+            if self.cfg.overhead_first:
+                self.extras["log"].update({
+                    "overhead/dz_target_cm": torch.tensor(self._oh_dz * 100.0, device=self.device),
+                    "overhead/rung_ema": torch.tensor(self._oh_ema, device=self.device),
+                })
         if self.cfg.reverse_curriculum:
             dev = self.device
             # actual fly-in distance in METERS (quadratic map) so the dashboard shows the
@@ -558,6 +675,7 @@ class DroneSnatchEnv(DirectRLEnv):
             return
         if self._stage == 0 and self._hover_ema >= self.cfg.stage_hover_thresh:
             self._stage = 1; self._last_stage_change = step
+            self._stage1_step = step                     # hover-anneal clock starts here
             print(f"[stage] -> 1 GRAB  step={step} hover_ema={self._hover_ema:.2f}", flush=True)
         elif self._stage == 1 and self._gr_ema >= self.cfg.stage_grasp_thresh:
             self._stage = 2; self._last_stage_change = step
@@ -624,10 +742,168 @@ class DroneSnatchEnv(DirectRLEnv):
             over_cube = 1.0 - torch.tanh(self._horiz / 0.15)
             descend = over_cube * (1.0 - torch.tanh(z_err / 0.15))
             touch = self._table_touch.float()
-            r = 1.0 * reach + 0.5 * align
+            # master-then-diminish: full hover payoff through stage 0; once stage 1 opens,
+            # decay the standoff terms to 20% over stage1_hover_anneal env-steps so the
+            # policy is pushed OFF the hover plateau and into the descent/grab rewards.
+            w_hov = 1.0
+            if self._stage >= 1 and self.cfg.stage1_hover_anneal > 0.0:
+                p1 = min(1.0, (getattr(self, "_train_steps", 0) - getattr(self, "_stage1_step", 0))
+                         / self.cfg.stage1_hover_anneal)
+                w_hov = 1.0 - 0.8 * p1
+            r = w_hov * (1.0 * reach + 0.5 * align)
+            if self.cfg.side_spawn_max > 0.0:
+                # navigation gradient: reach (0.5m scale) is saturated at side-spawn
+                # distances, so the cruise needs its own long-range pull toward the cube.
+                # NOT annealed: with side spawns this is the "get there" reward.
+                r = r + 0.7 * (1.0 - torch.tanh(self._d_reach / 3.0))
             if self._stage >= 1:
                 r = r + self.cfg.descend_coef * descend + 1.5 * grab + 60.0 * cube_h \
                     - self.cfg.table_touch_pen * touch
+                if self.cfg.latch_ready_coef > 0.0 and not self.cfg.overhead_first:
+                    # (disabled in overhead mode: a nest-peaked bonus is a "dive now"
+                    # magnet that bypasses the altitude-rung ladder)
+                    # peak reward at the exact capture pose. Under physics (no latch) the
+                    # envelope is ~1.2cm, so the gradient scales sharpen to match (the
+                    # broad descend term still covers the far field).
+                    rs = 0.02 if not self.cfg.grasp_latch else self.cfg.latch_r
+                    tip_z = self._base_p[:, 2] - 0.07
+                    vert = 1.0 - torch.tanh((self._obj_p[:, 2] - tip_z).abs() / (rs * 0.857))
+                    horiz_l = 1.0 - torch.tanh(self._horiz / rs)
+                    r = r + self.cfg.latch_ready_coef * horiz_l * vert
+                # keep the cage OPEN through the approach/descent (ported from the
+                # non-staged branch): a permanently-closed cage "snatches early", shoves
+                # the cube around, and only scores via the forgiving latch
+                if self.cfg.grasp_latch:
+                    early_close = grip_cmd * (self._d_reach > 0.10).float()
+                    r = r - self.cfg.early_close_pen * early_close
+                else:
+                    # PHYSICS: the cube must be ENCLOSED before closing. Capture-envelope
+                    # math (jaws close at 1 m/s -> 35ms; drone drifts 2-4mm during it):
+                    #   horiz: open lip aperture +-3.9cm vs cube half 2.5cm -> centre
+                    #     offset < 1.4cm geometric, 1.2cm after drift margin.
+                    #   vert: lips sit 1.7-2.5cm BELOW the tip -> they only pass under the
+                    #     cube midline for tip 0..+1.2cm above cube centre (table blocks
+                    #     lower). +-2.5cm would pay for closing on the cube's TOP edge.
+                    tip_z2 = self._base_p[:, 2] - 0.07
+                    dz_tip = tip_z2 - self._obj_p[:, 2]               # tip above cube centre
+                    # lower bound -1.2cm: a shelf-carried cube rests ~0.8cm ABOVE the tip
+                    # (bottom on the lip tops) -- holding it closed must NOT be taxed. On
+                    # the table the band below centre is unreachable anyway (table blocks).
+                    # capture envelope for the WIDENED cage: lips at 4.9cm vs cube half
+                    # 2.5cm -> 2.4cm geometric window; gate at 2.2cm with drift margin
+                    enclosed = ((self._horiz < 0.022)
+                                & (dz_tip > -0.012) & (dz_tip < 0.012)).float()
+                    r = r - 1.5 * grab                    # remove the mis-gated grab paid above
+                    # progress seesaw clock (defined FIRST -- used by the lift ladder below
+                    # and the squeeze-depreciation block further down)
+                    prog_l = min(1.0, getattr(self, "_train_steps", 0)
+                                 / max(1.0, self.cfg.lift_ramp_steps))
+                    # ALTITUDE ANCHOR FOLLOWS THE CUBE (not the fixed table height): the
+                    # table-anchored descend term bled ~3.6/step over the first 6cm of
+                    # ascent -- cancelling the lift bonus -- so "squeeze forever at the
+                    # nest" was a stable optimum (grip 0.87, grasp 0). Cube-anchored,
+                    # lifting together costs nothing and the 60x lift pays in the clear.
+                    z_err_obj = (self._base_p[:, 2] - (self._obj_p[:, 2] + 0.07)).abs()
+                    r = r - self.cfg.descend_coef * descend
+                    r = r + self.cfg.descend_coef * (1.0 - 0.6 * prog_l) * over_cube * (1.0 - torch.tanh(z_err_obj / 0.15))
+                    # GENTLE LIFT (probe-measured): carry succeeds 98% at <=0.3 m/s ascent,
+                    # 9% at full speed -- the seat breaks under jerk. While engaged
+                    # (enclosed + squeezing), a gentle climb pays; a violent one is taxed.
+                    vz_d = self.robot.data.root_lin_vel_w[:, 2]
+                    engaged = enclosed * (grip_cmd > 0.8).float()
+                    r = r + 4.0 * engaged * torch.clamp(vz_d, 0.0, 0.3) / 0.3
+                    r = r - 2.0 * engaged * torch.clamp(vz_d - 0.45, min=0.0)
+                    # EXPONENTIAL HEIGHT LADDER (user-designed): linear height pay gave
+                    # constant marginal reward against RISING marginal risk of losing the
+                    # seat -> optimal policy dabbled low and collapsed (bursts at 0.2-0.5cm,
+                    # first 6cm holds at 0.07% then retreat). Each cm now pays more than
+                    # the last: ~1.6/step at 2cm, ~9 at 6cm, ~26 at 10cm, ~76 at 15cm (cap).
+                    h_lift = torch.clamp(self._obj_p[:, 2]
+                                         - (self.cfg.surface_z + 0.5 * self.cfg.cube_size),
+                                         0.0, 0.15)
+                    r = r + 4.0 * (1.0 + prog_l) * (torch.exp(h_lift / 0.05) - 1.0)
+                    # explicit DROP penalty: one-time fine at the held->lost transition so
+                    # credit lands on the exact action that broke the seat (the ongoing
+                    # income cliff already punishes the aftermath)
+                    if not hasattr(self, "_prev_held_buf"):
+                        self._prev_held_buf = torch.zeros_like(self._held)
+                    dropped = (self._prev_held_buf & ~self._held).float()
+                    r = r - 10.0 * dropped
+                    self._prev_held_buf = self._held.clone()
+                    if self.cfg.overhead_first:
+                        # OVERHEAD-FIRST (user-designed): one paid spot in the world --
+                        # dead-centre at the current altitude setpoint. Lean/contact paths
+                        # pay nothing and are taxed; descent arrives only via the
+                        # competence-gated setpoint in the controller above.
+                        r = r - self.cfg.descend_coef * descend          # no generic descend
+                        # THREE centering scales so the gradient reaches from anywhere:
+                        # coarse (8cm) pulls 25cm->5cm, fine (2cm) pulls 5->1, exponential
+                        # (1cm) pays the bullseye -- only at the altitude setpoint band.
+                        center_c = 1.0 - torch.tanh(self._horiz / 0.08)
+                        center = 1.0 - torch.tanh(self._horiz / 0.02)
+                        band = 1.0 - torch.tanh((dz_tip - self._oh_dz).abs() / 0.02)
+                        r = r + 2.0 * center_c
+                        r = r + 3.0 * center
+                        # the setpoint altitude pays a BASE rate even off-centre (it must be
+                        # "the place to be" before centring there can be learned); centring
+                        # multiplies it up via the exponential
+                        r = r + 1.5 * band
+                        r = r + 8.0 * torch.exp(-self._horiz / 0.01) * band
+                        cube_v = torch.norm(self.object.data.root_lin_vel_w, dim=-1)
+                        r = r - 3.0 * torch.clamp(cube_v, max=1.0)       # DON'T TOUCH THE CUBE
+                        # contact-possible band taxed at ANY off-centre offset: walls span
+                        # tip+-2.5cm and the cube top is +2.5cm, so clipping is possible the
+                        # moment dz_tip < 5cm. Off-centre there = squish/top-clip territory.
+                        # The only untaxed entry into the final 5cm of descent is centred
+                        # inside the WIDENED 2.4cm fit window (lips at 4.9cm, cube half 2.5).
+                        beside = ((dz_tip > -0.03) & (dz_tip < 0.05)
+                                  & (self._horiz > 0.024)).float()
+                        r = r - 2.0 * beside                             # the lean/knock lane
+                        r = r - self.cfg.early_close_pen * grip_cmd      # cage stays open
+                    elif self.cfg.surround_only:
+                        # SURROUND-FIRST (user-directed): no grasp rewards at all. CHOREOGRAPHY
+                        # FIX: the generic descend term (15cm-soft centering gate) paid the
+                        # policy to sit at cube height while 2-3cm OFF -- i.e. wall against
+                        # cube, knocking it. Order is now CENTER -> SINK -> NEST:
+                        #   1) centering pays at ANY height (so it lines up while still high)
+                        #   2) descending pays ONLY once centered (tight 2cm gate)
+                        #   3) nested surround pays exponentially at cube height
+                        #   4) the cube MOVING at all is penalized (it should never be touched)
+                        r = r - self.cfg.descend_coef * descend          # retract loose descend
+                        center = 1.0 - torch.tanh(self._horiz / 0.02)
+                        vert_band = ((dz_tip > -0.012) & (dz_tip < 0.012)).float()
+                        r = r + 3.0 * center
+                        r = r + self.cfg.descend_coef * center * (1.0 - torch.tanh(z_err / 0.15))
+                        r = r + 8.0 * torch.exp(-self._horiz / 0.01) * vert_band
+                        cube_v = torch.norm(self.object.data.root_lin_vel_w, dim=-1)
+                        r = r - 3.0 * torch.clamp(cube_v, max=1.0)       # DON'T TOUCH THE CUBE
+                        # BESIDE-ZONE PENALTY (user-directed): being at cube height while
+                        # 1.4-7cm off-centre = a cage wall overlapping the cube = the knock
+                        # zone. Explicitly taxed -- the only paid route down is the centred
+                        # column. (Geometry: open walls at 4.4cm, lips 3.9cm, cube half 2.5.)
+                        beside = ((dz_tip.abs() < 0.03)
+                                  & (self._horiz > 0.024) & (self._horiz < 0.08)).float()
+                        r = r - 2.0 * beside
+                        # TWO ALTITUDE SETPOINTS (user-directed), never "go down":
+                        # centred -> nest height (paid above); NOT centred -> hold the safe
+                        # waiting band ABOVE the cube (tip 4-15cm over cube centre) while
+                        # lining up. Off-centre loitering now has a correct place to be.
+                        off_c = (self._horiz > 0.02).float()
+                        wait_band = ((dz_tip > 0.04) & (dz_tip < 0.15)).float()
+                        r = r + 1.0 * off_c * wait_band
+                        r = r - self.cfg.early_close_pen * grip_cmd
+                    else:
+                        # PRICED TO ATTEMPT + EXPONENTIAL PRECISION (user-designed): squeezing
+                        # only pays inside the (widened, 2.2cm) envelope, exponentially more
+                        # dead-centre (12mm scale matches the new fit window).
+                        # PROGRESS SEESAW (user-designed): as iterations grow, squeeze-camping
+                        # pay DEPRECIATES (8 -> 4) while the lift tier APPRECIATES (x1 -> x2
+                        # below) -- the income mix migrates toward grasping and lifting.
+                        prog_l = min(1.0, getattr(self, "_train_steps", 0)
+                                     / max(1.0, self.cfg.lift_ramp_steps))
+                        prec = torch.exp(-self._horiz / 0.012)
+                        r = r + (8.0 - 7.0 * prog_l) * prec * enclosed * grip_cmd
+                        r = r - self.cfg.early_close_pen * grip_cmd * (1.0 - enclosed)
             if self._stage >= 2:
                 r = r + 40.0 * place + 30.0 * carry_up + 25.0 * carry_prog + 80.0 * success
             return r - 0.01
@@ -731,10 +1007,50 @@ class DroneSnatchEnv(DirectRLEnv):
             root[near, 0] = obj_local[near, 0]
             root[near, 1] = obj_local[near, 1]
             root[near, 2] = grasp_z                       # tip (base-0.07) at the cube on the table
+            far = ~near
+            if self.cfg.side_spawn_max > 0.0 and bool(far.any()):
+                # SIDE SPAWN: random angle + area-uniform radius around the CUBE, random
+                # altitude -> the policy must navigate to the hover point, then descend.
+                ang = torch.rand(n, device=self.device) * 6.2831853
+                lo, hi = self.cfg.side_spawn_min, self.cfg.side_spawn_max
+                rad = torch.sqrt(torch.rand(n, device=self.device) * (hi * hi - lo * lo) + lo * lo)
+                z = self.cfg.side_spawn_h_lo + torch.rand(n, device=self.device) \
+                    * (self.cfg.side_spawn_h_hi - self.cfg.side_spawn_h_lo)
+                root[far, 0] = obj_local[far, 0] + (rad * torch.cos(ang))[far]
+                root[far, 1] = obj_local[far, 1] + (rad * torch.sin(ang))[far]
+                root[far, 2] = z[far]
+        # CARRY DEMOS: a fraction spawn ALREADY AIRBORNE WITH THE CUBE SEATED in the
+        # closed cage (drone at 0.50-0.65m, cube at the tip, jaws shut). The full
+        # carry/delivery income flows from step one -> the critic learns what holding
+        # high is worth; fly-in episodes inherit the motive to lift. (Same medicine
+        # that broke the squeeze-discovery wall: experience first, behavior follows.)
+        carry = torch.zeros(n, dtype=torch.bool, device=self.device)
+        if self.cfg.carry_demo_p > 0.0 and not self.cfg.grasp_latch:
+            carry = torch.rand(n, device=self.device) < self.cfg.carry_demo_p
+            if bool(carry.any()):
+                root[carry, 0] = obj_local[carry, 0]
+                root[carry, 1] = obj_local[carry, 1]
+                # 0.38-0.65m: some demos start barely above the nest (short, survivable
+                # dives -> retention learned at easy altitude first), others at goal
+                # height -- the exp ladder pulls survivors upward along a smooth value slope
+                root[carry, 2] = 0.38 + 0.27 * torch.rand(n, device=self.device)[carry]
+                obj[carry, 0] = root[carry, 0] + origins[carry, 0]
+                obj[carry, 1] = root[carry, 1] + origins[carry, 1]
+                # SHELF-SEATED, not tip-centred: cube bottom ON the lip tops (centre =
+                # tip + 0.8cm). Tip-centred with open jaws = 5.4cm lip aperture under a
+                # 5.0cm cube -> free-fall at spawn before the squeeze can arrive.
+                obj[carry, 2] = root[carry, 2] - 0.062 + origins[carry, 2]
+                obj[carry, 7:] = 0.0
+                self.object.write_root_pose_to_sim(obj[:, :7], env_ids)
+                self.object.write_root_velocity_to_sim(obj[:, 7:], env_ids)
         root[:, :3] += origins
         self.robot.write_root_pose_to_sim(root[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(root[:, 7:], env_ids)
         jpos = self.robot.data.default_joint_pos[env_ids].clone()
+        if bool(carry.any()):
+            # 0.026: shelf aperture 4.6cm < 5cm cube -> the shelves SUPPORT the seated
+            # cube from step one; walls (2.8cm half) clear its sides; nothing penetrates
+            jpos[carry] = 0.026
         self.robot.write_joint_state_to_sim(jpos, torch.zeros_like(jpos), env_ids=env_ids)
         # goal drop-zone near the cube, at carry height
         t = torch.zeros(n, 3, device=self.device)

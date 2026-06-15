@@ -6,8 +6,11 @@ rate, and (optional) video.
   python skyvla_isaac/scripts/play.py --checkpoint <ckpt> --video   # also save mp4
 """
 import argparse
+import os
 
 from isaaclab.app import AppLauncher
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True)
@@ -39,7 +42,7 @@ cfg.scene.num_envs = 1 if args.video else args.num_envs
 env = DronePickPlaceEnv(cfg, render_mode="rgb_array" if args.video else None)
 if args.video:
     env = gym.wrappers.RecordVideo(
-        env, video_folder="/home/ubuntu/SkyVLA/videos/isaac_play",
+        env, video_folder=os.path.join(_REPO, "videos/isaac_play"),
         step_trigger=lambda s: s == 0, video_length=500, disable_logger=True)
 env = RslRlVecEnvWrapper(env)
 base = env.unwrapped

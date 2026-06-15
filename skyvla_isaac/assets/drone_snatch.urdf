@@ -85,44 +85,58 @@
        (center at z=-0.07, just below the base bottom at -0.025) -- NOT dangled
        on a long standoff. The drone descends bodily to ~0.095 m to grasp a
        floor cube; grasp point = base - 0.07. -->
+  <!-- FLOORED SCOOP: each wall carries an inward lip at its bottom (flush with the wall
+       base, 0.5 cm proud, 0.8 cm tall). Closed, opposing lips leave a ~0.8 cm bottom
+       aperture -> a 5 cm cube physically CANNOT fall out (no kinematic latch needed).
+       Mounts widened 4->5 cm + travel 2->3.5 cm: open lip aperture 7.8 cm (was 6.8 wall
+       aperture) -> easier descent around the cube; closing presses the lips onto the
+       cube's lower faces for force closure, shelves catch it if grip slips. -->
   <link name="finger_xl">
     <visual><geometry><box size="0.012 0.07 0.05"/></geometry><material name="grip"/></visual>
     <collision><geometry><box size="0.012 0.07 0.05"/></geometry></collision>
+    <visual><origin xyz="-0.0025 0 -0.021"/><geometry><box size="0.017 0.05 0.008"/></geometry><material name="grip"/></visual>
+    <collision><origin xyz="-0.0025 0 -0.021"/><geometry><box size="0.017 0.05 0.008"/></geometry></collision>
     <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="grip_xl" type="prismatic">
-    <parent link="base"/><child link="finger_xl"/><origin xyz="0.04 0 -0.07"/><axis xyz="-1 0 0"/>
-    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+    <parent link="base"/><child link="finger_xl"/><origin xyz="0.06 0 -0.07"/><axis xyz="-1 0 0"/>
+    <limit lower="0.0" upper="0.035" effort="40" velocity="1.0"/>
   </joint>
 
   <link name="finger_xr">
     <visual><geometry><box size="0.012 0.07 0.05"/></geometry><material name="grip"/></visual>
     <collision><geometry><box size="0.012 0.07 0.05"/></geometry></collision>
+    <visual><origin xyz="0.0025 0 -0.021"/><geometry><box size="0.017 0.05 0.008"/></geometry><material name="grip"/></visual>
+    <collision><origin xyz="0.0025 0 -0.021"/><geometry><box size="0.017 0.05 0.008"/></geometry></collision>
     <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="grip_xr" type="prismatic">
-    <parent link="base"/><child link="finger_xr"/><origin xyz="-0.04 0 -0.07"/><axis xyz="1 0 0"/>
-    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+    <parent link="base"/><child link="finger_xr"/><origin xyz="-0.06 0 -0.07"/><axis xyz="1 0 0"/>
+    <limit lower="0.0" upper="0.035" effort="40" velocity="1.0"/>
   </joint>
 
   <link name="finger_yl">
     <visual><geometry><box size="0.07 0.012 0.05"/></geometry><material name="grip"/></visual>
     <collision><geometry><box size="0.07 0.012 0.05"/></geometry></collision>
+    <visual><origin xyz="0 -0.0025 -0.021"/><geometry><box size="0.05 0.017 0.008"/></geometry><material name="grip"/></visual>
+    <collision><origin xyz="0 -0.0025 -0.021"/><geometry><box size="0.05 0.017 0.008"/></geometry></collision>
     <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="grip_yl" type="prismatic">
-    <parent link="base"/><child link="finger_yl"/><origin xyz="0 0.04 -0.07"/><axis xyz="0 -1 0"/>
-    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+    <parent link="base"/><child link="finger_yl"/><origin xyz="0 0.06 -0.07"/><axis xyz="0 -1 0"/>
+    <limit lower="0.0" upper="0.035" effort="40" velocity="1.0"/>
   </joint>
 
   <link name="finger_yr">
     <visual><geometry><box size="0.07 0.012 0.05"/></geometry><material name="grip"/></visual>
     <collision><geometry><box size="0.07 0.012 0.05"/></geometry></collision>
+    <visual><origin xyz="0 0.0025 -0.021"/><geometry><box size="0.05 0.017 0.008"/></geometry><material name="grip"/></visual>
+    <collision><origin xyz="0 0.0025 -0.021"/><geometry><box size="0.05 0.017 0.008"/></geometry></collision>
     <inertial><mass value="0.02"/><inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/></inertial>
   </link>
   <joint name="grip_yr" type="prismatic">
-    <parent link="base"/><child link="finger_yr"/><origin xyz="0 -0.04 -0.07"/><axis xyz="0 1 0"/>
-    <limit lower="0.0" upper="0.02" effort="40" velocity="1.0"/>
+    <parent link="base"/><child link="finger_yr"/><origin xyz="0 -0.06 -0.07"/><axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="0.035" effort="40" velocity="1.0"/>
   </joint>
 
 </robot>

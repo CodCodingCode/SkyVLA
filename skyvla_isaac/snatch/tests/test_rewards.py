@@ -2,7 +2,7 @@
 
 Runnable with plain `python` (no Isaac):
 
-    PYTHONPATH=/home/ubuntu/SkyVLA python skyvla_isaac/snatch/tests/test_rewards.py
+    PYTHONPATH=$PWD python skyvla_isaac/snatch/tests/test_rewards.py
 
 Prints REWARD_TESTS_OK on success.
 """

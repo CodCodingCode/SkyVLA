@@ -4,7 +4,7 @@ SNATCH = Sim-trained Neural Aerial Transport and Capture. Free-flying quadrotor
 with a single-DOF caging gripper, dual-camera visuomotor policy, 5-action direct
 velocity control (see snatch/DESIGN.md). Same rsl_rl stack as scripts/train.py.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=/home/ubuntu/SkyVLA \
+  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD \
     python skyvla_isaac/scripts/train_snatch.py --num_envs 2048 --max_iterations 1500
   # smoke:
     python skyvla_isaac/scripts/train_snatch.py --num_envs 256 --max_iterations 3
@@ -14,14 +14,17 @@ this entrypoint is written against that import path and the 5-action / dict-obs
 contract, so it may not run end-to-end until that env lands.
 """
 import argparse
+import os
 
 from isaaclab.app import AppLauncher
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=2048)
 parser.add_argument("--max_iterations", type=int, default=1500)
 parser.add_argument("--log_dir", type=str,
-                    default="/home/ubuntu/SkyVLA/logs/isaac/drone_snatch")
+                    default=os.path.join(_REPO, "logs/isaac/drone_snatch"))
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--no_cams", action="store_true",
                     help="state-based variant (no cameras): tractable convergence + VIO-gap study")
@@ -33,6 +36,32 @@ parser.add_argument("--reward_staging", action="store_true",
                     help="learn pickup first, then phase in the placement/delivery reward")
 parser.add_argument("--staged_curriculum", action="store_true",
                     help="3-stage reward curriculum: hover -> grab(+dense descent, soft table) -> carry/drop")
+parser.add_argument("--side_spawn", type=float, default=None,
+                    help="randomized SIDE-spawn radius (m): stage 0 becomes navigate->hover, not just descend. "
+                         "Auto-scales env_spacing and episode length to fit the cruise")
+parser.add_argument("--stage_hover_thresh", type=float, default=None,
+                    help="stage 0->1 hover-EMA gate override (lower it with --side_spawn: cruise time caps the EMA)")
+parser.add_argument("--stage1_hover_anneal", type=float, default=None,
+                    help="master-then-diminish: env-steps over which the standoff hover payoff decays to 20% "
+                         "after stage 1 opens (nav cruise term stays full)")
+parser.add_argument("--latch_ready_coef", type=float, default=None,
+                    help="stage>=1 bonus peaked at the exact latch-engage pose (cube in cage footprint, "
+                         "tip at cube height); puts gradient across the last 5cm the descend term misses")
+parser.add_argument("--no_latch", action="store_true",
+                    help="REAL PHYSICS grasp: disable the kinematic latch; the floored-scoop cage must "
+                         "physically capture, hold, and carry the cube (contact forces only)")
+parser.add_argument("--carry_demo", type=float, default=None,
+                    help="fraction of resets spawning ALREADY CARRYING (cube seated in closed cage at "
+                         "altitude): teaches the carry's value -- white noise cannot sample a 15-step climb")
+parser.add_argument("--start_stage", type=int, default=None,
+                    help="start the staged controller at this stage (2 = all rewards on from step 0; "
+                         "use when warm-starting an already-expert policy)")
+parser.add_argument("--surround_only", action="store_true",
+                    help="train ONLY cage-surrounds-cube precision (exponential horiz at cube height); "
+                         "all gripper use taxed -- grasp training comes later from the surround expert")
+parser.add_argument("--overhead_first", action="store_true",
+                    help="overhead curriculum: pay ONLY dead-centre at an altitude setpoint that starts "
+                         "20cm above the cube and lowers rung-by-rung as centring is proven; ends at nest")
 parser.add_argument("--reverse_curriculum", action="store_true",
                     help="Florensa reverse curriculum: spawn at grasp pose, expand start distribution as grasp improves")
 parser.add_argument("--rc_start", type=float, default=None,
@@ -95,6 +124,28 @@ if args.rc_distance_mode:
     # to actually reach the cube from rc_dist_max at the (slow) grasp speed.
     cfg.scene.env_spacing = max(cfg.scene.env_spacing, 2.5 * args.rc_dist_max)
     cfg.episode_length_s = max(cfg.episode_length_s, args.rc_dist_max / max(cfg.speed, 0.3) + 6.0)
+if args.side_spawn is not None:
+    cfg.side_spawn_max = args.side_spawn
+    # room to cruise in from the side without entering a neighbour env, and time to
+    # reach the cube from the far edge of the spawn annulus at cruise speed
+    cfg.scene.env_spacing = max(cfg.scene.env_spacing, 2.0 * args.side_spawn + 2.0)
+    cfg.episode_length_s = max(cfg.episode_length_s, 10.0 + args.side_spawn / max(cfg.speed, 0.3))
+if args.stage_hover_thresh is not None:
+    cfg.stage_hover_thresh = args.stage_hover_thresh
+if args.stage1_hover_anneal is not None:
+    cfg.stage1_hover_anneal = args.stage1_hover_anneal
+if args.latch_ready_coef is not None:
+    cfg.latch_ready_coef = args.latch_ready_coef
+if args.no_latch:
+    cfg.grasp_latch = False
+if args.carry_demo is not None:
+    cfg.carry_demo_p = args.carry_demo
+if args.start_stage is not None:
+    cfg.start_stage = args.start_stage
+if args.surround_only:
+    cfg.surround_only = True
+if args.overhead_first:
+    cfg.overhead_first = True
 if args.curr_start is not None:
     cfg.curriculum_p_start = args.curr_start    # adaptive anneal resumes from here
 cfg.scene.num_envs = args.num_envs
@@ -102,6 +153,18 @@ if hasattr(cfg, "seed"):
     cfg.seed = args.seed
 env = DroneSnatchEnv(cfg, render_mode=None)
 env = RslRlVecEnvWrapper(env)
+
+# W&B auth from the gitignored key (repo convention). On a machine with no W&B
+# credentials (env var, key file, or `wandb login`), fall back to tensorboard
+# instead of crashing at logger init.
+_kf = os.path.join(_REPO, ".wandb_key")
+if "WANDB_API_KEY" not in os.environ and os.path.exists(_kf):
+    os.environ["WANDB_API_KEY"] = open(_kf).read().strip()
+_netrc = os.path.expanduser("~/.netrc")
+_use_wandb = ("WANDB_API_KEY" in os.environ
+              or (os.path.exists(_netrc) and "api.wandb.ai" in open(_netrc).read()))
+if not _use_wandb:
+    print("[train_snatch] no W&B credentials found -> logging to tensorboard only")
 
 # PPO hyperparams from the SNATCH spec: lr=3e-4, clip=0.2, entropy_coef=0.01,
 # ~64 steps/rollout, 10 epochs/update.
@@ -111,7 +174,7 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
     save_interval=50,
     experiment_name="drone_snatch",
     seed=args.seed,
-    logger="wandb",                       # W&B on by default (project convention)
+    logger="wandb" if _use_wandb else "tensorboard",  # W&B on by default (project convention)
     wandb_project="skyvla-isaac",
     empirical_normalization=True,         # normalize obs -> stability
     policy=RslRlPpoActorCriticCfg(
@@ -136,12 +199,6 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
         entropy_coef=args.entropy_coef,  # lower when refining a warm-started policy
     ),
 )
-
-# W&B auth from the gitignored key (so logger="wandb" can init), per repo convention.
-import os  # noqa: E402
-_kf = "/home/ubuntu/SkyVLA/.wandb_key"
-if "WANDB_API_KEY" not in os.environ and os.path.exists(_kf):
-    os.environ["WANDB_API_KEY"] = open(_kf).read().strip()
 
 runner = OnPolicyRunner(
     env, class_to_dict(agent_cfg), log_dir=args.log_dir, device=env.unwrapped.device)

@@ -8,13 +8,16 @@ Massively parallel: thousands of PhysX envs on one GPU. Real contact grasping.
     python skyvla_isaac/scripts/train.py --num_envs 256 --max_iterations 3
 """
 import argparse
+import os
 
 from isaaclab.app import AppLauncher
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=2048)
 parser.add_argument("--max_iterations", type=int, default=1500)
-parser.add_argument("--log_dir", type=str, default="/home/ubuntu/SkyVLA/logs/isaac/drone_pick_place")
+parser.add_argument("--log_dir", type=str, default=os.path.join(_REPO, "logs/isaac/drone_pick_place"))
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -32,12 +35,24 @@ cfg.scene.num_envs = args.num_envs
 env = DronePickPlaceEnv(cfg, render_mode=None)
 env = RslRlVecEnvWrapper(env)
 
+# W&B auth from the gitignored key (repo convention). On a machine with no W&B
+# credentials (env var, key file, or `wandb login`), fall back to tensorboard
+# instead of crashing at logger init.
+_kf = os.path.join(_REPO, ".wandb_key")
+if "WANDB_API_KEY" not in os.environ and os.path.exists(_kf):
+    os.environ["WANDB_API_KEY"] = open(_kf).read().strip()
+_netrc = os.path.expanduser("~/.netrc")
+_use_wandb = ("WANDB_API_KEY" in os.environ
+              or (os.path.exists(_netrc) and "api.wandb.ai" in open(_netrc).read()))
+if not _use_wandb:
+    print("[train] no W&B credentials found -> logging to tensorboard only")
+
 agent_cfg = RslRlOnPolicyRunnerCfg(
     num_steps_per_env=24,
     max_iterations=args.max_iterations,
     save_interval=50,
     experiment_name="drone_pick_place",
-    logger="wandb",                      # W&B on by default (project convention)
+    logger="wandb" if _use_wandb else "tensorboard",  # W&B on by default (project convention)
     wandb_project="skyvla-isaac",
     empirical_normalization=True,        # normalize observations -> stability
     policy=RslRlPpoActorCriticCfg(
@@ -54,12 +69,6 @@ agent_cfg = RslRlOnPolicyRunnerCfg(
         desired_kl=0.01, max_grad_norm=1.0,
     ),
 )
-
-# W&B auth from the gitignored key (so logger="wandb" can init), per repo convention
-import os  # noqa: E402
-_kf = "/home/ubuntu/SkyVLA/.wandb_key"
-if "WANDB_API_KEY" not in os.environ and os.path.exists(_kf):
-    os.environ["WANDB_API_KEY"] = open(_kf).read().strip()
 
 runner = OnPolicyRunner(env, class_to_dict(agent_cfg), log_dir=args.log_dir, device=env.unwrapped.device)
 runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)

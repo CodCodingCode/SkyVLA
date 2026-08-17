@@ -4,10 +4,10 @@ SNATCH = Sim-trained Neural Aerial Transport and Capture. Free-flying quadrotor
 with a single-DOF caging gripper, dual-camera visuomotor policy, 5-action direct
 velocity control (see snatch/DESIGN.md). Same rsl_rl stack as scripts/train.py.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD \
-    python skyvla_isaac/scripts/train_snatch.py --num_envs 2048 --max_iterations 1500
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD \
+    .venv311/bin/python skyvla_isaac/scripts/train_snatch.py --num_envs 2048 --max_iterations 1500
   # smoke:
-    python skyvla_isaac/scripts/train_snatch.py --num_envs 256 --max_iterations 3
+    .venv311/bin/python skyvla_isaac/scripts/train_snatch.py --num_envs 256 --max_iterations 3
 
 NOTE: the SNATCH env (snatch/pick_place_env.py) is assembled by the orchestrator;
 this entrypoint is written against that import path and the 5-action / dict-obs
@@ -39,6 +39,32 @@ parser.add_argument("--staged_curriculum", action="store_true",
 parser.add_argument("--side_spawn", type=float, default=None,
                     help="randomized SIDE-spawn radius (m): stage 0 becomes navigate->hover, not just descend. "
                          "Auto-scales env_spacing and episode length to fit the cruise")
+parser.add_argument("--two_platform", action="store_true",
+                    help="TRANSPORT task: add delivery platform B and anchor the goal to the cube AT REST ON B "
+                         "(not a waypoint floating over A). Auto-scales env_spacing and episode length")
+parser.add_argument("--plat_sep", type=float, default=1.5,
+                    help="starting A->B separation (m); expands by --plat_sep_step as arrival/deposit holds up")
+parser.add_argument("--plat_sep_max", type=float, default=2.0,
+                    help="A->B separation ceiling (m). env_spacing/episode length are sized off THIS, so set it "
+                         "to the distance you intend to reach, not the one you start at")
+parser.add_argument("--release_only", action="store_true",
+                    help="PLACE stage: success = cube deposited at rest on B with the jaws open (default is "
+                         "the NAV stage: success = arrived over B still holding it)")
+parser.add_argument("--place_only", action="store_true",
+                    help="PLACE stage from an already-holding start: every episode begins with the cube "
+                         "seated in the closed cage above delivery pad B; the only skill trained is a "
+                         "gentle set-down + release. Drops ALL altitude income (the exp lift ladder and "
+                         "carry_up), which is what traps the carry stage in a hover. Implies --two_platform "
+                         "--release_only --no_latch --carry_demo 1.0")
+parser.add_argument("--place_spawn_r", type=float, default=None,
+                    help="place stage: spawn-disc radius around pad B (m) for the already-holding start")
+parser.add_argument("--place_spawn_h", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="place stage: spawn BODY altitude band (m). The seat pose is body=0.395")
+parser.add_argument("--gentle_v", type=float, default=None,
+                    help="place stage: safe descent speed (m/s) inside place_taper_h of the seat pose; "
+                         "only EXCESS speed is taxed, so stopping dead is never penalized")
+parser.add_argument("--episode_s", type=float, default=None,
+                    help="override episode length (s). Shorter = more deposit attempts per iteration")
 parser.add_argument("--stage_hover_thresh", type=float, default=None,
                     help="stage 0->1 hover-EMA gate override (lower it with --side_spawn: cruise time caps the EMA)")
 parser.add_argument("--stage1_hover_anneal", type=float, default=None,
@@ -130,6 +156,47 @@ if args.side_spawn is not None:
     # reach the cube from the far edge of the spawn annulus at cruise speed
     cfg.scene.env_spacing = max(cfg.scene.env_spacing, 2.0 * args.side_spawn + 2.0)
     cfg.episode_length_s = max(cfg.episode_length_s, 10.0 + args.side_spawn / max(cfg.speed, 0.3))
+if args.two_platform:
+    cfg.two_platform = True
+    cfg.plat_sep = args.plat_sep
+    cfg.plat_sep_max = max(args.plat_sep_max, args.plat_sep)
+    cfg.release_only = args.release_only
+    # B sits up to plat_sep_max from A on ANY bearing, so a neighbour env is 2*sep away
+    # at worst; +2m clears the 1x1m pads themselves. Episode must cover fly-in, the
+    # A->B transit at cruise speed, and the descend/deposit at the far end.
+    cfg.scene.env_spacing = max(cfg.scene.env_spacing, 2.0 * cfg.plat_sep_max + 2.0)
+    cfg.episode_length_s = max(cfg.episode_length_s,
+                               12.0 + cfg.plat_sep_max / max(cfg.speed, 0.3))
+if args.place_only:
+    # PLACE stage. The reward is a dedicated method (_place_reward) with no altitude income,
+    # so the staged/adaptive controllers are deliberately NOT enabled -- there is nothing to
+    # gate. Everything below is implied rather than left to the caller, because getting any
+    # one of them wrong silently changes what "success" means.
+    cfg.place_only = True
+    cfg.two_platform = True          # pad B IS the delivery target
+    cfg.release_only = True          # success = deposited, not "arrived still holding"
+    cfg.grasp_latch = False          # real contact grasp; also what enables carry_demo
+    cfg.staged_curriculum = False
+    cfg.reverse_curriculum = False
+    cfg.adaptive_curriculum = False
+    cfg.reward_staging = False
+    cfg.side_spawn_max = 0.0         # the carry-demo spawn replaces it entirely
+    cfg.curriculum_p_start = cfg.curriculum_p_end = 0.0
+    if args.carry_demo is None:
+        cfg.carry_demo_p = 1.0       # EVERY episode starts holding the cube
+    cfg.plat_sep = args.plat_sep
+    cfg.plat_sep_max = max(args.plat_sep_max, args.plat_sep)
+    if args.place_spawn_r is not None:
+        cfg.place_spawn_r = args.place_spawn_r
+    if args.place_spawn_h is not None:
+        cfg.place_spawn_h_lo, cfg.place_spawn_h_hi = args.place_spawn_h
+    if args.gentle_v is not None:
+        cfg.gentle_v = args.gentle_v
+    # the drone spawns up to place_spawn_r beyond B, which itself sits plat_sep_max from A
+    cfg.scene.env_spacing = max(cfg.scene.env_spacing,
+                                2.0 * (cfg.plat_sep_max + cfg.place_spawn_r) + 2.0)
+if args.episode_s is not None:
+    cfg.episode_length_s = args.episode_s
 if args.stage_hover_thresh is not None:
     cfg.stage_hover_thresh = args.stage_hover_thresh
 if args.stage1_hover_anneal is not None:

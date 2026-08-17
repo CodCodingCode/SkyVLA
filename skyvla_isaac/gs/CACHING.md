@@ -36,10 +36,17 @@ at 720×540, so a 450-frame backdrop renders in <1 s once the scene is loaded.
 ## How to use
 
 ### 1. Build it once (Isaac, slow — do this a single time per room)
+
+> **Currently blocked on this host.** `render_rollout_gs.py` imports *both*
+> `isaaclab` and `gsplat`, and no interpreter here has both: `.venv311` has Isaac
+> without gsplat, `.venv` has gsplat without Isaac. Install `gsplat` into
+> `.venv311` before running this step. Step 2 below (the Isaac-free replay) is
+> unaffected and works today.
+
 ```bash
-conda activate isaac
+export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1
 OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1 PYTHONPATH=/home/ubuntu/SkyVLA \
-python skyvla_isaac/scripts/render_rollout_gs.py \
+.venv311/bin/python skyvla_isaac/scripts/render_rollout_gs.py \
     --checkpoint logs/isaac/drone_pick_place/model_5999.pt \
     --out videos/isaac_pickplace_gs.mp4 \
     --save_rollout        # also cache the rollout for Isaac-free replay
@@ -50,9 +57,9 @@ you changed the room geometry or the render resolution).
 
 ### 2. Re-render FAST, no Isaac (the iteration loop)
 ```bash
-conda activate habitat          # any env with torch + gsplat (no Isaac needed)
+# any interpreter with torch + gsplat
 PYTHONUTF8=1 PYTHONPATH=/home/ubuntu/SkyVLA \
-python skyvla_isaac/scripts/render_gs_cache.py \
+.venv/bin/python skyvla_isaac/scripts/render_gs_cache.py \
     --rollout skyvla_isaac/gs/cache/rollout_model_5999.npz \
     --out videos/replay.mp4
 ```
@@ -61,7 +68,7 @@ Re-composites the cached drone+cube over the cached splat — change `--fps`,
 
 Orbit the bare room to sanity-check the scene (no rollout needed):
 ```bash
-python skyvla_isaac/scripts/render_gs_cache.py --out videos/gs_orbit.mp4 \
+.venv/bin/python skyvla_isaac/scripts/render_gs_cache.py --out videos/gs_orbit.mp4 \
     --steps 180 --radius 2.6 --height 1.6 --look_z 1.2
 ```
 

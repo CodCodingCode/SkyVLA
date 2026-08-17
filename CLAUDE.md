@@ -5,15 +5,30 @@ repo is the Isaac Sim / Isaac Lab gripper-drone work in `skyvla_isaac/` — a
 free-floating quadrotor with a 4-jaw gripper doing pick-and-place (`tasks/pick_place_env.py`)
 and Gaussian-map navigation (`gs/`). Training is PPO via rsl_rl (`scripts/train.py`).
 
-## Environment
+## Environment — venvs, NOT conda
 
-All Isaac scripts run in the isolated `isaac` conda env (Python 3.10) and need:
+There is no conda on this host and no `isaac` / `habitat` env. Two virtualenvs:
+
+| | path | has |
+|---|---|---|
+| Isaac (physics, training, eval) | `.venv311` (py3.11) | Isaac Sim 5.1.0, Isaac Lab 2.3.2, rsl_rl 3.1.2, torch 2.7.0+cu128 |
+| Gaussian-map rendering | `.venv` (py3.10) | gsplat 1.5.3 |
 
 ```bash
-conda activate isaac
 export OMNI_KIT_ACCEPT_EULA=YES
 export PYTHONPATH=/home/ubuntu/SkyVLA
+export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1   # REQUIRED on this aarch64 host
+/home/ubuntu/SkyVLA/.venv311/bin/python skyvla_isaac/scripts/<script>.py
 ```
+
+**Never write `conda activate` into a script.** Four run scripts did; they resolved to
+the system `python`, died on `ModuleNotFoundError: isaaclab`, and their restart loops
+retried forever — looking alive in tmux while training nothing. They were deleted; their
+hyperparameters live in the README's grasp-lineage section.
+
+**No interpreter has both `isaaclab` and `gsplat`.** `gs_isaac_demo.py` and
+`render_rollout_gs.py` import both and cannot run until `gsplat` is installed into
+`.venv311`. `render_gs_cache.py` is the Isaac-free consumer and runs under `.venv`.
 
 ## W&B is on by default — don't disable it
 
@@ -58,30 +73,37 @@ their laptop never matters. Stop a run with `tmux kill-session -t <SESS>`
 SESS=isaac_pickplace_$(date +%Y%m%d_%H%M%S)
 LOG=/tmp/${SESS}.log
 tmux new-session -d -s "$SESS" \
-  "conda activate isaac && OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=/home/ubuntu/SkyVLA \
-   python skyvla_isaac/scripts/train.py --num_envs 2048 --max_iterations 1500 2>&1 | tee $LOG"
+  "OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=/home/ubuntu/SkyVLA \
+   LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1 \
+   /home/ubuntu/SkyVLA/.venv311/bin/python skyvla_isaac/scripts/train.py \
+   --num_envs 2048 --max_iterations 1500 2>&1 | tee $LOG"
 ```
+
+The `run_snatch_carry.sh` / `run_snatch_place.sh` scripts already set all of this up
+(`PY=`, `LD_PRELOAD`, restart loop); launch those directly rather than rebuilding the
+command. Before trusting a restart loop, confirm the log shows real iterations — a loop
+that reprints `[restart-loop]` every 10s is failing at import, not crashing mid-run.
 
 `scripts/train.py` checkpoints every `save_interval` iterations to
 `logs/isaac/drone_pick_place/`, so a crash loses at most that window — resume by
 relaunching from the latest `model_*.pt`.
 
-## Xid 43 on this machine
+## Segfaults on this machine
 
-The A100 on this host throws NVIDIA Xid 43 ("GPU stopped processing" / channel
-reset) errors at roughly ~50% per hour of sustained training. They surface in
-Python as `Fatal Python error: Segmentation fault` with no stack and no caught
-exception, across PyTorch versions and architectures — no ECC errors, no
-hardware fault. Suspected cause: a PyTorch cu130 binary on a system with CUDA
-12.8 nvcc. **Design for it:** checkpoint often, and wrap long launches in a
-restart loop so a mid-run segfault just resumes from the latest checkpoint
-rather than losing the run.
+This host is a **GH200 (aarch64)** running torch 2.7.0+**cu128**. The older note here
+described an A100 with a cu130/CUDA-12.8 mismatch causing Xid 43 at ~50%/hour; that
+hardware and that mismatch are both gone.
 
-**Don't rerun the cu128 reinstall without authorization.** We diagnosed Xid 43
-and considered reinstalling PyTorch with cu128 wheels to match the system CUDA
-toolkit; the user explicitly chose **not** to (preferred checkpoint + restart).
-Don't propose the reinstall again unless the restart strategy starts failing in
-a new way — the reinstall has a real blast radius (Isaac Lab / rsl_rl pinning).
+What is observed now is a **teardown segfault**: training completes normally, prints
+`TRAIN_SNATCH_OK`, and *then* dies in `simulation_app.close()` with
+`carb.graphics-vulkan.plugin: VkResult: ERROR_INCOMPATIBLE_DRIVER` (headless host, no
+Vulkan). Intermittent — same command exits 0 on some runs, 139 on others. It is
+harmless: it happens after checkpoints are written.
+
+**Design for it anyway:** checkpoint often and wrap long launches in a restart loop.
+But when a loop is spinning, check *where* it fails — a teardown segfault after real
+iterations is benign; a loop that never logs an iteration is an import/env failure and
+will never make progress.
 
 ## GS rendering is CACHED — never rebuild the splat room from scratch
 
@@ -98,11 +120,10 @@ Two caches under `skyvla_isaac/gs/cache/` (gitignored), via `gs/cache.py`:
   one checkpoint. Written by `render_rollout_gs.py --save_rollout`.
 
 **To iterate on the render/camera look, do NOT boot Isaac.** Use the Isaac-free
-consumer in the `habitat` env (~1.5 ms/frame):
+consumer in `.venv` (~1.5 ms/frame):
 ```bash
-conda activate habitat
 PYTHONUTF8=1 PYTHONPATH=/home/ubuntu/SkyVLA \
-python skyvla_isaac/scripts/render_gs_cache.py \
+.venv/bin/python skyvla_isaac/scripts/render_gs_cache.py \
     --rollout skyvla_isaac/gs/cache/rollout_<ckpt>.npz --out videos/replay.mp4
 # or orbit the bare room:  render_gs_cache.py --out videos/gs_orbit.mp4
 ```
@@ -112,11 +133,10 @@ Clean `cache/rollout_*.npz` when done — disk is tight (see below).
 
 ## Disk hygiene
 
-`/dev/vda1` is shared with `/tmp` and runs 90%+ full on this machine. PPO
-checkpoints and rendered mp4s add up. **Before a long run**, check `df -h /tmp`
-has headroom; delete stale checkpoints/videos first if not. A full root disk
-also breaks the Claude Code harness (task-output dir can't be written), so this
-matters more than usual.
+`/dev/vda1` is shared with `/tmp`. It is currently **3.9 TB at 2% used** — the old
+"90%+ full" warning no longer applies, but PPO checkpoints and rendered mp4s still
+add up. **Before a long run**, check `df -h /tmp` has headroom. A full root disk also
+breaks the Claude Code harness (task-output dir can't be written).
 
 ## Don't break what works
 

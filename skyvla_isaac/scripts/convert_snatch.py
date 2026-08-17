@@ -6,8 +6,8 @@ Adapted from convert_urdf.py for assets/drone_snatch.urdf. After dropping the
 grasp is contact/friction-based. Fixed boom/rotor/camera links fold into the base.
 Free-floating base = a drone.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD \
-    python skyvla_isaac/scripts/convert_snatch.py
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD \
+    .venv311/bin/python skyvla_isaac/scripts/convert_snatch.py
 """
 import os
 import sys

@@ -1,7 +1,7 @@
 """Render a SNATCH (state-based) pick-and-place rollout to MP4 with a 3rd-person cam.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1
-  python skyvla_isaac/scripts/render_snatch.py \
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1
+  .venv311/bin/python skyvla_isaac/scripts/render_snatch.py \
      --checkpoint logs/isaac/drone_snatch_state/model_650.pt --out videos/snatch_pickplace.mp4
 
 Quality profiles (--quality):

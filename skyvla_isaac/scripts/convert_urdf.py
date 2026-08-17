@@ -4,8 +4,8 @@ The movable joints (lower, grip_l, grip_r) become real actuated PhysX DoFs, so
 grasping is contact/friction-based — not the kinematic-attach hack from Habitat.
 Fixed boom/rotor links are merged into the base. Free-floating base = a drone.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES \
-    python skyvla_isaac/scripts/convert_urdf.py
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES \
+    .venv311/bin/python skyvla_isaac/scripts/convert_urdf.py
 """
 import os
 

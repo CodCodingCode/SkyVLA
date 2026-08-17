@@ -5,9 +5,9 @@ the two SNATCH depth cameras via `snatch.perception` cfgs, steps a few times, an
 prints the captured depth tensor shapes + min/max for both cameras. Then runs the
 two (separate) DepthEncoders on the captured depth and prints the latent shapes.
 
-  conda activate isaac
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1
   OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1 PYTHONPATH=$PWD \
-    python scripts/snatch_cam_smoke.py
+    .venv311/bin/python scripts/snatch_cam_smoke.py
 
 Prints CAM_SMOKE_OK on success.
 """

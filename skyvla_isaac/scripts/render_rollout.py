@@ -3,8 +3,8 @@
 Runs the deterministic policy in 1 env with a 3rd-person Camera sensor framing
 the workspace, captures RGB each step, encodes an mp4 (libx264, QuickTime-ready).
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES
-  python skyvla_isaac/scripts/render_rollout.py \
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES
+  .venv311/bin/python skyvla_isaac/scripts/render_rollout.py \
      --checkpoint logs/isaac/drone_pick_place/model_1499.pt --out videos/isaac_pickplace.mp4
 """
 import argparse

@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 
 # Environments and OS noise
+.venv/
+.venv311/
 .DS_Store
 
 # Training artifacts

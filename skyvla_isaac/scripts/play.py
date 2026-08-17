@@ -1,9 +1,9 @@
 """Evaluate a trained pick-place policy: deterministic rollout, real success
 rate, and (optional) video.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES
-  python skyvla_isaac/scripts/play.py --checkpoint logs/isaac/drone_pick_place/model_1499.pt
-  python skyvla_isaac/scripts/play.py --checkpoint <ckpt> --video   # also save mp4
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES
+  .venv311/bin/python skyvla_isaac/scripts/play.py --checkpoint logs/isaac/drone_pick_place/model_1499.pt
+  .venv311/bin/python skyvla_isaac/scripts/play.py --checkpoint <ckpt> --video   # also save mp4
 """
 import argparse
 import os

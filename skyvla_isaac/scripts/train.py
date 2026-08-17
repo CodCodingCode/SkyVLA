@@ -2,10 +2,10 @@
 
 Massively parallel: thousands of PhysX envs on one GPU. Real contact grasping.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES \
-    python skyvla_isaac/scripts/train.py --num_envs 2048 --max_iterations 1500
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES \
+    .venv311/bin/python skyvla_isaac/scripts/train.py --num_envs 2048 --max_iterations 1500
   # smoke:
-    python skyvla_isaac/scripts/train.py --num_envs 256 --max_iterations 3
+    .venv311/bin/python skyvla_isaac/scripts/train.py --num_envs 256 --max_iterations 3
 """
 import argparse
 import os

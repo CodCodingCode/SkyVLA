@@ -2,8 +2,12 @@
 Isaac Lab Camera around a small scene, fuse into the (ported) GaussianMap, and
 render a novel view. Confirms the Habitat->Isaac GS port end to end.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES \
-    python skyvla_isaac/scripts/gs_isaac_demo.py
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES \
+    .venv311/bin/python skyvla_isaac/scripts/gs_isaac_demo.py
+
+BLOCKED on this host: needs BOTH isaaclab and gsplat, and no interpreter has both
+(.venv311 = Isaac, no gsplat; .venv = gsplat, no Isaac). Install gsplat into
+.venv311 to run this. See README "Known gap".
 """
 import argparse
 import os

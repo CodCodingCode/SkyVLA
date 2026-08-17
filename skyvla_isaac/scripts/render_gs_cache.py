@@ -11,15 +11,15 @@ Two modes
 * ORBIT (default) — fly a ring around the room and render the bare splat. Great
   for sanity-checking the cached scene and tuning render params.
 
-      conda activate habitat           # any env with torch + gsplat
-      python skyvla_isaac/scripts/render_gs_cache.py --out videos/gs_orbit.mp4
+      # any interpreter with torch + gsplat
+      .venv/bin/python skyvla_isaac/scripts/render_gs_cache.py --out videos/gs_orbit.mp4
 
 * REPLAY (``--rollout``) — re-composite a captured rollout (drone+cube foreground
   saved by ``render_rollout_gs.py --save_rollout``) over the splat backdrop, with
   no physics and no Isaac. Change the fill colour / coverage threshold / fps and
   re-render in seconds.
 
-      python skyvla_isaac/scripts/render_gs_cache.py \
+      .venv/bin/python skyvla_isaac/scripts/render_gs_cache.py \
           --rollout skyvla_isaac/gs/cache/rollout_model_5999.npz \
           --out videos/replay.mp4
 
@@ -96,7 +96,7 @@ def main() -> None:
     if not os.path.exists(scene_path):
         raise SystemExit(
             f"no scene cache at {scene_path} — build one first:\n"
-            "  python skyvla_isaac/scripts/render_rollout_gs.py --checkpoint <ckpt> --save_rollout"
+            "  .venv/bin/python skyvla_isaac/scripts/render_rollout_gs.py --checkpoint <ckpt> --save_rollout"
         )
     gmap, K, W, H, meta = gs_cache.load_scene(scene_path, device=dev)
     print(f"[gs-cache] scene {scene_path}: {gmap.num_gaussians} gaussians, "

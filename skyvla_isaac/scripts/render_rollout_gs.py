@@ -9,9 +9,13 @@ Pipeline (the Habitat->Isaac GS port, applied as a rollout backdrop):
      room at the follow-camera pose, and composite the live drone+cube (segmentation
      mask) on top. Physics is NOT against the splat -- it's a cosmetic backdrop.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1 \
-  python skyvla_isaac/scripts/render_rollout_gs.py \
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES PYTHONUTF8=1 \
+  .venv311/bin/python skyvla_isaac/scripts/render_rollout_gs.py \
      --checkpoint logs/isaac/drone_pick_place/model_5999.pt --out videos/isaac_pickplace_gs.mp4
+
+BLOCKED on this host: needs BOTH isaaclab and gsplat, and no interpreter has both
+(.venv311 = Isaac, no gsplat; .venv = gsplat, no Isaac). Install gsplat into
+.venv311 to run this. render_gs_cache.py (Isaac-free replay) works today.
 
 NOTE: PYTHONUTF8=1 is REQUIRED -- gsplat 1.5.3 ships without prebuilt CUDA kernels
 and JIT-compiles on first use; torch's JIT reads the .cu sources with the locale

@@ -8,8 +8,8 @@ Loads a checkpoint, runs deterministic rollouts, and reports:
   - VIO-noise sweep: re-run eval across a range of vio_drift_scale values and
     print success vs drift. This sweep is the core sim2real GAP RESULT.
 
-  conda activate isaac; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD \
-    python skyvla_isaac/scripts/eval_snatch.py \
+  export LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1; OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH=$PWD \
+    .venv311/bin/python skyvla_isaac/scripts/eval_snatch.py \
       --checkpoint logs/isaac/drone_snatch/model_1499.pt
 
 NOTE: imports the orchestrator's env (snatch/pick_place_env.py) and

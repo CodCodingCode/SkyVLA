@@ -4,9 +4,15 @@
 # flies in, cages and lifts; this run only has to add "and now haul it to B".
 #
 # Success here = ARRIVED over B with the cube still held (--release_only is stage 3).
-# --carry_demo 0.35: a third of the envs spawn already airborne with the cube seated in
-# the shut cage, which IS the handoff distribution the snatch policy hands over -- so the
-# transit is learned from step one instead of waiting on a grasp to happen first.
+#
+# PURE TRANSPORT. --grip_closed welds the cage shut (a[4] forced to +1 every step), so this
+# policy controls only [vx vy vz yaw_rate] and never has to maintain its own grasp. That
+# forces --carry_demo 1.0: with the jaws shut a drone spawned away from the cube can never
+# scoop it, so EVERY env starts already holding, at A, and the only task is the haul to B.
+# Rationale: with the grasp in the loop, arrive_rate plateaued at ~4% for 380 iterations --
+# most failures were the cube slipping mid-flight on a 49%-reliable friction grasp, not bad
+# flying. Removing grasp maintenance isolates the transport skill. The real grasp is the
+# snatch policy's job, and run_pipeline.py hands over to this one already holding.
 #
 # DISTANCE LADDER. env_spacing and episode_length are sized off --plat_sep_max at scene
 # construction, so you cannot raise the ceiling mid-run: finish a rung, then relaunch the
@@ -37,7 +43,7 @@ while true; do
     RESUME=${LATEST:-$INIT}
     "$PY" skyvla_isaac/scripts/train_snatch.py --no_cams --staged_curriculum --cur_p 0.0 \
         --two_platform --plat_sep "$SEP" --plat_sep_max "$SEP_MAX" \
-        --no_latch --carry_demo 0.35 \
+        --grip_closed --no_latch --carry_demo 1.0 \
         --cube_mass 0.05 --side_spawn 5.0 --speed "$SPEED" \
         --stage_hover_thresh 0.70 --stage1_hover_anneal 10000 --start_stage 2 \
         --entropy_coef 0.001 --latch_ready_coef 4.0 \

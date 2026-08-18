@@ -82,7 +82,8 @@ def run_eval(env, policy, base, steps):
         base._placed        (N,) bool — block delivered at goal this step
         base._grasp_pos_err (N,) float — m, |gripper - block| at grasp moment
     """
-    obs, _ = env.get_observations()
+    _r = env.get_observations()
+    obs = _r[0] if isinstance(_r, tuple) else _r   # 2.3.2 returns a bare TensorDict
     n = base.num_envs
     dev = base.device
     ever_grasp = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -93,7 +94,9 @@ def run_eval(env, policy, base, steps):
     for _ in range(steps):
         with torch.no_grad():
             act = policy(obs)
-        obs, _, dones, _ = env.step(act)
+        _s = env.step(act)
+        obs = _s[0]
+        dones = (_s[2].bool() | _s[3].bool()) if len(_s) == 5 else _s[2].bool()
 
         grasped = getattr(base, "_grasped", torch.zeros(n, dtype=torch.bool, device=dev))
         placed = getattr(base, "_placed", torch.zeros(n, dtype=torch.bool, device=dev))

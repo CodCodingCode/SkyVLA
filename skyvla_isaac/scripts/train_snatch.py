@@ -47,6 +47,10 @@ parser.add_argument("--plat_sep", type=float, default=1.5,
 parser.add_argument("--plat_sep_max", type=float, default=2.0,
                     help="A->B separation ceiling (m). env_spacing/episode length are sized off THIS, so set it "
                          "to the distance you intend to reach, not the one you start at")
+parser.add_argument("--grip_closed", action="store_true",
+                    help="CARRY stage: weld the cage shut (a[4] forced to +1 every step) so the policy "
+                         "controls only [vx vy vz yaw_rate]. Requires --carry_demo 1.0 -- with the jaws "
+                         "shut a drone spawned away from the cube can never grasp it")
 parser.add_argument("--release_only", action="store_true",
                     help="PLACE stage: success = cube deposited at rest on B with the jaws open (default is "
                          "the NAV stage: success = arrived over B still holding it)")
@@ -60,6 +64,11 @@ parser.add_argument("--place_spawn_r", type=float, default=None,
                     help="place stage: spawn-disc radius around pad B (m) for the already-holding start")
 parser.add_argument("--place_spawn_h", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                     help="place stage: spawn BODY altitude band (m). The seat pose is body=0.395")
+parser.add_argument("--no_place_curriculum", action="store_true",
+                    help="place stage: train the FULL spawn distribution from step one instead of ramping "
+                         "the disc radius + altitude up from a near-trivial deposit as competence holds")
+parser.add_argument("--place_curr_start", type=float, default=None,
+                    help="place stage: starting start-ramp difficulty (use on crash-restart to resume)")
 parser.add_argument("--gentle_v", type=float, default=None,
                     help="place stage: safe descent speed (m/s) inside place_taper_h of the seat pose; "
                          "only EXCESS speed is taxed, so stopping dead is never penalized")
@@ -161,6 +170,7 @@ if args.two_platform:
     cfg.plat_sep = args.plat_sep
     cfg.plat_sep_max = max(args.plat_sep_max, args.plat_sep)
     cfg.release_only = args.release_only
+    cfg.grip_closed = args.grip_closed
     # B sits up to plat_sep_max from A on ANY bearing, so a neighbour env is 2*sep away
     # at worst; +2m clears the 1x1m pads themselves. Episode must cover fly-in, the
     # A->B transit at cruise speed, and the descend/deposit at the far end.
@@ -192,9 +202,17 @@ if args.place_only:
         cfg.place_spawn_h_lo, cfg.place_spawn_h_hi = args.place_spawn_h
     if args.gentle_v is not None:
         cfg.gentle_v = args.gentle_v
+    if args.no_place_curriculum:
+        cfg.place_curriculum = False
+    if args.place_curr_start is not None:
+        cfg.place_curr_start = args.place_curr_start
     # the drone spawns up to place_spawn_r beyond B, which itself sits plat_sep_max from A
     cfg.scene.env_spacing = max(cfg.scene.env_spacing,
                                 2.0 * (cfg.plat_sep_max + cfg.place_spawn_r) + 2.0)
+    # 8s: ~1s to centre + ~3s to descend 0.46m at the tapered speed, leaving ~4s of
+    # post-deposit income. Shorter than the transport stages on purpose -- the deposit is
+    # the whole episode here, so more resets means more attempts per iteration.
+    cfg.episode_length_s = 8.0
 if args.episode_s is not None:
     cfg.episode_length_s = args.episode_s
 if args.stage_hover_thresh is not None:

@@ -89,7 +89,14 @@ def main():
     cfg.two_platform = True
     cfg.plat_sep = args.plat_sep
     cfg.plat_sep_max = max(args.plat_sep_max, args.plat_sep)
-    cfg.release_only = True                      # deposit is the pipeline's success metric
+    # NEITHER deposit flag. _reset_target must hand the CARRY policy the goal it was
+    # trained against (a hover point at surface_z + 0.25); the PLACE policy was trained
+    # against the resting-height goal instead, so the runner rewrites _target[:, 2]
+    # per-env at the carry->place handoff below. Setting release_only here would give
+    # the carry policy the wrong goal for the whole haul.
+    cfg.release_only = False
+    cfg.place_only = False
+    cfg.grip_closed = False                      # per-phase, handled in the loop
     if args.speed is not None:
         cfg.speed = args.speed
     cfg.side_spawn_max = args.side_spawn
@@ -120,12 +127,60 @@ def main():
     ep_deposited = torch.zeros(n, dtype=torch.bool, device=dev)
     tot = {"grasp": 0, "arrive": 0, "deposit": 0, "eps": 0}
 
-    obs, _ = env.get_observations()
+    # Isaac Lab 2.3.2 / rsl_rl 3.1.2 return a bare obs tensor here; older versions
+    # returned (obs, extras). Accept either so this runs across both.
+    def _obs(r):
+        return r[0] if isinstance(r, tuple) else r
+
+    def _step(a):
+        r = env.step(a)
+        # (obs, rew, dones, extras) or (obs, rew, terminated, truncated, extras)
+        if len(r) == 5:
+            return r[0], (r[2].bool() | r[3].bool())
+        return r[0], r[2].bool()
+
+    def _retarget_obs(o, ph):
+        """Each policy was trained with a DIFFERENT MEANING for the goal channel
+        (obs[:, -3:] = target - drone_pos), so handing over requires rewriting it:
+
+          snatch  goal sampled within +-0.25m of the CUBE at 0.55m (goal_offset_diam)
+          carry   goal = platform B's hover point (surface_z + 0.25)
+          place   goal = the cube at rest ON B (surface_z + cube/2)
+
+        Feeding the snatch policy B's goal 2m away puts those 3 dims far outside its
+        training distribution -- measured: grasp collapses to 0.1%. Phases 1/2 already
+        read the env target, which _reset_target and the handoff below keep correct."""
+        op = getattr(base, "_obj_p", None)
+        bp = getattr(base, "_base_p", None)
+        if op is None or bp is None:
+            return o
+        g = torch.empty_like(bp)
+        g[:, :2] = op[:, :2]                      # hover point over the CUBE
+        g[:, 2] = cfg.surface_z + 0.25
+        o = o.clone()
+        # Isaac Lab 2.3.2 hands back a TensorDict keyed "policy"; older versions a tensor.
+        td = hasattr(o, "keys") and "policy" in o.keys()
+        t = o["policy"] if td else o
+        t = t.clone()
+        t[:, -3:] = torch.where((ph == 0).unsqueeze(-1), g - bp, t[:, -3:])
+        if td:
+            o["policy"] = t
+            return o
+        return t
+
+    obs = _obs(env.get_observations())
     for _ in range(args.steps):
         with torch.inference_mode():
-            acts = torch.stack([p(obs) for p in policies], dim=0)     # (3,N,5)
+            obs_p = _retarget_obs(obs, phase)
+            acts = torch.stack([p(obs_p) for p in policies], dim=0)   # (3,N,5)
         act = acts.gather(0, phase.view(1, n, 1).expand(1, n, acts.shape[-1]))[0]
-        obs, _, dones, _ = env.step(act)
+        # The carry policy NEVER controlled its own grip: it was trained with --grip_closed,
+        # so a[4] was overridden to +1 every step and its 5th output head is untrained noise.
+        # Let that noise through here and the cage can pop open mid-haul and drop the cube.
+        # Weld it shut for exactly the phase that was trained that way.
+        act = torch.where((phase == 1).unsqueeze(-1),
+                          torch.cat([act[:, :4], torch.ones_like(act[:, 4:5])], dim=-1), act)
+        obs, dones = _step(act)
 
         held = base._held
         hold_run = torch.where(held, hold_run + 1, torch.zeros_like(hold_run))
@@ -135,13 +190,17 @@ def main():
         to_place = (phase == 1) & base._arrived
         phase = torch.where(to_carry, torch.ones_like(phase), phase)
         phase = torch.where(to_place, torch.full_like(phase, 2), phase)
+        if bool(to_place.any()):
+            # Hand the place policy the goal IT was trained on: the cube at rest ON B,
+            # not the carry policy's hover point 25cm above it.
+            base._target[to_place, 2] = cfg.surface_z + 0.5 * cfg.cube_size
 
         ep_grasped |= held
         ep_arrived |= base._arrived
         ep_deposited |= base._deposited
 
         if bool(dones.any()):
-            d = dones.bool()
+            d = dones
             tot["eps"] += int(d.sum().item())
             tot["grasp"] += int((ep_grasped & d).sum().item())
             tot["arrive"] += int((ep_arrived & d).sum().item())

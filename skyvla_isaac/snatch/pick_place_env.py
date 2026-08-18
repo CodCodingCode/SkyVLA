@@ -136,6 +136,13 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     place_settle_v: float = 0.10         # cube speed (m/s) below which it counts settled
     release_only: bool = False           # place stage: pay for the deposit, not the hold
     arrive_radius: float = 0.30          # nav stage: "over B" gate (XY, cube still held)
+    # WELDED GRIP (carry stage): force a[4] = +1 every step, so the cage is commanded shut
+    # for the whole ride and the policy effectively controls only [vx vy vz yaw_rate]. The
+    # action vector stays 5-wide so warm starts and the 3-policy runner still load; the 5th
+    # element is simply overridden. Pair with carry_demo_p = 1.0 -- with the jaws welded
+    # shut a drone that spawns away from the cube can never scoop it, so every env must
+    # start already holding. That turns the carry stage into pure transport.
+    grip_closed: bool = False
 
     # --- PLACE-ONLY stage (OPT-IN): gentle deposit from an already-holding start ---
     # Every episode starts with the cube ALREADY seated in the closed cage, airborne
@@ -147,8 +154,27 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
     place_spawn_r: float = 0.8           # spawn disc radius around B's centre (XY, m)
     place_spawn_h_lo: float = 0.55       # spawn BODY altitude band (m). At the seat pose the
     place_spawn_h_hi: float = 0.85       # body is 0.395 -> this is 0.16-0.46 m of descent
+    # COMPETENCE-GATED START RAMP. The end distribution is exactly the one above; this only
+    # controls how fast we get there. At difficulty 0 the drone spawns dead over B with a
+    # 5.5cm descent (a near-trivial deposit); the radius and altitude expand to the full
+    # spec only as the deposit rate holds up. Per-env difficulty is U[0,p] with a frontier
+    # bias, so easy starts are RETAINED at every stage -- the repo's proven pattern (a
+    # time-based anneal caused catastrophic forgetting here before; a competence gate did
+    # not). Set place_curriculum False to train the full distribution from step one.
+    place_curriculum: bool = True
+    place_h_easy: float = 0.45           # body altitude at difficulty 0
+    place_curr_thresh: float = 0.25      # deposit-rate EMA needed to expand one step
+    place_curr_step: float = 0.10        # difficulty increment per expansion
+    place_curr_dwell: int = 3000         # env-steps to hold after an expansion (PPO re-settle)
+    place_curr_ema: float = 0.99
+    place_curr_start: float = 0.0        # resume point (set on crash-restart)
     gentle_v: float = 0.15               # safe descent speed inside place_taper_h of the seat
-    place_taper_h: float = 0.10          # height over the seat where the speed cap tapers in
+    place_taper_h: float = 0.10          # within this of the seat, the cap IS gentle_v
+    place_taper_ramp: float = 0.30       # above place_taper_h, the cap ramps back to `speed`
+                                         # over this height -> full cruise 40cm out, 0.15 m/s
+                                         # for the last 10cm. (Scaling the cap by seat_err
+                                         # directly instead only hit gentle_v in the last CM:
+                                         # the descent entered the last 10cm still at 1.5 m/s.)
     # CAGE GEOMETRY (drone_snatch.urdf, base frame; tip = base - 0.07):
     #   wall spans tip+-0.025 ; inward lip spans tip-0.025 .. tip-0.017
     # so a shelf-seated cube's BOTTOM is lip_h above the cage's lowest point. The lips
@@ -160,6 +186,16 @@ class DroneSnatchEnvCfg(DirectRLEnvCfg):
                                          # success requires this: without it the policy scores
                                          # by lowering the cube to rest height and never
                                          # letting go (_held is already False once it rests).
+    # RELEASE LATCH (place_only): hold the jaws open for this many policy steps once the
+    # policy commands open. MEASURED: from the seated pose a forced a4=-1 takes exactly THREE
+    # consecutive steps to clear release_jaw (jaw 28.99 -> 24.39 -> 9.59 mm). PPO explores with
+    # per-step INDEPENDENT Gaussian noise, so the probability of the required 3-in-a-row is
+    # p^3 = 2.6e-7 -> 0.21 discoveries per iteration across all 2048 envs, which is exactly the
+    # trickle observed (deposit_rate below display resolution for 182 iterations). The latch
+    # turns a 3-step motor program into a 1-step DECISION: p^3 -> p, ~5200 discoveries per
+    # iteration. This is also the honest model of a real gripper, whose release is a commanded
+    # sequence and not a per-20ms re-vote.  0 disables.
+    release_latch: int = 4
 
     # flight + task params
     speed: float = 1.5                   # proven value; eases precise bodily descent-grasp
@@ -347,6 +383,8 @@ class DroneSnatchEnv(DirectRLEnv):
         self._mass = self.robot.root_physx_view.get_masses().sum(-1).to(self.device)
         self._target = torch.zeros(self.num_envs, 3, device=self.device)
         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
+        self._raw_actions = torch.zeros_like(self._actions)   # pre-clamp; see _pre_physics_step
+        self._rel_latch = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         z = lambda: torch.zeros(self.num_envs, device=self.device)  # noqa: E731
         self._prev_d_goal = z()
         self._held = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -365,6 +403,15 @@ class DroneSnatchEnv(DirectRLEnv):
         # (so the held->released transition can be priced on the exact action that let go).
         self._impact_v = z()
         self._prev_seated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cube_lost = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cube_on_floor = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._holding = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._prev_d_b = z()                 # baseline for the scale-free progress term
+        # place start-ramp controller state
+        self._place_p = float(self.cfg.place_curr_start)
+        self._place_ema = 0.0
+        self._place_ema_init = False
+        self._last_place_change = 0
         self._sep = float(self.cfg.plat_sep)
         self._sep_ema = 0.0
         self._sep_ema_init = False
@@ -451,7 +498,19 @@ class DroneSnatchEnv(DirectRLEnv):
 
     # ------------------------------------------------------------------ #
     def _pre_physics_step(self, actions: torch.Tensor):
+        # KEEP THE UNCLAMPED ACTION. The clamp below is behaviour-preserving but
+        # gradient-DESTROYING: every a4 above +1 drives the identical jaw target, so the actor's
+        # grip mean can drift arbitrarily far out of range with nothing pushing back. Measured on
+        # model_10900: grip mean +2.108 (sigma 0.282), i.e. the action that first moves the jaw is
+        # 5.15 sigma away and a full release is 8.17 sigma -- the release was not "hard to
+        # explore", it was outside the support of the policy. _place_reward taxes the overshoot.
+        self._raw_actions = actions
         self._actions = actions.clamp(-1.0, 1.0)
+        if self.cfg.grip_closed:
+            # Weld the cage shut: whatever the actor emits on a[4] is discarded and the
+            # jaws are driven fully closed every step. The policy is left with flight only.
+            self._actions = self._actions.clone()
+            self._actions[:, 4] = 1.0
         self._train_steps = getattr(self, "_train_steps", 0) + 1
 
     def _apply_action(self):
@@ -499,6 +558,15 @@ class DroneSnatchEnv(DirectRLEnv):
             force.unsqueeze(1), torque.unsqueeze(1), body_ids=self._base_i)
         # gripper: all 4 cage jaws driven by the single gripper action
         jaw = (a[:, 4] * 0.5 + 0.5) * self.cfg.grip_travel
+        if self.cfg.place_only and self.cfg.release_latch > 0:
+            # commit to an open command for release_latch steps (see cfg.release_latch): the
+            # jaw needs 3 consecutive steps of travel to free the cube and per-step Gaussian
+            # exploration effectively never strings 3 together.
+            asks_open = jaw < self.cfg.release_jaw
+            self._rel_latch = torch.where(
+                asks_open, torch.full_like(self._rel_latch, self.cfg.release_latch),
+                (self._rel_latch - 1).clamp(min=0))
+            jaw = torch.where(self._rel_latch > 0, torch.zeros_like(jaw), jaw)
         tgt = jaw.unsqueeze(-1).repeat(1, len(self._grip_i))
         self.robot.set_joint_position_target(tgt, joint_ids=self._grip_i)
         # GRASP LATCH: rigidly carry the caged cube with the gripper (no slide/fall while moving)
@@ -585,6 +653,13 @@ class DroneSnatchEnv(DirectRLEnv):
             v_obj = torch.norm(self.object.data.root_lin_vel_w, dim=-1)
             jaw_pos = self.robot.data.joint_pos[:, self._grip_i].mean(-1)
             self._released = jaw_pos < self.cfg.release_jaw     # lip aperture > cube -> free
+            # HOLDING = "the cube is in the cage", which for the place stage CANNOT be _held:
+            # _held requires the cube above surface_z + cube/2 + grasp_clear = 0.385, but the
+            # seat pose puts it at 0.333, so _held goes false for the last 5cm of the descent.
+            # Gating the approach/lower/seat/release terms on _held paid the policy to hover
+            # 5cm short of the pad and made `seated` unreachable by construction. Judged
+            # geometrically instead: cube at the cage tip, jaws not yet open.
+            self._holding = (self._d_reach < 0.05) & (~self._released)
             self._deposited = ((d_b < self.cfg.place_radius)
                                & ((obj_p[:, 2] - rest_z).abs() < 0.5 * self.cfg.cube_size)
                                & (v_obj < self.cfg.place_settle_v)
@@ -625,6 +700,23 @@ class DroneSnatchEnv(DirectRLEnv):
             # (place_only NEEDS this: the deposit pose sits 9.5cm over the pad, so a
             # hard crash-end on pad contact would terminate every good set-down attempt.)
             self._crashed = out_of_bounds
+        if self.cfg.place_only:
+            # A cube out of the cage and AT REST that is not a valid deposit has decided the
+            # episode: this policy starts holding and never learns to re-grasp. END it rather
+            # than bleed per-step for the remaining seconds -- with a bleed, flying out of
+            # bounds to stop the bleeding outscores loitering (terminations aren't
+            # value-bootstrapped) and PPO finds that exploit. Priced as a one-time fine in
+            # _place_reward instead.
+            # Testing "below pad height" is NOT enough: the pads are 1x1 m, so a cube dropped
+            # onto B off-centre stays above surface_z -> no termination, no deposit, and the
+            # measured result was a -1/step bleed for ~225 steps (holding_frac 0.73 -> 0.17,
+            # mean reward -310). "At rest and not deposited" covers both cases.
+            self._cube_on_floor = self._obj_p[:, 2] < self.cfg.surface_z
+            self._cube_lost = ((~self._holding) & (v_obj < self.cfg.place_settle_v)
+                               & (~self._deposited))
+            self._crashed = self._crashed | self._cube_lost
+            if self.cfg.place_curriculum:
+                self._update_place_curr()
         else:
             self._crashed = self._table_touch | out_of_bounds
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -672,13 +764,15 @@ class DroneSnatchEnv(DirectRLEnv):
             # even reaching the set-down pose. deposit_rate above is the headline.
             rest_z = self.cfg.surface_z + 0.5 * self.cfg.cube_size
             seat_err = (self._obj_p[:, 2] - (rest_z + self.cfg.lip_h)).abs()
-            seated = self._held & (self._d_plat_b < self.cfg.place_radius) & (seat_err < 0.012)
+            seated = self._holding & (self._d_plat_b < self.cfg.place_radius) & (seat_err < 0.012)
             dep = self._deposited
             n_dep = dep.float().sum().clamp(min=1.0)
             self.extras["log"].update({
+                "place/holding_frac": self._holding.float().mean(),
                 "place/seated_frac": seated.float().mean(),
                 "place/impact_v": (self._impact_v * dep.float()).sum() / n_dep,
                 "place/landing_err_cm": (self._d_plat_b * dep.float()).sum() / n_dep * 100.0,
+                "place/difficulty": torch.tensor(self._place_p, device=self.device),
             })
         if self.cfg.staged_curriculum:
             dev = self.device
@@ -834,6 +928,25 @@ class DroneSnatchEnv(DirectRLEnv):
             print(f"[revcurr] difficulty={self._rc_p:.2f} grasp_ema={self._rc_grasp_ema:.2f} "
                   f"step={step}", flush=True)
 
+    def _update_place_curr(self):
+        """Place start-ramp controller. Expands the spawn disc + altitude band toward the
+        full spec only once the deposit rate holds at the current spread. Self-pacing: if an
+        expansion drops the deposit rate below the gate, it stalls until it recovers."""
+        d = self._deposited.float().mean().item()
+        a = self.cfg.place_curr_ema
+        if not self._place_ema_init:
+            self._place_ema, self._place_ema_init = d, True
+        else:
+            self._place_ema = a * self._place_ema + (1.0 - a) * d
+        step = getattr(self, "_train_steps", 0)
+        if step - self._last_place_change < self.cfg.place_curr_dwell:
+            return
+        if self._place_p < 1.0 and self._place_ema >= self.cfg.place_curr_thresh:
+            self._place_p = min(1.0, self._place_p + self.cfg.place_curr_step)
+            self._last_place_change = step
+            print(f"[place] difficulty={self._place_p:.2f} -> spawn r<={self._place_p*self.cfg.place_spawn_r:.2f}m "
+                  f"deposit_ema={self._place_ema:.2f} step={step}", flush=True)
+
     def _update_sep(self):
         """A->B separation curriculum. Expands the transport gap once the stage's own
         success (arrival for nav, deposit for place) holds up at the current distance."""
@@ -848,10 +961,18 @@ class DroneSnatchEnv(DirectRLEnv):
         if step - self._last_sep_change < self.cfg.plat_sep_dwell:
             return
         if self._sep_ema >= self.cfg.plat_sep_thresh and self._sep < self.cfg.plat_sep_max:
-            self._sep = min(self.cfg.plat_sep_max, self._sep + self.cfg.plat_sep_step)
+            # PROPORTIONAL step: a fixed 0.25m increment needs 34 gates to walk 1.5 -> 10m,
+            # and each gate costs a dwell plus re-earning the success EMA. Scaling with the
+            # current gap keeps the *relative* jump constant (~15%), so the ladder reads
+            # 1.5 -> 1.75 ... -> 5.0 (+0.75) -> ... -> 10.0 (+1.5): small where the policy is
+            # fragile, larger once long-haul flight is already working.
+            inc = max(self.cfg.plat_sep_step, 0.15 * self._sep)
+            earned = self._sep_ema
+            self._sep = min(self.cfg.plat_sep_max, self._sep + inc)
             self._last_sep_change = step
-            print(f"[plat_sep] -> {self._sep:.2f} m  success_ema={self._sep_ema:.2f} "
-                  f"step={step}", flush=True)
+            self._sep_ema = 0.0          # re-earn the gate at the new distance
+            print(f"[plat_sep] -> {self._sep:.2f} m (+{inc:.2f})  "
+                  f"earned_ema={earned:.2f} step={step}", flush=True)
 
     def _get_rewards(self) -> torch.Tensor:
         # bottom-cam centering proxy: horizontal tip-block offset -> pixels (~320 half-width)
@@ -894,6 +1015,16 @@ class DroneSnatchEnv(DirectRLEnv):
             # = 7.5 for merely holding the cube high, which was the local optimum the
             # policy found. 2.4x lifts carry_prog's weight 25 -> 60 for transport runs.
             carry_prog = carry_prog * 2.4
+            if not (self.cfg.release_only or self.cfg.place_only):
+                # STOP PAYING FOR MERELY HOLDING (carry stage). The raw potential above is
+                # worth 40*(1-tanh(1.0)) = 9.5/step at the spawn separation -- ~5,700 over a
+                # 600-step episode for standing still, against ~90 for completing the haul
+                # (carry_prog telescopes to 60*sep). The policy correctly learned to hover:
+                # arrive_rate rose to 4.7% then DECAYED to 0.9% over 1000 iterations while
+                # mean reward climbed. Subtracting the spawn-distance baseline makes holding
+                # at the start worth exactly 0, and only closing distance pays.
+                p_base = 1.0 - math.tanh(max(self._sep, 1e-6) / d_scale)
+                place = ((place - held * p_base) / max(1.0 - p_base, 1e-6)).clamp(min=0.0)
             success = self._success.float()
             over_b = 1.0 - torch.tanh(self._d_plat_b / 0.15)
             if self.cfg.release_only:
@@ -910,7 +1041,7 @@ class DroneSnatchEnv(DirectRLEnv):
         self._prev_d_goal = self._d_goal.clone()
 
         if self.cfg.place_only:
-            return self._place_reward(held, grip_cmd)
+            return self._place_reward()
 
         if self.cfg.staged_curriculum:
             # Stage 0: hover over cube (reach+align). Stage 1: + DENSE descent reward
@@ -1128,7 +1259,7 @@ class DroneSnatchEnv(DirectRLEnv):
         return r
 
     # ------------------------------------------------------------------ #
-    def _place_reward(self, held: torch.Tensor, grip_cmd: torch.Tensor) -> torch.Tensor:
+    def _place_reward(self) -> torch.Tensor:
         """PLACE stage: gentle deposit onto platform B from an already-holding start.
 
         Deliberately does NOT reuse the stage>=1/2 pile. That reward pays an exponential
@@ -1154,19 +1285,35 @@ class DroneSnatchEnv(DirectRLEnv):
         vz_d = self.robot.data.root_lin_vel_w[:, 2]
         hspeed = torch.norm(self.robot.data.root_lin_vel_w[:, :2], dim=-1)
         v_cube = torch.norm(self.object.data.root_lin_vel_w, dim=-1)
-        held_f = held
-        # 1. CENTRE OVER B -- coarse (0.4m) covers the whole 0.8m spawn disc, fine (0.15m)
-        #    sharpens the last few cm so the landing lands mid-pad, not on the lip.
-        r = 6.0 * held_f * (1.0 - torch.tanh(d_b / 0.4))
-        over_b = 1.0 - torch.tanh(d_b / 0.15)
-        r = r + 4.0 * held_f * over_b
-        # 2. LOWER -- pays only while centred over B, so it cannot be farmed over the floor
-        #    or over pad A. Zero at the reachable seat pose.
-        r = r + 12.0 * held_f * over_b * (1.0 - torch.tanh(seat_err / 0.15))
+        held_f = self._holding.float()          # see _get_dones: geometric, NOT _held
+        # 1. GET TO B. A tanh potential alone does NOT work here: at a 0.4m scale its
+        #    gradient is ~0.05 per metre by the time the drone is 0.9m out, and the measured
+        #    result was a policy that drifted to 0.9m and simply stayed in that flat region
+        #    (obj_to_goal 0.73 -> 0.99, deposit 0). So the long-range work is done by a
+        #    SCALE-FREE per-step progress difference -- the same term that is the only reason
+        #    the carry stage has gradient across metres (see the two_platform block above).
+        #    Telescoping: closing then re-opening the same distance nets zero, so it cannot
+        #    be farmed by orbiting.
+        prog_b = held_f * (self._prev_d_b - d_b)
+        r = 30.0 * prog_b
+        self._prev_d_b = d_b.clone()
+        #    REPRICED: at the spawn distribution the curriculum actually runs (difficulty 0 =
+        #    dead over B), d_b is ~0 from step one, so these two paid a flat 10/step for merely
+        #    existing over the pad -- 22% of the hover income, earned for nothing. They exist
+        #    for the expanded disc, so they stay, but they must not bankroll a parked drone.
+        r = r + 2.0 * held_f * (1.0 - torch.tanh(d_b / 1.0))    # broad basin, gradient to ~2m
+        over_b = 1.0 - torch.tanh(d_b / 0.15)                   # fine centring at the pad
+        r = r + 2.0 * held_f * over_b
+        # 2. LOWER -- gated on being near B (0.25m scale, matched to place_radius 0.20) so it
+        #    cannot be farmed over the floor or over pad A, but is not so tight that a drone
+        #    20cm out gets no descent signal at all. Zero at the reachable seat pose.
+        lower_gate = 1.0 - torch.tanh(d_b / 0.25)
+        r = r + 12.0 * held_f * lower_gate * (1.0 - torch.tanh(seat_err / 0.15))
         # 3. GENTLE DESCENT PROFILE (the user's bar): the safe descent speed tapers from
         #    `speed` far out down to gentle_v within place_taper_h of the seat. Only EXCESS
         #    speed is taxed -- descending slower, or stopping dead, is never penalized.
-        vz_safe = torch.clamp(seat_err * (cfg.speed / max(cfg.place_taper_h, 1e-3)),
+        taper_k = (cfg.speed - cfg.gentle_v) / max(cfg.place_taper_ramp, 1e-3)
+        vz_safe = torch.clamp(cfg.gentle_v + (seat_err - cfg.place_taper_h) * taper_k,
                               cfg.gentle_v, cfg.speed)
         r = r - 10.0 * held_f * torch.clamp(-vz_d - vz_safe, min=0.0)
         #    same idea laterally: don't arrive at the pad sideways at cruise speed
@@ -1178,43 +1325,94 @@ class DroneSnatchEnv(DirectRLEnv):
         r = r - 2.0 * held_f * torch.clamp(vz_d, min=0.0)
         # 5. SEATED: cube centred over B and at the reachable seat height, still gripped.
         seated = held_f * over_b * (seat_err < 0.012).float()
-        r = r + 15.0 * seated
+        #    REPRICED 15->6 / 8->3. Being seated is a WAYPOINT, not the job. At 23/step it was
+        #    the largest single block of income available, it is collectable indefinitely (the
+        #    episode never ends while holding), and the measured result was seated_frac 0.992 /
+        #    holding_frac 1.000 / episode length 399.00 / deposit_rate 0.0000 for 644 straight
+        #    iterations. Keep it positive -- a bleed here makes fleeing the arena outscore
+        #    loitering (see term 9) -- but small enough that term 6 dominates it.
+        r = r + 6.0 * seated
         #    hold still once seated (this is what makes the release itself soft)
-        r = r + 8.0 * seated * (1.0 - torch.tanh(vz_d.abs() / 0.10))
-        # 6. RELEASE: open the jaws, but ONLY while seated. release_jaw is where the lip
-        #    aperture clears the cube, so the gradient runs all the way to a real letting-go:
-        #    `openness` is 0 at a full squeeze and 1 once the jaws are commanded past the
-        #    point where the cube can physically fall through.
-        closed = torch.clamp((cfg.grip_travel * grip_cmd - cfg.release_jaw)
-                             / max(cfg.grip_travel - cfg.release_jaw, 1e-3), 0.0, 1.0)
-        openness = 1.0 - closed
-        r = r + 40.0 * seated * openness
+        r = r + 3.0 * seated * (1.0 - torch.tanh(vz_d.abs() / 0.10))
+        #    and specifically STOP DESCENDING once seated: continuing to push down presses
+        #    the lips onto the pad, and the contact friction locks the jaw joints so the cube
+        #    can never be released (measured: 61% of scripted set-downs failed exactly here)
+        r = r - 6.0 * seated * torch.clamp(-vz_d, min=0.0)
+        # 6. RELEASE: open the jaws, but ONLY while seated. Scored on the MEASURED jaw
+        #    position, never the command -- if the drone keeps pressing the lips into the pad
+        #    the contact friction locks the prismatic joints, and a command-scored version
+        #    pays full price for an "open" that never happens (verified: the cube stays
+        #    sitting on the lips 5-13mm up, 61% of scripted attempts). ~0 at the 0.026 hold
+        #    pose, 1 once the lip aperture actually clears the cube.
+        #    SCALE 0.004 -> 0.012 (the load-bearing fix). The held pose sits at jaw ~0.026 and
+        #    release_jaw is 0.014 -- a 12mm gap read through a 4mm tanh is THREE scale-lengths,
+        #    so openness at the held pose was 1-tanh(3.0) = 0.005 and this whole term paid
+        #    0.2/step against ~45/step for staying shut. Flat, not just small: the gradient
+        #    only appeared below jaw 0.022, which is a ~3 sigma move on a4 at action_std 0.25,
+        #    sustained for several steps while the joint travels. Exploration never got there
+        #    (30 accidental deposits in 1650 iterations, none after 10048). At 0.012 the held
+        #    pose reads 1-tanh(1.0) = 0.238 and the ramp is monotone all the way to release.
+        jaw_now = self.robot.data.joint_pos[:, self._grip_i].mean(-1)
+        openness = 1.0 - torch.tanh(torch.clamp(jaw_now - cfg.release_jaw, min=0.0) / 0.012)
+        #    60 (was 40): starting to open must beat the entire seated block on the FIRST step
+        #    of the move, or the policy re-derives the hover. 60*0.238 = 14.3/step at the held
+        #    pose vs 9/step for seated+still.
+        r = r + 60.0 * seated * openness
         #    releasing anywhere else drops the cube from height / off the pad
         early_open = held_f * openness * (seat_err > 0.03).float()
         r = r - 12.0 * early_open
         # 7. DEPOSITED: persistent income, and it must beat everything available while
         #    holding (peak hold income ~35/step) or the policy just hovers over B forever.
         dep = self._deposited.float()
-        r = r + 120.0 * dep
+        #    GENTLENESS IS MOST OF THE INCOME, NOT A BONUS ON TOP. Previously this paid a flat
+        #    120 plus a 60 gentleness bonus on a 0.30 tanh -- and the 0.30 scale saturates by
+        #    ~1.0 m/s, so at the 1.37 m/s the policy actually converged to it paid 0.25 of 60
+        #    with a gradient of -1.7 per m/s. Flat, i.e. invisible: exactly the failure the 4mm
+        #    `openness` scale had. FILMED RESULT of that combination: the policy opens the jaws
+        #    on step ONE from 35cm up and lets the cube's inherited horizontal velocity carry it
+        #    into the 20cm ring -- 61/64 episodes "deposit" by THROWING (videos/place_deposit.mp4).
+        #    Scale 0.30 -> 1.2 puts real gradient at the speeds it flies at, and moving 50 of the
+        #    flat 120 into the gentleness-scaled term makes a throw earn ~109/step against ~240
+        #    for a set-down instead of 133 against 240.
+        r = r + 70.0 * dep
         r = r + 60.0 * dep * (1.0 - torch.tanh(d_b / 0.10))     # land it mid-pad
+        r = r + 110.0 * dep * (1.0 - torch.tanh(
+            torch.clamp(self._impact_v - (cfg.gentle_v + 0.30), min=0.0) / 1.2))
         # 8. RELEASE HEIGHT: pay for letting go from as low as the lips allow (floor lip_h).
         #    Measured at the transition so it prices the action, not the aftermath.
-        just_let_go = (self._prev_seated & self._released & (~self._held)).float()
-        r = r + 25.0 * just_let_go * (1.0 - torch.tanh((drop_h - cfg.lip_h).clamp(min=0.0) / 0.01))
+        just_let_go = (self._prev_seated & self._released & (~self._holding)).float()
+        #    Scale 0.01 -> 0.05: a 1cm scale reads every real release height as identical zero
+        #    (the filmed take let go at 34.7cm, i.e. 27 scale-lengths out), so it priced nothing.
+        r = r + 25.0 * just_let_go * (1.0 - torch.tanh((drop_h - cfg.lip_h).clamp(min=0.0) / 0.05))
         r = r - 20.0 * just_let_go * torch.clamp(-vz_d - 0.10, min=0.0)   # no downward throw
         self._prev_seated = (seated > 0.5)
-        # 9. PENALTIES. A loose cube that is neither resting on B nor being carried is
-        #    either falling or has been knocked off; any post-release motion is a bounce.
-        loose = ((~self._held) & (~self._deposited)).float()
-        r = r - 20.0 * loose * ((d_b > cfg.place_radius).float())
-        r = r - 15.0 * (1.0 - held_f) * torch.clamp(v_cube - cfg.place_settle_v, min=0.0)
+        # 9. PENALTIES -- priced as EVENTS, not as an ongoing bleed. Every terminal case ends
+        #    the episode the same step, so none can be gamed by ending it early: a botched
+        #    set-down costs 10-30, fleeing the arena costs 50, and simply holding position
+        #    pays ~+18/step, so quitting is never the better option.
+        #    Graded fine: landing on the pad but outside place_radius is a near-miss (10);
+        #    putting the cube on the floor is a real failure (30).
+        r = r - (10.0 + 20.0 * self._cube_on_floor.float()) * self._cube_lost.float()
+        r = r - 50.0 * (self._crashed & (~self._cube_lost)).float()
+        #    bounce/knock: any cube motion once it is out of the cage, capped so a hard
+        #    landing is a bounded fine rather than a reason to end the episode
+        r = r - 15.0 * (1.0 - held_f) * torch.clamp(v_cube - cfg.place_settle_v, 0.0, 1.0)
+        #    small standing pressure to not just sit there having dropped it near the pad
+        r = r - 1.0 * ((~self._holding) & (~self._deposited)).float()
         r = r - cfg.table_touch_pen * self._table_touch.float()
+        # 10. SATURATION TAX on the grip channel. Nothing else in this reward can see an action
+        #     of +2.1 -- the clamp makes it identical to +1.0 -- so the actor's grip mean has no
+        #     force returning it to the usable range and it ran to 5 sigma past the jaw-moving
+        #     threshold. Priced on the RAW action so the gradient exists, and only on the
+        #     overshoot so behaviour inside [-1,1] is untouched.
+        r = r - 1.0 * torch.clamp(self._raw_actions[:, 4].abs() - 1.0, min=0.0)
         return r - 0.01
 
     # ------------------------------------------------------------------ #
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
         n = len(env_ids)
+        self._rel_latch[env_ids] = 0          # a new episode starts with the jaws under policy control
         origins = self.scene.env_origins[env_ids]
         # cube on the floor within obj_spawn_diam of origin
         obj = self.object.data.default_root_state[env_ids].clone()
@@ -1314,13 +1512,21 @@ class DroneSnatchEnv(DirectRLEnv):
                     # random bearing, body altitude in [h_lo, h_hi] -> every episode starts
                     # with a real approach + descent onto B from a random direction. This is
                     # a superset of "dead over B", so the pure vertical set-down is retained.
+                    # per-env difficulty, frontier-biased (sqrt) so most episodes practise
+                    # near the current frontier while easy ones are still sampled
+                    dd = torch.ones(n, device=self.device)
+                    if self.cfg.place_curriculum:
+                        dd = self._place_p * torch.sqrt(torch.rand(n, device=self.device))
                     ang_s = torch.rand(n, device=self.device) * 2.0 * math.pi
-                    rad_s = self.cfg.place_spawn_r * torch.sqrt(torch.rand(n, device=self.device))
+                    rad_s = (dd * self.cfg.place_spawn_r
+                             * torch.sqrt(torch.rand(n, device=self.device)))
+                    z_full = (self.cfg.place_spawn_h_lo
+                              + (self.cfg.place_spawn_h_hi - self.cfg.place_spawn_h_lo)
+                              * torch.rand(n, device=self.device))
+                    z_s = self.cfg.place_h_easy + dd * (z_full - self.cfg.place_h_easy)
                     root[carry, 0] = (b_xy[:, 0] + rad_s * torch.cos(ang_s))[carry]
                     root[carry, 1] = (b_xy[:, 1] + rad_s * torch.sin(ang_s))[carry]
-                    root[carry, 2] = (self.cfg.place_spawn_h_lo
-                                      + (self.cfg.place_spawn_h_hi - self.cfg.place_spawn_h_lo)
-                                      * torch.rand(n, device=self.device))[carry]
+                    root[carry, 2] = z_s[carry]
                 else:
                     root[carry, 0] = obj_local[carry, 0]
                     root[carry, 1] = obj_local[carry, 1]
@@ -1352,7 +1558,16 @@ class DroneSnatchEnv(DirectRLEnv):
             # spawns the drone relative to it, so it has to exist before the spawn).
             t = torch.zeros(n, 3, device=self.device)
             t[:, :2] = b_xy
-            t[:, 2] = self.cfg.surface_z + 0.5 * self.cfg.cube_size
+            if self.cfg.release_only or self.cfg.place_only:
+                # DEPOSIT stages: the goal IS the cube at rest on B's top.
+                t[:, 2] = self.cfg.surface_z + 0.5 * self.cfg.cube_size
+            else:
+                # CARRY stage: a hover point ABOVE B, not the resting height. At resting
+                # height the goal pulled the cube DOWN to 0.325 while carry_up paid to lift
+                # it UP to 0.635 -- two terms fighting over 31cm of altitude that _arrived
+                # does not even score (it is XY-only). Same 0.25m standoff the original
+                # single-platform goal used. Descending onto B is the PLACE stage's job.
+                t[:, 2] = self.cfg.surface_z + 0.25
         else:
             # goal drop-zone near the cube, at carry height
             t = torch.zeros(n, 3, device=self.device)
@@ -1373,4 +1588,7 @@ class DroneSnatchEnv(DirectRLEnv):
         self._released[env_ids] = False
         self._impact_v[env_ids] = 0.0
         self._prev_seated[env_ids] = False
+        if self.cfg.two_platform:
+            # progress baseline = the spawn distance, so step 1 doesn't bank a phantom gain
+            self._prev_d_b[env_ids] = torch.norm(obj[:, :2] - (origins[:, :2] + b_xy), dim=-1)
         self._latched[env_ids] = False

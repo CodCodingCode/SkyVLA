@@ -1,0 +1,12 @@
+[plat_sep] -> 1.75 m (+0.25)  earned_ema=0.55 step=174369
+[plat_sep] -> 2.01 m (+0.26)  earned_ema=0.57 step=177369
+[plat_sep] -> 2.31 m (+0.30)  earned_ema=0.55 step=192903
+[plat_sep] -> 2.66 m (+0.35)  earned_ema=0.55 step=235756
+[plat_sep] -> 3.06 m (+0.40)  earned_ema=0.55 step=276378
+[plat_sep] -> 3.52 m (+0.46)  earned_ema=0.55 step=305259
+[plat_sep] -> 4.05 m (+0.53)  earned_ema=0.55 step=349053
+[plat_sep] -> 4.66 m (+0.61)  earned_ema=0.55 step=370757
+[plat_sep] -> 5.35 m (+0.70)  earned_ema=0.55 step=397788
+[plat_sep] -> 6.16 m (+0.80)  earned_ema=0.55 step=429386
+[plat_sep] -> 7.08 m (+0.92)  earned_ema=0.55 step=492260
+[plat_sep] -> 8.14 m (+1.06)  earned_ema=0.55 step=546609

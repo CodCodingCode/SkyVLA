@@ -7,12 +7,21 @@ the `*.pt` rule); trimmed logs are the `*.log.gz` files beside this README.
 | checkpoint | run | ended at | headline metric |
 |---|---|---|---|
 | `carry_8m_model_22800.pt` | `drone_snatch_carry_v3` | iter 22,800 | arrive 31%* at **8.14 m**, grasp 99.9% |
-| `place_best_v4_model_21950.pt` | `drone_snatch_place_only_v4` | iter 21,950 | **deposit 90.2%** (peak 92.7%) |
-| `place_latest_v5_model_12500.pt` | `drone_snatch_place_only_v5` | iter 12,500 | deposit 42.8% (peak 57.5%) |
+| `place_deposit_throw_21950.pt` | `drone_snatch_place_only_v4` | iter 21,950 | **deposit 90.2%** (peak 92.7%) |
 
-**Use v4 for placing, not v5.** v5 is the more recent run but a clear regression —
-it never got past 57.5% deposit where v4 was sitting at ~90%. It is kept only so the
-attempt is not lost.
+Only the best checkpoint of each stage is kept. Two were deleted:
+
+- **`place_latest_v5_model_12500.pt`** — `place_only_v5` was the more recent place run
+  but a clear regression, never clearing 57.5% deposit where v4 sat at ~90%. Its log
+  survives in `place_v5_tail.log.gz` if you want to see what the attempt did.
+- **`place_deposit_throw_21950.pt`** — byte-identical duplicate of
+  `place_deposit_throw_21950.pt` (same md5). One copy is enough.
+
+`carry_transport_21350.pt` is a genuinely different, earlier carry snapshot, so it stays.
+
+Caveat on the surviving place policy: 90% deposit comes with `impact_v` 1.35 m/s and
+`landing_err` 10.4 cm — it drops the cube rather than setting it down, which is what the
+`throw` in its name records. The deposit succeeds; it is not gentle.
 
 \* the carry run was mid-rung when stopped: it had cleared the 55% gate to reach
 8.14 m and was re-earning it at the new distance (it stalled ~46%, then slid to 31%).

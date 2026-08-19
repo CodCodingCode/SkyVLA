@@ -42,6 +42,9 @@ parser.add_argument("--side_spawn", type=float, default=5.0)
 parser.add_argument("--hold_steps", type=int, default=10,
                     help="consecutive steps of _held before handing off to the carry policy")
 parser.add_argument("--no_cams", action="store_true")
+parser.add_argument("--trace_out", type=str, default=None,
+                    help="record drone/cube/phase per step to this .npz for offline plotting "
+                         "(RTX video is unavailable on hosts without Vulkan)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -111,11 +114,39 @@ def main():
     base = env.unwrapped
     dev = base.device
 
+    def _with_norm(pol, ckpt):
+        """Re-apply the checkpoint's observation normalizer BY HAND.
+
+        These checkpoints were written by rsl_rl 5.x, which stored the running obs
+        mean/std in a top-level "obs_norm_state_dict". rsl_rl 3.1.2 (installed with
+        Isaac Lab 2.3.2) deprecated `empirical_normalization`, moved normalization
+        inside the policy, and its load() ignores that key entirely -- so the weights
+        load fine while the normalizer is silently dropped and the actor is fed RAW
+        observations. Measured effect: model_9250 scores 0% grasp in every config.
+        """
+        ck = torch.load(ckpt, map_location=dev, weights_only=False)
+        nz = ck.get("obs_norm_state_dict")
+        if not nz or "_mean" not in nz:
+            print(f"[pipeline]   no obs_norm in {ckpt} -- using policy as-is", flush=True)
+            return pol
+        mean = nz["_mean"].to(dev).reshape(1, -1)
+        std = nz["_std"].to(dev).reshape(1, -1).clamp(min=1e-6)
+        print(f"[pipeline]   obs_norm restored (dim {mean.shape[-1]})", flush=True)
+
+        def _p(o):
+            td = hasattr(o, "keys") and "policy" in o.keys()
+            if td:
+                o = o.clone()
+                o["policy"] = (o["policy"] - mean) / std
+                return pol(o)
+            return pol((o - mean) / std)
+        return _p
+
     policies = []
     for name, ckpt in (("snatch", args.snatch), ("carry", args.carry), ("place", args.place)):
         runner = build_runner(env, dev)
         runner.load(ckpt)
-        policies.append(runner.get_inference_policy(device=dev))
+        policies.append(_with_norm(runner.get_inference_policy(device=dev), ckpt))
         print(f"[pipeline] {name:6s} <- {ckpt}", flush=True)
 
     n = args.num_envs
@@ -169,7 +200,17 @@ def main():
         return t
 
     obs = _obs(env.get_observations())
-    for _ in range(args.steps):
+    # Offline trace: this host has no Vulkan, so an mp4 of a successful delivery cannot be
+    # rendered. Record the geometry instead and plot it after the fact.
+    tr = None
+    if args.trace_out:
+        import numpy as np
+        tr = {k: np.zeros((args.steps, n, 3), dtype=np.float32) for k in ("drone", "cube")}
+        tr["phase"] = np.zeros((args.steps, n), dtype=np.int8)
+        tr["dep"] = np.zeros((args.steps, n), dtype=bool)
+        tr["done"] = np.zeros((args.steps, n), dtype=bool)
+        tr["platB"] = np.zeros((args.steps, n, 2), dtype=np.float32)
+    for _t in range(args.steps):
         with torch.inference_mode():
             obs_p = _retarget_obs(obs, phase)
             acts = torch.stack([p(obs_p) for p in policies], dim=0)   # (3,N,5)
@@ -195,6 +236,13 @@ def main():
             # not the carry policy's hover point 25cm above it.
             base._target[to_place, 2] = cfg.surface_z + 0.5 * cfg.cube_size
 
+        if tr is not None:
+            tr["drone"][_t] = base._base_p.detach().cpu().numpy()
+            tr["cube"][_t] = base._obj_p.detach().cpu().numpy()
+            tr["phase"][_t] = phase.detach().cpu().numpy()
+            tr["dep"][_t] = base._deposited.detach().cpu().numpy()
+            tr["done"][_t] = dones.detach().cpu().numpy()
+            tr["platB"][_t] = base._plat_b_xy.detach().cpu().numpy()
         ep_grasped |= held
         ep_arrived |= base._arrived
         ep_deposited |= base._deposited
@@ -218,6 +266,11 @@ def main():
     print(f"  grasped         : {tot['grasp']/e:.1%}")
     print(f"  arrived over B  : {tot['arrive']/e:.1%}")
     print(f"  DEPOSITED on B  : {tot['deposit']/e:.1%}   <- end-to-end")
+    if tr is not None:
+        import numpy as np
+        np.savez_compressed(args.trace_out, surface_z=cfg.surface_z,
+                            cube_size=cfg.cube_size, sep=base._sep, **tr)
+        print(f"[pipeline] trace -> {args.trace_out}  (deposits recorded: {int(tr['dep'].any(0).sum())} envs)")
     print("PIPELINE_OK")
     env.close()
 

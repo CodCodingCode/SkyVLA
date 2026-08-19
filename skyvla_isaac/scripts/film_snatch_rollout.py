@@ -19,6 +19,9 @@ parser.add_argument("--steps", type=int, default=400)
 parser.add_argument("--side_spawn", type=float, default=1.6, help="fly-in radius from the cube (m)")
 parser.add_argument("--tail", type=int, default=55, help="frames to keep after the lift registers")
 parser.add_argument("--min_hold", type=int, default=25, help="lift must survive this many frames")
+parser.add_argument("--cur_p", type=float, default=None,
+                    help="start distribution; None leaves the cfg default (0.6), which is what "
+                         "the README eval line uses. 0.0 is the honest full fly-in.")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -39,8 +42,10 @@ cfg.use_cameras = False
 cfg.place_only = cfg.two_platform = cfg.release_only = False
 cfg.grasp_latch = False
 cfg.carry_demo_p = 0.0
-cfg.curriculum_p_start = cfg.curriculum_p_end = 0.0
+if args.cur_p is not None:
+    cfg.curriculum_p_start = cfg.curriculum_p_end = args.cur_p
 cfg.side_spawn_max = args.side_spawn
+cfg.scene.env_spacing = max(cfg.scene.env_spacing, 2.0 * args.side_spawn + 2.0)
 cfg.staged_curriculum = True          # soft table-touch, as in training
 cfg.episode_length_s = 12.0
 cfg.scene.num_envs = args.num_envs
@@ -84,6 +89,24 @@ R = {k: np.stack(v) for k, v in rec.items()}
 held_any = R["held"].any(0).sum()
 print(f"[film] {held_any}/{n} envs grasped and lifted", flush=True)
 
+# how long does a grasp actually SURVIVE? a cage that catches the cube and drops it is a
+# very different result from one that holds, and the pick% headline cannot tell them apart.
+runs = []
+for e in range(n):
+    h = R["held"][:, e].astype(int)
+    if not h.any():
+        continue
+    best_run = cur = 0
+    for v in h:
+        cur = cur + 1 if v else 0
+        best_run = max(best_run, cur)
+    runs.append(best_run)
+if runs:
+    a = np.array(sorted(runs))
+    print(f"[film] longest held-run per successful env (frames, 50 Hz): "
+          f"min {a.min()} median {int(np.median(a))} p90 {int(a[int(.9*len(a))-1])} max {a.max()}", flush=True)
+    print(f"[film] grasps surviving >=20 frames (0.4 s): {(a>=20).sum()}/{len(a)}", flush=True)
+
 best, best_score = None, -1e9
 for e in range(n):
     h = R["held"][:, e]
@@ -100,9 +123,11 @@ for e in range(n):
         end = t_h + int(d_after[0]) + 1
     if not R["held"][t_h:min(t_h + args.min_hold, end), e].all():
         continue                                       # grasp must SURVIVE, not flicker
-    lift = float(R["cube"][end-1, e, 2] - cfg.surface_z - 0.5 * cfg.cube_size)
-    if lift > best_score:
-        best_score, best = lift, (e, t0, t_h, end)
+    # prefer a take with a REAL fly-in: at the cfg-default cur_p the drone often spawns
+    # straddling the cube, and a 1cm "approach" makes for a dishonest film.
+    d0 = float(np.linalg.norm(R["drone"][t0, e, :2] - R["cube"][t0, e, :2]))
+    if d0 > best_score:
+        best_score, best = d0, (e, t0, t_h, end)
 
 if best is None:
     print("[film] NO usable take -- rerun with more envs/steps", flush=True)

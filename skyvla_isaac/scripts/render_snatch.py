@@ -134,7 +134,8 @@ runner.load(args.checkpoint)
 policy = runner.get_inference_policy(device=env.device)
 print(f"[snatch-render] loaded {args.checkpoint}")
 
-obs, _ = wenv.get_observations()
+_r = wenv.get_observations()
+obs = _r[0] if isinstance(_r, tuple) else _r   # IsaacLab 2.3.2 returns a bare TensorDict
 cam = env._render_cam
 off_eye = torch.tensor([1.9, 1.9, -0.18], device=env.device)   # side-on, slightly below drone
 off_tgt = torch.tensor([0.0, 0.0, -0.20], device=env.device)   # so the cube hanging below is clear
@@ -147,7 +148,7 @@ tmp = tempfile.mkdtemp(prefix="snatch_"); nf = 0
 for i in range(args.steps):
     with torch.no_grad():
         act = policy(obs)
-    obs, _, _, _ = wenv.step(act)
+    obs = wenv.step(act)[0]
     follow()
     # path tracing converges over accumulated passes -> re-render the held frame
     for _ in range(pt_sub):

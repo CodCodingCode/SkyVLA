@@ -7,6 +7,8 @@ and Gaussian-map navigation (`gs/`). Training is PPO via rsl_rl (`scripts/train.
 
 ## Environment — venvs, NOT conda
 
+Full host setup, including Vulkan and the version traps, is in [`GH200.md`](GH200.md).
+
 There is no conda on this host and no `isaac` / `habitat` env. Two virtualenvs:
 
 | | path | has |

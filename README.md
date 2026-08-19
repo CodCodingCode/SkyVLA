@@ -252,6 +252,10 @@ Verified on a GH200 (aarch64) with torch 2.7.0+cu128. Earlier revisions of this
 README specified Isaac Sim 4.5 / Isaac Lab 2.1 / Python 3.10 under conda envs named
 `isaac` and `habitat`; that layout is gone and no script depends on it any more.
 
+Host-specific setup for the **GH200 (aarch64)** — the two virtualenvs, the mandatory
+`LD_PRELOAD`, enabling Vulkan on a compute-only driver, and the rsl_rl / Isaac Lab version
+traps — is in [`GH200.md`](GH200.md).
+
 Agent/operator conventions for this repo (W&B logging, crash-resilient training on this host) live in [`CLAUDE.md`](CLAUDE.md).
 
 ## License
